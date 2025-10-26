@@ -1,0 +1,32 @@
+[build-system]
+requires = [
+    "setuptools>=42",
+    "wheel",
+    "torch",
+    "ninja",
+    "packaging"
+]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "flash_attn_v100"
+version = "1.0.0"
+description = "Flash Attention 2 for Tesla v100"
+requires-python = ">=3.7"
+dependencies = [
+    "torch",
+    "einops",
+    "packaging",
+    "ninja"
+]
+
+[tool.setuptools]
+packages = ["flash_attn_v100"]
+
+[tool.setuptools.exclude-package-data]
+"*" = [
+    "build",
+    "kernel",
+    "include",
+    "flash_attn_v100.egg-info",
+]
