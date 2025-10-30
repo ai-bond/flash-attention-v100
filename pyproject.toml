@@ -10,7 +10,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "flash_attn_v100"
-version = "1.0.0"
+version = "1.2.0"
 description = "Flash Attention 2 for Tesla v100"
 requires-python = ">=3.7"
 dependencies = [
