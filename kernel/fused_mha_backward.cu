@@ -54,19 +54,19 @@ using namespace nvcuda::wmma;
 
 #define BLOCK_KV_32  32
 #define BLOCK_Q_32   64
-#define WARPS_DKV_32 8
+#define WARPS_DKV_32 16
 
 #define BLOCK_KV_64  32
 #define BLOCK_Q_64   96
-#define WARPS_DKV_64 8
+#define WARPS_DKV_64 12
 
 #define BLOCK_KV_128  16
 #define BLOCK_Q_128   96
-#define WARPS_DKV_128 8
+#define WARPS_DKV_128 12
 
 #define BLOCK_KV_256  16
 #define BLOCK_Q_256   32
-#define WARPS_DKV_256 8
+#define WARPS_DKV_256 16
 
 // ============================================================================
 // COMPILE-TIME CONFIG DQ
@@ -285,13 +285,13 @@ flash_attention_backward_dq_kernel(
 
         __syncthreads();
 
-        // Compute S = Q @ K^T
+        // Compute S = Q @ K^T with 2D warp distribution
         float* sS = acc_buffer;
         
-        const int num_tiles_m = (BLOCK_M + WMMA_M - 1) / WMMA_M;
-        const int num_tiles_n = (BLOCK_N + WMMA_N - 1) / WMMA_N;
-        const int total_tiles = num_tiles_m * num_tiles_n;
-        const int tiles_per_warp = (total_tiles + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
+        constexpr int num_tiles_m = (BLOCK_M + WMMA_M - 1) / WMMA_M;
+        constexpr int num_tiles_n = (BLOCK_N + WMMA_N - 1) / WMMA_N;
+        constexpr int total_tiles = num_tiles_m * num_tiles_n;
+        constexpr int tiles_per_warp = (total_tiles + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
         
         for (int tile_idx = 0; tile_idx < tiles_per_warp; ++tile_idx) {
             const int global_tile_idx = warp_id * tiles_per_warp + tile_idx;
@@ -347,20 +347,6 @@ flash_attention_backward_dq_kernel(
             __syncthreads();
         }
 
-        // Compute P = exp(S - lse)
-        #pragma unroll 2
-        for (int idx = tid; idx < BLOCK_M * BLOCK_N; idx += THREADS) {
-            const int row = idx / BLOCK_N;
-            const int col = idx % BLOCK_N;
-            if (row < valid_q_rows && col < valid_k_rows) {
-                float shifted = sS[row * S_STRIDE + col] - sLse[row];
-                shifted = fmaxf(shifted, -80.0f);
-                shifted = fminf(shifted,  80.0f);
-                sS[row * S_STRIDE + col] = __expf(shifted);
-            }
-        }
-        __syncthreads();
-
         // Load V into shared memory
         __half* sV = sKV_base;
         const uint4* v_vec     = reinterpret_cast<const uint4*>(v_ptr + start_col * D);
@@ -380,7 +366,7 @@ flash_attention_backward_dq_kernel(
 
         __syncthreads();
 
-        // Compute dOV = dO @ V^T with universal 2D warp distribution
+        // Compute dOV = dO @ V^T with 2D warp distribution
         __half* sdO = sdO_base;
         float* sdOV = dov_buffer;
         
@@ -414,46 +400,59 @@ flash_attention_backward_dq_kernel(
 
             store_matrix_sync(sdOV + tile_m * S_STRIDE + tile_n, acc_frag, S_STRIDE, mem_row_major);
         }
-
         __syncthreads();
 
-        // Compute dS = P * (dOV - row_dot) * scale
-        float* sP = sS;
-        float* s_dS = dov_buffer;
+        // Compute dS = exp(S - lse) * (dOV - row_dot) * scale → store directly as half
+        __half* sdS_base = reinterpret_cast<__half*>(dov_buffer);
+       
+        const int total_elements = BLOCK_M * BLOCK_N;
+        const int total_pairs = (total_elements + 1) / 2;
+
         #pragma unroll 2
-        for (int idx = tid; idx < BLOCK_M * BLOCK_N; idx += THREADS) {
-            const int row = idx / BLOCK_N;
-            const int col = idx % BLOCK_N;
-            if (row < valid_q_rows && col < valid_k_rows) {
-                float p       = sP[row * S_STRIDE + col];
-                float dov     = sdOV[row * S_STRIDE + col];
-                float row_dot = sRowDot[row];
-                float diff    = dov - row_dot;
-                float ds      = fmaf(p, softmax_scale * diff, 0.0f);
-                s_dS[row * S_STRIDE + col] = ds;
-            }
-        }
+        for (int i = tid; i < total_pairs; i += THREADS) {
+            const int linear_idx0 = i * 2;
+            const int linear_idx1 = linear_idx0 + 1;
 
-        __syncthreads();
+            const int row = linear_idx0 / BLOCK_N;
+            const int col0 = linear_idx0 % BLOCK_N;
+            const int col1 = col0 + 1;
 
-        // Convert dS to half precision with reuse dov_buffer
-        #pragma unroll 2
-        for (int i = tid; i < (BLOCK_M * BLOCK_N + 1) / 2; i += THREADS) {
-            const int row      = i / ((BLOCK_N + 1) / 2);
-            const int half_col = i % ((BLOCK_N + 1) / 2);
-            const int col0     = half_col * 2;
-            const int col1     = col0 + 1;
+            // Boundary check
+            bool valid0 = (row < valid_q_rows && col0 < valid_k_rows);
+            bool valid1 = (linear_idx1 < total_elements && row < valid_q_rows && col1 < valid_k_rows);
 
-            float val0 = 0.0f, val1 = 0.0f;
-            if (row < valid_q_rows && col0 < valid_k_rows) { val0 = s_dS[row * S_STRIDE + col0]; }
-            if (row < valid_q_rows && col1 < valid_k_rows) { val1 = s_dS[row * S_STRIDE + col1]; }
+            // Load S and dOV
+            float s0 = 0.0f, s1 = 0.0f;
+            float dov0 = 0.0f, dov1 = 0.0f;
 
-            __half2 h2 = __float22half2_rn(make_float2(val0, val1));
+            if (valid0) { s0 = sS[row * S_STRIDE + col0]; dov0 = sdOV[row * S_STRIDE + col0]; }
+            if (valid1) { s1 = sS[row * S_STRIDE + col1]; dov1 = sdOV[row * S_STRIDE + col1]; }
+
+            // Shared per-row values
+            float lse_val = sLse[row];
+            float row_dot_val = sRowDot[row];
+
+            // Compute P0, P1
+            float shifted0 = s0 - lse_val;
+            float shifted1 = s1 - lse_val;
+//            shifted0 = fmaxf(fminf(shifted0, 80.0f), -80.0f);
+//            shifted1 = fmaxf(fminf(shifted1, 80.0f), -80.0f);
+//            float p0 = __expf(shifted0);
+//            float p1 = __expf(shifted1);
+            float p0 = (shifted0 < -80.0f) ? 0.0f : __expf(shifted0);
+            float p1 = (shifted1 < -80.0f) ? 0.0f : __expf(shifted1);
+
+            // Compute dS
+            float diff0 = dov0 - row_dot_val;
+            float diff1 = dov1 - row_dot_val;
+            float ds0 = valid0 ? fmaf(p0, softmax_scale * diff0, 0.0f) : 0.0f;
+            float ds1 = valid1 ? fmaf(p1, softmax_scale * diff1, 0.0f) : 0.0f;
+
+            // Convert to half and store in row-major layout (BLOCK_N columns, no padding)
+            __half2 h2 = __float22half2_rn(make_float2(ds0, ds1));
             __half* dst = sdS_base + row * BLOCK_N + col0;
             dst[0] = h2.x;
-            if (col1 < BLOCK_N) {
-                dst[1] = h2.y;
-            }
+            if (col1 < BLOCK_N) { dst[1] = h2.y; }
         }
         __syncthreads();
 
@@ -473,77 +472,49 @@ flash_attention_backward_dq_kernel(
 
         __syncthreads();
 
-        // Compute dQ += dS @ K
+        // Compute dQ += dS @ K with 2D warp distribution
         const int num_tiles_m_dq = (BLOCK_M + WMMA_M - 1) / WMMA_M;
-        if (num_tiles_m_dq >= WARPS_PER_BLOCK) {
-            const int tile_m = warp_id * WMMA_M;
-            
-            if (tile_m < valid_q_rows) {
-                for (int tile_n = 0; tile_n < D; tile_n += WMMA_N) {
-                    fragment<matrix_a, WMMA_M, WMMA_N, WMMA_K, __half, row_major> a_frag;
-                    fragment<matrix_b, WMMA_M, WMMA_N, WMMA_K, __half, row_major> b_frag;
-                    fragment<accumulator, WMMA_M, WMMA_N, WMMA_K, float> acc_frag;
-                    fill_fragment(acc_frag, 0.0f);
+        const int num_tiles_n_dq = (D + WMMA_N - 1) / WMMA_N;
+        const int total_tiles_dq = num_tiles_m_dq * num_tiles_n_dq;
+        const int tiles_per_warp_dq = (total_tiles_dq + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
 
-                    const int num_k_tiles_dq = (BLOCK_N + WMMA_K - 1) / WMMA_K;
-                    
-                    #pragma unroll
-                    for (int k_tile = 0; k_tile < num_k_tiles_dq; ++k_tile) {
-                        const int k_offset = k_tile * WMMA_K;
-                        if (k_offset >= valid_k_rows) break;
-                        
-                        load_matrix_sync(a_frag, sdS_base + tile_m * BLOCK_N + k_offset, BLOCK_N);
-                        load_matrix_sync(b_frag, sK + k_offset * KV_STRIDE + tile_n, KV_STRIDE);
-                        mma_sync(acc_frag, a_frag, b_frag, acc_frag);
-                    }
+        for (int tile_local = 0; tile_local < tiles_per_warp_dq; ++tile_local) {
+            const int global_tile_idx = warp_id * tiles_per_warp_dq + tile_local;
+            if (global_tile_idx >= total_tiles_dq) break;
 
-                    fragment<accumulator, WMMA_M, WMMA_N, WMMA_K, float> curr_frag;
-                    load_matrix_sync(curr_frag, s_dQ + tile_m * Q_STRIDE + tile_n, Q_STRIDE, mem_row_major);
+            const int tile_m_idx = global_tile_idx / num_tiles_n_dq;
+            const int tile_n_idx = global_tile_idx % num_tiles_n_dq;
 
-                    #pragma unroll
-                    for (int i = 0; i < curr_frag.num_elements; ++i) {
-                        curr_frag.x[i] += acc_frag.x[i];
-                    }
+            const int tile_m = tile_m_idx * WMMA_M;
+            const int tile_n = tile_n_idx * WMMA_N;
 
-                    store_matrix_sync(s_dQ + tile_m * Q_STRIDE + tile_n, curr_frag, Q_STRIDE, mem_row_major);
-                }
+            if (tile_m >= valid_q_rows || tile_n >= D) continue;
+
+            fragment<matrix_a, WMMA_M, WMMA_N, WMMA_K, __half, row_major> a_frag;
+            fragment<matrix_b, WMMA_M, WMMA_N, WMMA_K, __half, row_major> b_frag;
+            fragment<accumulator, WMMA_M, WMMA_N, WMMA_K, float> acc_frag;
+            fill_fragment(acc_frag, 0.0f);
+
+            const int num_k_tiles_dq = (BLOCK_N + WMMA_K - 1) / WMMA_K;
+            #pragma unroll
+            for (int k_tile = 0; k_tile < num_k_tiles_dq; ++k_tile) {
+                const int k_offset = k_tile * WMMA_K;
+                if (k_offset >= valid_k_rows) break;
+
+                load_matrix_sync(a_frag, sdS_base + tile_m * BLOCK_N + k_offset, BLOCK_N);
+                load_matrix_sync(b_frag, sK + k_offset * KV_STRIDE + tile_n, KV_STRIDE);
+                mma_sync(acc_frag, a_frag, b_frag, acc_frag);
             }
-        } else {
-            const int warps_per_tile_m = WARPS_PER_BLOCK / num_tiles_m_dq;
-            const int tile_m_group = warp_id / warps_per_tile_m;
-            const int warp_in_group = warp_id % warps_per_tile_m;
-            const int tile_m = tile_m_group * WMMA_M;
-            
-            if (tile_m < valid_q_rows) {
-                for (int tile_n = warp_in_group * WMMA_N; tile_n < D; tile_n += warps_per_tile_m * WMMA_N) {
-                    fragment<matrix_a, WMMA_M, WMMA_N, WMMA_K, __half, row_major> a_frag;
-                    fragment<matrix_b, WMMA_M, WMMA_N, WMMA_K, __half, row_major> b_frag;
-                    fragment<accumulator, WMMA_M, WMMA_N, WMMA_K, float> acc_frag;
-                    fill_fragment(acc_frag, 0.0f);
 
-                    const int num_k_tiles_dq = (BLOCK_N + WMMA_K - 1) / WMMA_K;
-                    
-                    #pragma unroll
-                    for (int k_tile = 0; k_tile < num_k_tiles_dq; ++k_tile) {
-                        const int k_offset = k_tile * WMMA_K;
-                        if (k_offset >= valid_k_rows) break;
-                        
-                        load_matrix_sync(a_frag, sdS_base + tile_m * BLOCK_N + k_offset, BLOCK_N);
-                        load_matrix_sync(b_frag, sK + k_offset * KV_STRIDE + tile_n, KV_STRIDE);
-                        mma_sync(acc_frag, a_frag, b_frag, acc_frag);
-                    }
+            fragment<accumulator, WMMA_M, WMMA_N, WMMA_K, float> curr_frag;
+            load_matrix_sync(curr_frag, s_dQ + tile_m * Q_STRIDE + tile_n, Q_STRIDE, mem_row_major);
 
-                    fragment<accumulator, WMMA_M, WMMA_N, WMMA_K, float> curr_frag;
-                    load_matrix_sync(curr_frag, s_dQ + tile_m * Q_STRIDE + tile_n, Q_STRIDE, mem_row_major);
-
-                    #pragma unroll
-                    for (int i = 0; i < curr_frag.num_elements; ++i) {
-                        curr_frag.x[i] += acc_frag.x[i];
-                    }
-
-                    store_matrix_sync(s_dQ + tile_m * Q_STRIDE + tile_n, curr_frag, Q_STRIDE, mem_row_major);
-                }
+            #pragma unroll
+            for (int i = 0; i < curr_frag.num_elements; ++i) {
+                curr_frag.x[i] += acc_frag.x[i];
             }
+
+            store_matrix_sync(s_dQ + tile_m * Q_STRIDE + tile_n, curr_frag, Q_STRIDE, mem_row_major);
         }
         __syncthreads();
     }
@@ -729,34 +700,46 @@ flash_attention_backward_dkv_kernel(
         }
         __syncthreads();
 
-        // Compute S = Q @ K^T -> store sS (acc_buffer)
+        // Compute dQ += dS @ K with 2D warp distribution
         float* sS = acc_buffer;
-        for (int tile_m = warp_id * WMMA_M; tile_m < BLOCK_N; tile_m += WARPS_PER_BLOCK * WMMA_M) {
-            if (tile_m >= valid_q_rows) continue;
-            for (int tile_n = 0; tile_n < BLOCK_M; tile_n += WMMA_N) {
-                if (tile_n >= valid_kv_rows) continue;
+        
+        constexpr int num_tiles_s_m = (BLOCK_N + WMMA_M - 1) / WMMA_M;  // по Q
+        constexpr int num_tiles_s_n = (BLOCK_M + WMMA_N - 1) / WMMA_N;  // по K/V
+        constexpr int total_tiles_s = num_tiles_s_m * num_tiles_s_n;
+        constexpr int tiles_per_warp_s = (total_tiles_s + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
+        
+        for (int tile_local = 0; tile_local < tiles_per_warp_s; ++tile_local) {
+            const int tile_idx = warp_id * tiles_per_warp_s + tile_local;
+            if (tile_idx >= total_tiles_s) break;
+            
+            // Row-major mapping: iterate M first, then N
+            const int tile_m_idx = tile_idx / num_tiles_s_n;
+            const int tile_n_idx = tile_idx % num_tiles_s_n;
+            const int tile_m = tile_m_idx * WMMA_M;
+            const int tile_n = tile_n_idx * WMMA_N;
+            
+            if (tile_m >= valid_q_rows || tile_n >= valid_kv_rows) continue;
+            
+            fragment<matrix_a, WMMA_M, WMMA_N, WMMA_K, half, row_major> a_frag;
+            fragment<matrix_b, WMMA_M, WMMA_N, WMMA_K, half, col_major> b_frag;
+            fragment<accumulator, WMMA_M, WMMA_N, WMMA_K, float> acc_frag;
+            fill_fragment(acc_frag, 0.0f);
 
-                fragment<matrix_a, WMMA_M, WMMA_N, WMMA_K, half, row_major> a_frag;
-                fragment<matrix_b, WMMA_M, WMMA_N, WMMA_K, half, col_major> b_frag;
-                fragment<accumulator, WMMA_M, WMMA_N, WMMA_K, float> acc_frag;
-                fill_fragment(acc_frag, 0.0f);
-
-                #pragma unroll
-                for (int k_tile = 0; k_tile < NUM_K_TILES; ++k_tile) {
-                    const int k_offset = k_tile * WMMA_K;
-                    if (k_offset >= D) break;
-                    load_matrix_sync(a_frag, sQ + tile_m * Q_STRIDE + k_offset, Q_STRIDE);
-                    load_matrix_sync(b_frag, sK + tile_n * KV_STRIDE + k_offset, KV_STRIDE);
-                    mma_sync(acc_frag, a_frag, b_frag, acc_frag);
-                }
-
-                #pragma unroll
-                for (int i = 0; i < acc_frag.num_elements; ++i) {
-                    acc_frag.x[i] *= softmax_scale;
-                }
-
-                store_matrix_sync(sS + tile_m * S_STRIDE + tile_n, acc_frag, S_STRIDE, mem_row_major);
+            #pragma unroll
+            for (int k_tile = 0; k_tile < NUM_K_TILES; ++k_tile) {
+                const int k_offset = k_tile * WMMA_K;
+                if (k_offset >= D) break;
+                load_matrix_sync(a_frag, sQ + tile_m * Q_STRIDE + k_offset, Q_STRIDE);
+                load_matrix_sync(b_frag, sK + tile_n * KV_STRIDE + k_offset, KV_STRIDE);
+                mma_sync(acc_frag, a_frag, b_frag, acc_frag);
             }
+
+            #pragma unroll
+            for (int i = 0; i < acc_frag.num_elements; ++i) {
+                acc_frag.x[i] *= softmax_scale;
+            }
+
+            store_matrix_sync(sS + tile_m * S_STRIDE + tile_n, acc_frag, S_STRIDE, mem_row_major);
         }
         __syncthreads();
 
@@ -775,20 +758,6 @@ flash_attention_backward_dkv_kernel(
             __syncthreads();
         }
 
-         // Compute P = exp(S - lse)
-        #pragma unroll 2
-        for (int idx = tid; idx < BLOCK_N * BLOCK_M; idx += THREADS) {
-            const int row = idx / BLOCK_M;
-            const int col = idx % BLOCK_M;
-            if (row < valid_q_rows && col < valid_kv_rows) {
-                float shifted = sS[row * S_STRIDE + col] - sLse[row];
-                shifted = fmaxf(shifted, -80.0f);
-                shifted = fminf(shifted,  80.0f);
-                sS[row * S_STRIDE + col] = __expf(shifted);
-            }
-        }
-        __syncthreads();
-
         // Load V (overwrite K in shared memory)
         sV = sKV_base;
         const uint4* v_vec = reinterpret_cast<const uint4*>(v_ptr);
@@ -806,78 +775,103 @@ flash_attention_backward_dkv_kernel(
         }
         __syncthreads();
 
-        // Compute dOV = dO @ V^T
+        // Compute dOV = dO @ V^T with with 2D warp distribution
         float* sdOV = dov_buffer;
-        for (int tile_m = warp_id * WMMA_M; tile_m < BLOCK_N; tile_m += WARPS_PER_BLOCK * WMMA_M) {
-            if (tile_m >= valid_q_rows) continue;
-            for (int tile_n = 0; tile_n < BLOCK_M; tile_n += WMMA_N) {
-                if (tile_n >= valid_kv_rows) continue;
+        
+        for (int tile_local = 0; tile_local < tiles_per_warp_s; ++tile_local) {
+            const int tile_idx = warp_id * tiles_per_warp_s + tile_local;
+            if (tile_idx >= total_tiles_s) break;
+            
+            const int tile_m_idx = tile_idx / num_tiles_s_n;
+            const int tile_n_idx = tile_idx % num_tiles_s_n;
+            const int tile_m = tile_m_idx * WMMA_M;
+            const int tile_n = tile_n_idx * WMMA_N;
+            
+            if (tile_m >= valid_q_rows || tile_n >= valid_kv_rows) continue;
+            
+            fragment<matrix_a, WMMA_M, WMMA_N, WMMA_K, half, row_major> a_frag;
+            fragment<matrix_b, WMMA_M, WMMA_N, WMMA_K, half, col_major> b_frag;
+            fragment<accumulator, WMMA_M, WMMA_N, WMMA_K, float> acc_frag;
+            fill_fragment(acc_frag, 0.0f);
 
-                fragment<matrix_a, WMMA_M, WMMA_N, WMMA_K, half, row_major> a_frag;
-                fragment<matrix_b, WMMA_M, WMMA_N, WMMA_K, half, col_major> b_frag;
-                fragment<accumulator, WMMA_M, WMMA_N, WMMA_K, float> acc_frag;
-                fill_fragment(acc_frag, 0.0f);
-
-                #pragma unroll
-                for (int k_tile = 0; k_tile < NUM_K_TILES; ++k_tile) {
-                    const int k_offset = k_tile * WMMA_K;
-                    if (k_offset >= D) break;
-                    load_matrix_sync(a_frag, sdO + tile_m * Q_STRIDE + k_offset, Q_STRIDE);
-                    load_matrix_sync(b_frag, sV + tile_n * KV_STRIDE + k_offset, KV_STRIDE);
-                    mma_sync(acc_frag, a_frag, b_frag, acc_frag);
-                }
-
-                store_matrix_sync(sdOV + tile_m * S_STRIDE + tile_n, acc_frag, S_STRIDE, mem_row_major);
+            #pragma unroll
+            for (int k_tile = 0; k_tile < NUM_K_TILES; ++k_tile) {
+                const int k_offset = k_tile * WMMA_K;
+                if (k_offset >= D) break;
+                load_matrix_sync(a_frag, sdO + tile_m * Q_STRIDE + k_offset, Q_STRIDE);
+                load_matrix_sync(b_frag, sV + tile_n * KV_STRIDE + k_offset, KV_STRIDE);
+                mma_sync(acc_frag, a_frag, b_frag, acc_frag);
             }
+
+            store_matrix_sync(sdOV + tile_m * S_STRIDE + tile_n, acc_frag, S_STRIDE, mem_row_major);
         }
         __syncthreads();
 
-        // Compute dS = P * (dOV - row_dot) * scale
-        float* sP = sS;
-        float* s_dS = dov_buffer;
-        #pragma unroll 2
-        for (int idx = tid; idx < BLOCK_N * BLOCK_M; idx += THREADS) {
-            const int row = idx / BLOCK_M;
-            const int col = idx % BLOCK_M;
-            if (row < valid_q_rows && col < valid_kv_rows) {
-                float p = sP[row * S_STRIDE + col];
-                float dov = sdOV[row * S_STRIDE + col];
-                float row_dot = sRowDot[row];
-                float diff = dov - row_dot;
-                s_dS[row * S_STRIDE + col] = fmaf(p, softmax_scale * diff, 0.0f);
-            }
-        }
-        __syncthreads();
-
-        // Convert dS to half with dov_buffer reuse
+        // Compute P = exp(S - lse) AND dS = P * (dOV - row_dot) * scale → store P in half (in acc_buffer), dS in half (in dov_buffer)
+        float* sP = acc_buffer;
+        __half* sP_half = reinterpret_cast<__half*>(acc_buffer);
         __half* sdS_base = reinterpret_cast<__half*>(dov_buffer);
+
+        const int total_elements = BLOCK_N * BLOCK_M;
+        const int total_pairs = (total_elements + 1) / 2;
+
         #pragma unroll 2
-        for (int i = tid; i < (BLOCK_N * BLOCK_M + 1) / 2; i += THREADS) {
-            const int row = i / ((BLOCK_M + 1) / 2);
-            const int half_col = i % ((BLOCK_M + 1) / 2);
-            const int col0 = half_col * 2;
-            const int col1 = col0 + 1;
+        for (int i = tid; i < total_pairs; i += THREADS) {
+            const int linear_idx0 = i * 2;
+            const int linear_idx1 = linear_idx0 + 1;
 
-            float val0 = 0.0f, val1 = 0.0f;
+            const int row0 = linear_idx0 / BLOCK_M;
+            const int col0 = linear_idx0 % BLOCK_M;
+            const int row1 = (linear_idx1 < total_elements) ? linear_idx1 / BLOCK_M : row0;
+            const int col1 = (linear_idx1 < total_elements) ? linear_idx1 % BLOCK_M : col0 + 1;
 
-            if (row < BLOCK_N && col0 < BLOCK_M) {
-                if (row < valid_q_rows && col0 < valid_kv_rows) {
-                    val0 = s_dS[row * S_STRIDE + col0];
-                }
+            // Load S and dOV
+            float s0 = 0.0f, s1 = 0.0f;
+            float dov0 = 0.0f, dov1 = 0.0f;
+
+            bool valid0 = (row0 < valid_q_rows && col0 < valid_kv_rows);
+            bool valid1 = (linear_idx1 < total_elements && row1 < valid_q_rows && col1 < valid_kv_rows);
+
+            if (valid0) { s0 = sS[row0 * S_STRIDE + col0]; dov0 = sdOV[row0 * S_STRIDE + col0]; }
+            if (valid1) { s1 = sS[row1 * S_STRIDE + col1]; dov1 = sdOV[row1 * S_STRIDE + col1]; }
+
+            float lse0 = sLse[row0];
+            float lse1 = (valid1 && row1 != row0) ? sLse[row1] : lse0;
+            float row_dot0 = sRowDot[row0];
+            float row_dot1 = (valid1 && row1 != row0) ? sRowDot[row1] : row_dot0;
+
+            // Compute P0, P1 in float
+            float shifted0 = s0 - lse0;
+            float shifted1 = s1 - lse1;
+//            shifted0 = fmaxf(fminf(shifted0, 80.0f), -80.0f);
+//            shifted1 = fmaxf(fminf(shifted1, 80.0f), -80.0f);
+//            float p0 = __expf(shifted0);
+//            float p1 = __expf(shifted1);
+            float p0 = (shifted0 < -80.0f) ? 0.0f : __expf(shifted0);
+            float p1 = (shifted1 < -80.0f) ? 0.0f : __expf(shifted1);
+
+            // Compute dS
+            float diff0 = dov0 - row_dot0;
+            float diff1 = dov1 - row_dot1;
+            float ds0 = valid0 ? fmaf(p0, softmax_scale * diff0, 0.0f) : 0.0f;
+            float ds1 = valid1 ? fmaf(p1, softmax_scale * diff1, 0.0f) : 0.0f;
+
+            // Convert P and dS to half
+            __half2 p_h2 = __float22half2_rn(make_float2(p0, p1));
+            __half2 ds_h2 = __float22half2_rn(make_float2(ds0, ds1));
+
+            // Store P and dS in half (row-major, BLOCK_M stride)
+            if (col1 < BLOCK_M && row1 == row0) {
+                __half* p_dst  = sP_half  + row0 * BLOCK_M + col0;
+                __half* ds_dst = sdS_base + row0 * BLOCK_M + col0;
+                p_dst[0]  = p_h2.x;  p_dst[1]  = p_h2.y;
+                ds_dst[0] = ds_h2.x; ds_dst[1] = ds_h2.y;
+            } else {
+                if (valid0) { sP_half[row0 * BLOCK_M + col0] = p_h2.x; sdS_base[row0 * BLOCK_M + col0] = ds_h2.x; }
+                if (valid1) { sP_half[row1 * BLOCK_M + col1] = p_h2.y; sdS_base[row1 * BLOCK_M + col1] = ds_h2.y; }
             }
-            if (row < BLOCK_N && col1 < BLOCK_M) {
-                if (row < valid_q_rows && col1 < valid_kv_rows) {
-                    val1 = s_dS[row * S_STRIDE + col1];
-                }
-            }
-
-            __half2 h2 = __float22half2_rn(make_float2(val0, val1));
-
-           __half* dst = sdS_base + row * BLOCK_M + col0;
-            dst[0] = h2.x;
-            if (col1 < BLOCK_M) { dst[1] = h2.y; }
-         }
-         __syncthreads();
+        }
+        __syncthreads();
 
         // Load K with reuse(rewrite) V
         sK = sKV_base;
@@ -894,14 +888,21 @@ flash_attention_backward_dkv_kernel(
         }
         __syncthreads();
 
-        // Compute dK = dS^T @ Q
-        int num_tiles_dk_m = (valid_kv_rows + WMMA_M - 1) / WMMA_M;
-        int num_tiles_dk_n = (D + WMMA_N - 1) / WMMA_N;
-        int total_tiles_dk = num_tiles_dk_m * num_tiles_dk_n;
-
-        for (int tile_idx = warp_id; tile_idx < total_tiles_dk; tile_idx += WARPS_PER_BLOCK) {
-            int tile_m = (tile_idx % num_tiles_dk_m) * WMMA_M;
-            int tile_n = (tile_idx / num_tiles_dk_m) * WMMA_N;
+        // Compute dK = dS^T @ Q with deterministic tile distribution
+        const int num_tiles_dk_m = (valid_kv_rows + WMMA_M - 1) / WMMA_M;
+        const int num_tiles_dk_n = (D + WMMA_N - 1) / WMMA_N;
+        const int total_tiles_dk = num_tiles_dk_m * num_tiles_dk_n;
+        const int tiles_per_warp_dk = (total_tiles_dk + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
+        
+        for (int tile_local = 0; tile_local < tiles_per_warp_dk; ++tile_local) {
+            const int tile_idx = warp_id * tiles_per_warp_dk + tile_local;
+            if (tile_idx >= total_tiles_dk) break;
+            
+            const int tile_m_idx = tile_idx / num_tiles_dk_n;
+            const int tile_n_idx = tile_idx % num_tiles_dk_n;
+            const int tile_m = tile_m_idx * WMMA_M;
+            const int tile_n = tile_n_idx * WMMA_N;
+            
             if (tile_m >= valid_kv_rows || tile_n >= D) continue;
 
             fragment<matrix_a, WMMA_M, WMMA_N, WMMA_K, half, col_major> a_frag;
@@ -909,10 +910,10 @@ flash_attention_backward_dkv_kernel(
             fragment<accumulator, WMMA_M, WMMA_N, WMMA_K, float> acc_frag;
             load_matrix_sync(acc_frag, s_dK_accum + tile_m * KV_STRIDE + tile_n, KV_STRIDE, mem_row_major);
 
-            int num_k_tiles = (valid_q_rows + WMMA_K - 1) / WMMA_K;
+            const int num_k_tiles = (valid_q_rows + WMMA_K - 1) / WMMA_K;
             #pragma unroll
             for (int k_tile = 0; k_tile < num_k_tiles; ++k_tile) {
-                int k_offset = k_tile * WMMA_K;
+                const int k_offset = k_tile * WMMA_K;
                 if (k_offset >= valid_q_rows) break;
                 
                 load_matrix_sync(a_frag, sdS_base + k_offset * BLOCK_M + tile_m, BLOCK_M);
@@ -924,42 +925,21 @@ flash_attention_backward_dkv_kernel(
         }
         __syncthreads();
 
-        // Convert P to half with acc_buffer reuse
-        __half* sP_half = reinterpret_cast<__half*>(acc_buffer);
-        #pragma unroll 2
-        for (int i = tid; i < (BLOCK_N * BLOCK_M + 1) / 2; i += THREADS) {
-            const int row = i / ((BLOCK_M + 1) / 2);
-            const int half_col = i % ((BLOCK_M + 1) / 2);
-            const int col0 = half_col * 2;
-            const int col1 = col0 + 1;
-
-            float val0 = 0.0f, val1 = 0.0f;
-            if (row < BLOCK_N && col0 < BLOCK_M) {
-                if (row < valid_q_rows && col0 < valid_kv_rows) {
-                    val0 = sP[row * S_STRIDE + col0];
-                }
-            }
-            if (row < BLOCK_N && col1 < BLOCK_M) {
-                if (row < valid_q_rows && col1 < valid_kv_rows) {
-                    val1 = sP[row * S_STRIDE + col1];
-                }
-            }
-
-            __half2 h2 = __float22half2_rn(make_float2(val0, val1));
-            __half* dst = sP_half + row * BLOCK_M + col0;
-            dst[0] = h2.x;
-            if (col1 < BLOCK_M) { dst[1] = h2.y; }
-        }
-        __syncthreads();
+        // Compute dV = P^T @ dO with deterministic tile distribution
+        const int num_tiles_dv_m = (valid_kv_rows + WMMA_M - 1) / WMMA_M;
+        const int num_tiles_dv_n = (D + WMMA_N - 1) / WMMA_N;
+        const int total_tiles_dv = num_tiles_dv_m * num_tiles_dv_n;
+        const int tiles_per_warp_dv = (total_tiles_dv + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
         
-        // Compute dV = P^T @ dO
-        int num_tiles_dv_m = (valid_kv_rows + WMMA_M - 1) / WMMA_M;
-        int num_tiles_dv_n = (D + WMMA_N - 1) / WMMA_N;
-        int total_tiles_dv = num_tiles_dv_m * num_tiles_dv_n;
-
-        for (int tile_idx = warp_id; tile_idx < total_tiles_dv; tile_idx += WARPS_PER_BLOCK) {
-            int tile_m = (tile_idx % num_tiles_dv_m) * WMMA_M;
-            int tile_n = (tile_idx / num_tiles_dv_m) * WMMA_N;
+        for (int tile_local = 0; tile_local < tiles_per_warp_dv; ++tile_local) {
+            const int tile_idx = warp_id * tiles_per_warp_dv + tile_local;
+            if (tile_idx >= total_tiles_dv) break;
+            
+            const int tile_m_idx = tile_idx / num_tiles_dv_n;
+            const int tile_n_idx = tile_idx % num_tiles_dv_n;
+            const int tile_m = tile_m_idx * WMMA_M;
+            const int tile_n = tile_n_idx * WMMA_N;
+            
             if (tile_m >= valid_kv_rows || tile_n >= D) continue;
 
             fragment<matrix_a, WMMA_M, WMMA_N, WMMA_K, half, col_major> a_frag;
@@ -967,11 +947,12 @@ flash_attention_backward_dkv_kernel(
             fragment<accumulator, WMMA_M, WMMA_N, WMMA_K, float> acc_frag;
             load_matrix_sync(acc_frag, s_dV_accum + tile_m * KV_STRIDE + tile_n, KV_STRIDE, mem_row_major);
 
-            int num_k_tiles = (valid_q_rows + WMMA_K - 1) / WMMA_K;
+            const int num_k_tiles = (valid_q_rows + WMMA_K - 1) / WMMA_K;
             #pragma unroll
             for (int k_tile = 0; k_tile < num_k_tiles; ++k_tile) {
-                int k_offset = k_tile * WMMA_K;
+                const int k_offset = k_tile * WMMA_K;
                 if (k_offset >= valid_q_rows) break;
+                
                 load_matrix_sync(a_frag, sP_half + k_offset * BLOCK_M + tile_m, BLOCK_M);
                 load_matrix_sync(b_frag, sdO + k_offset * Q_STRIDE + tile_n, Q_STRIDE);
                 mma_sync(acc_frag, a_frag, b_frag, acc_frag);

@@ -19,6 +19,11 @@ else:
 
 this_dir = Path(__file__).parent.resolve()
 
+open(this_dir / "README.md", encoding="utf-8") as f:
+        long_description = f.read()
+except FileNotFoundError:
+    long_description = "Flash Attention implementation for Tesla V100"
+
 ext_modules = [
     CUDAExtension(
         name="flash_attn_v100_cuda",
@@ -48,7 +53,7 @@ ext_modules = [
 # Установка
 setup(
     name="flash_attn_v100",
-    version="1.0.0",
+    version="1.2.0",
     packages=[],
     ext_modules=ext_modules,
     cmdclass={"build_ext": BuildExtension.with_options(parallel=True, use_ninja=True)},
