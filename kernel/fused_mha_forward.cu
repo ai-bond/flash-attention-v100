@@ -423,40 +423,30 @@ flash_attention_forward_kernel(
     }
     
     // Store final Sum to global memory
-    int ver_row_elem = valid_q_rows * D;
-    int vec_row_size = (ver_row_elem + 4 - 1) / 4;
+    const int total_fp16_x4 = (valid_q_rows * D) / 4;
     
-    #pragma unroll 4
-    for (int vec_idx = tid; vec_idx < vec_row_size; vec_idx += THREADS) {
-        int linear_idx = vec_idx * 4;
-        int row = linear_idx / D;
-        int col = linear_idx % D;
-        
-        if (row < valid_q_rows && col < D) {
-            const float row_sum = sRowSum[row];
-            float inv_sum = 1.0f;
-            
-            if (row_sum > 1e-6f) {
-                inv_sum = 1.0f / row_sum;
-            }
-            
-            float4 vec_val;
-            vec_val.x = sO[row * O_STRIDE + col] * inv_sum;
-            vec_val.y = (col + 1 < D) ? sO[row * O_STRIDE + col + 1] * inv_sum : 0.0f;
-            vec_val.z = (col + 2 < D) ? sO[row * O_STRIDE + col + 2] * inv_sum : 0.0f;
-            vec_val.w = (col + 3 < D) ? sO[row * O_STRIDE + col + 3] * inv_sum : 0.0f;
-            
-            // Vectorized fp32 -> fp16 conversion
-            __half2 h2_low = __float22half2_rn(make_float2(vec_val.x, vec_val.y));
-            __half2 h2_high = __float22half2_rn(make_float2(vec_val.z, vec_val.w));
-            
-            // Pack 4 fp16 into uint2
-            uint2 packed;
-            packed.x = *reinterpret_cast<unsigned int*>(&h2_low);
-            packed.y = *reinterpret_cast<unsigned int*>(&h2_high);
-            
-            reinterpret_cast<uint2*>(&out_ptr[row * D + col])[0] = packed;
-        }
+    for (int i = tid; i < total_fp16_x4; i += THREADS) {
+        const int row = i / (D / 4);
+        const int col = (i % (D / 4)) * 4;
+
+        const float inv_sum = (sRowSum[row] > 1e-6f) ? (1.0f / sRowSum[row]) : 1.0f;
+        const float* sO_row = sO + row * O_STRIDE;
+
+        const __half h0 = __float2half_rn(sO_row[col + 0] * inv_sum);
+        const __half h1 = __float2half_rn(sO_row[col + 1] * inv_sum);
+        const __half h2 = __float2half_rn(sO_row[col + 2] * inv_sum);
+        const __half h3 = __float2half_rn(sO_row[col + 3] * inv_sum);
+
+        asm volatile(
+            "st.global.v4.u16 [%0], {%1, %2, %3, %4};"
+            :
+            : "l"(out_ptr + row * D + col),
+              "h"(__half_as_ushort(h0)),
+              "h"(__half_as_ushort(h1)),
+              "h"(__half_as_ushort(h2)),
+              "h"(__half_as_ushort(h3))
+            : "memory"
+        );
     }
     
     if (tid < valid_q_rows) {

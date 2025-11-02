@@ -526,35 +526,29 @@ flash_attention_backward_dq_kernel(
     }
 
     // Store final dQ to global memory
-    int vec_elem_dq = valid_q_rows * D;
-    int vec_size_dq = (vec_elem_dq + 4 - 1) / 4;
+    const int total_fp16_x4 = (valid_q_rows * D) / 4;
+    for (int i = tid; i < total_fp16_x4; i += THREADS) {
+        const int row = i / (D / 4);
+        const int col = (i % (D / 4)) * 4;
 
-    for (int vec_idx = tid; vec_idx < vec_size_dq; vec_idx += THREADS) {
-        int linear_idx = vec_idx * 4;
-        int row = linear_idx / D;
-        int col = linear_idx % D;
-    
-        if (row < valid_q_rows) {
-            float4 vec_val;
+        const float* s_dQ_row = s_dQ + row * Q_STRIDE;
 
-            vec_val.x = s_dQ[row * Q_STRIDE + col];
-            vec_val.y = (col + 1 < D) ? s_dQ[row * Q_STRIDE + col + 1] : 0.0f;
-            vec_val.z = (col + 2 < D) ? s_dQ[row * Q_STRIDE + col + 2] : 0.0f;
-            vec_val.w = (col + 3 < D) ? s_dQ[row * Q_STRIDE + col + 3] : 0.0f;
-        
-            // Vectorized fp32 -> fp16 conversion
-            __half2 h2_low = __float22half2_rn(make_float2(vec_val.x, vec_val.y));
-            __half2 h2_high = __float22half2_rn(make_float2(vec_val.z, vec_val.w));
-            
-            // Pack 4 fp16 into uint2
-            uint2 packed;
-            packed.x = *reinterpret_cast<unsigned int*>(&h2_low);
-            packed.y = *reinterpret_cast<unsigned int*>(&h2_high);
-            
-            reinterpret_cast<uint2*>(&dQ_ptr[row * D + col])[0] = packed;
-        }
+        const __half h0 = __float2half_rn(s_dQ_row[col + 0]);
+        const __half h1 = __float2half_rn(s_dQ_row[col + 1]);
+        const __half h2 = __float2half_rn(s_dQ_row[col + 2]);
+        const __half h3 = __float2half_rn(s_dQ_row[col + 3]);
+
+        asm volatile(
+            "st.global.v4.u16 [%0], {%1, %2, %3, %4};"
+            :
+            : "l"(dQ_ptr + row * D + col),
+              "h"(__half_as_ushort(h0)),
+              "h"(__half_as_ushort(h1)),
+              "h"(__half_as_ushort(h2)),
+              "h"(__half_as_ushort(h3))
+            : "memory"
+        );
     }
-
 }
 
 // ============================================================================
@@ -982,49 +976,46 @@ flash_attention_backward_dkv_kernel(
     }
 
     // Write dK + dV to global memory at once
-    int vec_elem_dkv = valid_kv_rows * D;
-    int vec_size_dkv = (vec_elem_dkv + 4 - 1) / 4;
+    const int total_fp16_x4 = (valid_kv_rows * D) / 4;
+    for (int i = tid; i < total_fp16_x4; i += THREADS) {
+        const int row = i / (D / 4);
+        const int col = (i % (D / 4)) * 4;
 
-    for (int vec_idx = tid; vec_idx < vec_size_dkv; vec_idx += THREADS) {
-        int linear_idx = vec_idx * 4;
-        int row = linear_idx / D;
-        int col = linear_idx % D;
-        
-        if (row < valid_kv_rows) {
-            float4 dK_val, dV_val;
-            dK_val.x = s_dK_accum[row * KV_STRIDE + col];
-            dK_val.y = (col + 1 < D) ? s_dK_accum[row * KV_STRIDE + col + 1] : 0.0f;
-            dK_val.z = (col + 2 < D) ? s_dK_accum[row * KV_STRIDE + col + 2] : 0.0f;
-            dK_val.w = (col + 3 < D) ? s_dK_accum[row * KV_STRIDE + col + 3] : 0.0f;
-            
-            dV_val.x = s_dV_accum[row * KV_STRIDE + col];
-            dV_val.y = (col + 1 < D) ? s_dV_accum[row * KV_STRIDE + col + 1] : 0.0f;
-            dV_val.z = (col + 2 < D) ? s_dV_accum[row * KV_STRIDE + col + 2] : 0.0f;
-            dV_val.w = (col + 3 < D) ? s_dV_accum[row * KV_STRIDE + col + 3] : 0.0f;
-            
-            // Vectorized fp32 -> fp16 conversion
-            __half2 h2_low_dk = __float22half2_rn(make_float2(dK_val.x, dK_val.y));
-            __half2 h2_high_dk = __float22half2_rn(make_float2(dK_val.z, dK_val.w));
-            
-            uint2 packed_dk;
-            packed_dk.x = *reinterpret_cast<unsigned int*>(&h2_low_dk);
-            packed_dk.y = *reinterpret_cast<unsigned int*>(&h2_high_dk);
-            
-            reinterpret_cast<uint2*>(&dK_ptr[row * D + col])[0] = packed_dk;
+        const float* s_dK_row = s_dK_accum + row * KV_STRIDE;
+        const float* s_dV_row = s_dV_accum + row * KV_STRIDE;
 
-            // Vectorized fp32 -> fp16 conversion
-            __half2 h2_low_dv = __float22half2_rn(make_float2(dV_val.x, dV_val.y));
-            __half2 h2_high_dv = __float22half2_rn(make_float2(dV_val.z, dV_val.w));
-            
-            uint2 packed_dv;
-            packed_dv.x = *reinterpret_cast<unsigned int*>(&h2_low_dv);
-            packed_dv.y = *reinterpret_cast<unsigned int*>(&h2_high_dv);
-            
-            reinterpret_cast<uint2*>(&dV_ptr[row * D + col])[0] = packed_dv;
+        const __half hk0 = __float2half_rn(s_dK_row[col + 0]);
+        const __half hk1 = __float2half_rn(s_dK_row[col + 1]);
+        const __half hk2 = __float2half_rn(s_dK_row[col + 2]);
+        const __half hk3 = __float2half_rn(s_dK_row[col + 3]);
 
-        }
+        const __half hv0 = __float2half_rn(s_dV_row[col + 0]);
+        const __half hv1 = __float2half_rn(s_dV_row[col + 1]);
+        const __half hv2 = __float2half_rn(s_dV_row[col + 2]);
+        const __half hv3 = __float2half_rn(s_dV_row[col + 3]);
+
+        asm volatile(
+            "st.global.v4.u16 [%0], {%1, %2, %3, %4};"
+            :
+            : "l"(dK_ptr + row * D + col),
+              "h"(__half_as_ushort(hk0)),
+              "h"(__half_as_ushort(hk1)),
+              "h"(__half_as_ushort(hk2)),
+              "h"(__half_as_ushort(hk3))
+            : "memory"
+        );
+
+        asm volatile(
+            "st.global.v4.u16 [%0], {%1, %2, %3, %4};"
+            :
+            : "l"(dV_ptr + row * D + col),
+              "h"(__half_as_ushort(hv0)),
+              "h"(__half_as_ushort(hv1)),
+              "h"(__half_as_ushort(hv2)),
+              "h"(__half_as_ushort(hv3))
+            : "memory"
+        );
     }
-
 }
 
 // ============================================================================
