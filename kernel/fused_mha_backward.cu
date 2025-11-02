@@ -204,31 +204,32 @@ flash_attention_backward_dq_kernel(
     __half* sdO_base     = sKV_base + BLOCK_N * KV_STRIDE;
     __half* sdS_base     = reinterpret_cast<__half*>(dov_buffer);
 
-    // Initialize dQ buffer to zero
-    for (int idx = tid; idx < BLOCK_M * Q_STRIDE; idx += THREADS) {
-        s_dQ[idx] = 0.0f;
-    }
-    __syncthreads();
+    // Unified initialization: Q/dO load + dQ zeroing
+    const int q_stride_uint4 = (Q_STRIDE + PER_UINT4 - 1) / PER_UINT4;
+    const int max_work       = max((BLOCK_M * Q_STRIDE), VECTOR_Q);
+    const uint4* q_vec       = reinterpret_cast<const uint4*>(q_ptr);
+    const uint4* do_vec      = reinterpret_cast<const uint4*>(dO_ptr);
+          uint4* sQ_vec      = reinterpret_cast<uint4*>(sQ);
+          uint4* sdO_vec     = reinterpret_cast<uint4*>(sdO_base);
 
-    // Load Q + dO into shared memory at once (as fp16)
-    const uint4* q_vec  = reinterpret_cast<const uint4*>(q_ptr);
-    uint4*       sQ_vec = reinterpret_cast<uint4*>(sQ);
-    const uint4* do_vec = reinterpret_cast<const uint4*>(dO_ptr);
-    uint4*      sdO_vec = reinterpret_cast<uint4*>(sdO_base);
-    const int    q_stride_uint4 = (Q_STRIDE + PER_UINT4 - 1) / PER_UINT4;
+    for (int i = tid; i < max_work; i += THREADS) {
 
-    #pragma unroll 2
-    for (int idx = tid; idx < VECTOR_Q; idx += THREADS) {
-        const int row     = idx / VECTOR_D;
-        const int vec_col = idx % VECTOR_D;
-        uint4 q_val = make_uint4(0, 0, 0, 0);
-        uint4 do_val = make_uint4(0, 0, 0, 0);
-        if (row < valid_q_rows && vec_col < VECTOR_D) {
-            q_val  = __ldg(&q_vec[row * VECTOR_D + vec_col]);
-            do_val = __ldg(&do_vec[row * VECTOR_D + vec_col]);
+        // 1. Zero dQ accumulator
+        if (i < (BLOCK_M * Q_STRIDE)) { s_dQ[i] = 0.0f; }
+
+        // 2. Load Q and dO
+        if (i < VECTOR_Q) {
+            const int row = i / VECTOR_D;
+            const int col = i % VECTOR_D;
+            uint4 q_val   = make_uint4(0, 0, 0, 0);
+            uint4 do_val  = make_uint4(0, 0, 0, 0);
+            if (row < valid_q_rows && col < VECTOR_D) {
+                q_val  = __ldg(&q_vec[row * VECTOR_D + col]);
+                do_val = __ldg(&do_vec[row * VECTOR_D + col]);
+            }
+            sQ_vec[row * q_stride_uint4 + col] = q_val;
+            sdO_vec[row * q_stride_uint4 + col] = do_val;
         }
-        sQ_vec[row * q_stride_uint4 + vec_col] = q_val;
-        sdO_vec[row * q_stride_uint4 + vec_col] = do_val;
     }
     __syncthreads();
 
@@ -262,8 +263,7 @@ flash_attention_backward_dq_kernel(
     __syncthreads();
 
     // Prefetch first block of K and V (L2 cache line = 128 bytes = 64 fp16)
-    const int total_fp16 = BLOCK_N * D;
-    const int cache_lines = (total_fp16 + 63) / 64;
+    const int cache_lines = ((BLOCK_N * D) + 63) / 64;
     const int prefetch_threads = min(THREADS, cache_lines);
     if (tid < prefetch_threads) {
         const __half* first_k = k_ptr + tid * 64;
@@ -647,31 +647,34 @@ flash_attention_backward_dkv_kernel(
     float* s_dK_accum   = reinterpret_cast<float*>(smem + Config::SMEM_QKV_BUFFER + 2 * Config::SMEM_ACC_BUFFER + Config::SMEM_STATS);
     float* s_dV_accum   = s_dK_accum + BLOCK_M * KV_STRIDE;
     
-    const int kv_stride_uint4 = (KV_STRIDE + PER_UINT4 - 1) / PER_UINT4;
-
     // Load and reuse K/V
     __half* sK = sKV_base;
     __half* sV = sKV_base;
 
-    // Init accum with zero
-    for (int idx = tid; idx < BLOCK_M * KV_STRIDE; idx += THREADS) {
-        s_dK_accum[idx] = 0.0f;
-        s_dV_accum[idx] = 0.0f;
-    }
-    __syncthreads();
+    // Unified initialization: K load + sdK/sdV zeroing
+    const uint4* k_vec        = reinterpret_cast<const uint4*>(k_ptr);
+          uint4* sK_vec       = reinterpret_cast<uint4*>(sK);
+    const int kv_stride_uint4 = (KV_STRIDE + PER_UINT4 - 1) / PER_UINT4;
+    const int max_work        = max((BLOCK_M * KV_STRIDE), VECTOR_KV);
 
-    // Load K
-    const uint4* k_vec = reinterpret_cast<const uint4*>(k_ptr);
-    uint4* sK_vec = reinterpret_cast<uint4*>(sK);
-    #pragma unroll 2
-    for (int idx = tid; idx < VECTOR_KV; idx += THREADS) {
-        const int row = idx / VECTOR_D;
-        const int vec_col = idx % VECTOR_D;
-        uint4 val = make_uint4(0, 0, 0, 0);
-        if (row < valid_kv_rows && vec_col < VECTOR_D) {
-            val = __ldg(&k_vec[row * VECTOR_D + vec_col]);
+    for (int i = tid; i < max_work; i += THREADS) {
+
+        // 1. Zero accumulators (s_dK_accum, s_dV_accum)
+        if (i < (BLOCK_M * KV_STRIDE)) { 
+            s_dK_accum[i] = 0.0f;
+            s_dV_accum[i] = 0.0f;
         }
-        sK_vec[row * kv_stride_uint4 + vec_col] = val;
+
+        // 2. Load K
+        if (i < VECTOR_KV) {
+            const int row = i / VECTOR_D;
+            const int col = i % VECTOR_D;
+            uint4 val = make_uint4(0, 0, 0, 0);
+            if (row < valid_kv_rows && col < VECTOR_D) {
+                val = __ldg(&k_vec[row * VECTOR_D + col]);
+            }
+            sK_vec[row * kv_stride_uint4 + col] = val;
+        }
     }
     __syncthreads();
 

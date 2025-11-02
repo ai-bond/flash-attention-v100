@@ -137,35 +137,31 @@ flash_attention_forward_kernel(
     float*  sRowSum = sRowMax + BLOCK_M;
     float*  sOldMax = sRowSum + BLOCK_M;
 
-    // Load Q into shared memory at once
+    // Unified initialization: Q load + O zeroing + state buffers
     const uint4* q_vec = reinterpret_cast<const uint4*>(q_ptr);
-    uint4* sQ_vec = reinterpret_cast<uint4*>(sQ);
-    const int q_stride_uint4 = (Q_STRIDE + PER_UINT4 - 1) / PER_UINT4;
+    uint4*      sQ_vec = reinterpret_cast<uint4*>(sQ);
+    float4*     sO_vec = reinterpret_cast<float4*>(sO);
+    const float4 zero4 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    const int max_work = max(max(BLOCK_M * VECTOR_D, VECTOR_F), BLOCK_M);
+
     #pragma unroll 4
-    for (int idx = tid; idx < BLOCK_M * VECTOR_D; idx += THREADS) {
-        const int row = idx / VECTOR_D;
-        const int vec_col = idx % VECTOR_D;
-        uint4 val = make_uint4(0, 0, 0, 0);
-        if (row < valid_q_rows && vec_col < VECTOR_D) {
-            val = __ldg(&q_vec[row * VECTOR_D + vec_col]);
+    for (int i = tid; i < max_work; i += THREADS) {
+        // 1. Load Q into sQ
+        if (i < BLOCK_M * VECTOR_D) {
+            const int row = i / VECTOR_D;
+            const int col = i % VECTOR_D;
+            uint4 val = make_uint4(0, 0, 0, 0);
+            if (row < valid_q_rows && col < VECTOR_D) {
+                val = __ldg(&q_vec[row * VECTOR_D + col]);
+            }
+            sQ_vec[row * ((Q_STRIDE + PER_UINT4 - 1) / PER_UINT4) + col] = val;
         }
-        sQ_vec[row * q_stride_uint4 + vec_col] = val;
-    }
-    __syncthreads();
-    
-    // Initialize buffer's
-    if (tid < BLOCK_M) {
-        sRowMax[tid] = NEG_INF;
-        sRowSum[tid] = 0.0f;
-        sOldMax[tid] = 1.0f;
-    }
-    
-    // Initialize O to zero
-    float4* sO_vec = reinterpret_cast<float4*>(sO);
-    const float4 zero4 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);    
-    #pragma unroll 4
-    for (int i = tid; i < VECTOR_F; i += THREADS) {
-        sO_vec[i] = zero4;
+
+        // 2. Zero out O accumulator
+        if (i < VECTOR_F) { sO_vec[i] = zero4; }
+
+        // 3. Initialize per-row state buffers (sRowMax, sRowSum, sOldMax)
+        if (i < BLOCK_M) { sRowMax[i] = NEG_INF; sRowSum[i] = 0.0f; sOldMax[i] = 1.0f; }
     }
     __syncthreads();
 
