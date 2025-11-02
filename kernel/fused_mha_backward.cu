@@ -261,6 +261,18 @@ flash_attention_backward_dq_kernel(
     if (tid < valid_q_rows) { sLse[tid] = lse_ptr[tid]; }
     __syncthreads();
 
+    // Prefetch first block of K and V (L2 cache line = 128 bytes = 64 fp16)
+    const int total_fp16 = BLOCK_N * D;
+    const int cache_lines = (total_fp16 + 63) / 64;
+    const int prefetch_threads = min(THREADS, cache_lines);
+    if (tid < prefetch_threads) {
+        const __half* first_k = k_ptr + tid * 64;
+        const __half* first_v = v_ptr + tid * 64;
+        asm volatile("prefetch.global.L2 [%0];" :: "l"(first_k));
+        asm volatile("prefetch.global.L2 [%0];" :: "l"(first_v));
+    }
+    __syncthreads();
+
     // ========================================================================
     // MAIN LOOP
     // ========================================================================
@@ -272,6 +284,18 @@ flash_attention_backward_dq_kernel(
         const int start_col = block_n * BLOCK_N;
         if (start_col >= N) break;
         const int valid_k_rows = min(BLOCK_N, N - start_col);
+
+        // Prefetch next block of K and V
+        if (block_n + 1 < num_n_blocks) {
+            const int cache_lines = ((BLOCK_N * D) + 63) / 64;
+            const int prefetch_threads = min(THREADS, cache_lines);
+            if (tid < prefetch_threads) {
+                const __half* next_k = k_ptr + (block_n + 1) * BLOCK_N * D + tid * 64;
+                const __half* next_v = v_ptr + (block_n + 1) * BLOCK_N * D + tid * 64;
+                asm volatile("prefetch.global.L2 [%0];" :: "l"(next_k));
+                asm volatile("prefetch.global.L2 [%0];" :: "l"(next_v));
+            }
+        }
 
         // Load K into shared memory
         __half* sK = sKV_base;
@@ -624,7 +648,6 @@ flash_attention_backward_dkv_kernel(
     float* s_dV_accum   = s_dK_accum + BLOCK_M * KV_STRIDE;
     
     const int kv_stride_uint4 = (KV_STRIDE + PER_UINT4 - 1) / PER_UINT4;
-    const int num_q_blocks = (M + BLOCK_N - 1) / BLOCK_N;
 
     // Load and reuse K/V
     __half* sK = sKV_base;
@@ -655,6 +678,9 @@ flash_attention_backward_dkv_kernel(
     // ========================================================================
     // MAIN LOOP
     // ========================================================================
+
+    const int num_q_blocks = (M + BLOCK_N - 1) / BLOCK_N;
+
     for (int block_n = 0; block_n < num_q_blocks; ++block_n) {
         const int start_col = block_n * BLOCK_N;
         if (start_col >= M) break;
