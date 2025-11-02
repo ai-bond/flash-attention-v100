@@ -82,8 +82,8 @@ flash_attention_forward_kernel(
     const __half* __restrict__ Q,
     const __half* __restrict__ K,
     const __half* __restrict__ V,
-    float* __restrict__ Out,
-    float* __restrict__ softmax_lse,
+          __half* __restrict__ Out,
+           float* __restrict__ softmax_lse,
     const int B,
     const int H,
     const int M,
@@ -120,21 +120,22 @@ flash_attention_forward_kernel(
     const int lane_id = tid % WARP_SIZE;
     
     // Global pointers
-    const __half* q_ptr = Q + (size_t)batch_head_id * M * D + start_row * D;
-    const __half* k_ptr = K + (size_t)batch_head_id * N * D;
-    const __half* v_ptr = V + (size_t)batch_head_id * N * D;
-    float* out_ptr = Out + (size_t)batch_head_id * M * D + start_row * D;
+    const __half* q_ptr    = Q +           (size_t)batch_head_id * M * D + start_row * D;
+    const __half* k_ptr    = K +           (size_t)batch_head_id * N * D;
+    const __half* v_ptr    = V +           (size_t)batch_head_id * N * D;
+          __half* out_ptr  = Out +         (size_t)batch_head_id * M * D + start_row * D;
     float* softmax_lse_ptr = softmax_lse + (size_t)batch_head_id * M + start_row;
     
     // Shared memory layout
     extern __shared__ char smem[];
-    __half* sQ = reinterpret_cast<__half*>(smem);
-    __half* sKV = sQ + BLOCK_M * Q_STRIDE;
-    float* sS = reinterpret_cast<float*>(sKV + BLOCK_N * KV_STRIDE);
-    float* sO = sS + BLOCK_M * S_STRIDE;
-    float* sRowMax = sO + BLOCK_M * O_STRIDE;
-    float* sRowSum = sRowMax + BLOCK_M;
-    float* sOldMax = sRowSum + BLOCK_M;
+   
+    __half* sQ      = reinterpret_cast<__half*>(smem);
+    __half* sKV     = sQ + BLOCK_M * Q_STRIDE;
+    float*  sS      = reinterpret_cast<float*>(sKV + BLOCK_N * KV_STRIDE);
+    float*  sO      = sS + BLOCK_M * S_STRIDE;
+    float*  sRowMax = sO + BLOCK_M * O_STRIDE;
+    float*  sRowSum = sRowMax + BLOCK_M;
+    float*  sOldMax = sRowSum + BLOCK_M;
 
     // Load Q into shared memory at once
     const uint4* q_vec = reinterpret_cast<const uint4*>(q_ptr);
@@ -445,7 +446,16 @@ flash_attention_forward_kernel(
             vec_val.z = (col + 2 < D) ? sO[row * O_STRIDE + col + 2] * inv_sum : 0.0f;
             vec_val.w = (col + 3 < D) ? sO[row * O_STRIDE + col + 3] * inv_sum : 0.0f;
             
-            reinterpret_cast<float4*>(&out_ptr[row * D + col])[0] = vec_val;
+            // Vectorized fp32 -> fp16 conversion
+            __half2 h2_low = __float22half2_rn(make_float2(vec_val.x, vec_val.y));
+            __half2 h2_high = __float22half2_rn(make_float2(vec_val.z, vec_val.w));
+            
+            // Pack 4 fp16 into uint2
+            uint2 packed;
+            packed.x = *reinterpret_cast<unsigned int*>(&h2_low);
+            packed.y = *reinterpret_cast<unsigned int*>(&h2_high);
+            
+            reinterpret_cast<uint2*>(&out_ptr[row * D + col])[0] = packed;
         }
     }
     
@@ -494,7 +504,7 @@ void launcher_flash_attention_forward(
             reinterpret_cast<const __half*>(Q.data_ptr()),
             reinterpret_cast<const __half*>(K.data_ptr()),
             reinterpret_cast<const __half*>(V.data_ptr()),
-            Out.data_ptr<float>(),
+            reinterpret_cast<__half*>(Out.data_ptr()),
             softmax_lse.data_ptr<float>(),
             B, H, M, N, softmax_scale
         );
@@ -503,7 +513,7 @@ void launcher_flash_attention_forward(
             reinterpret_cast<const __half*>(Q.data_ptr()),
             reinterpret_cast<const __half*>(K.data_ptr()),
             reinterpret_cast<const __half*>(V.data_ptr()),
-            Out.data_ptr<float>(),
+            reinterpret_cast<__half*>(Out.data_ptr()),
             softmax_lse.data_ptr<float>(),
             B, H, M, N, softmax_scale
         );
@@ -513,36 +523,63 @@ void launcher_flash_attention_forward(
 // ============================================================================
 // WRAPPER
 // ============================================================================
-void flash_attention_forward(
-    const torch::Tensor& Q,
-    const torch::Tensor& K,
-    const torch::Tensor& V,
-    torch::Tensor& Out,
-    torch::Tensor& softmax_lse,
-    float softmax_scale,
-    bool causal
+std::vector<at::Tensor> flash_attention_forward(
+    at::Tensor& q,
+    const at::Tensor& k,
+    const at::Tensor& v,
+    std::optional<at::Tensor>& out_,
+    std::optional<at::Tensor>& alibi_slopes_,
+    const float p_dropout,
+    const float softmax_scale,
+    bool is_causal,
+    int window_size_left,
+    int window_size_right,
+    const float softcap,
+    const bool return_softmax,
+    std::optional<at::Generator> gen_
 ) {
-    const int D = Q.size(3);
+    // Now unsupported functions
+    TORCH_CHECK(!alibi_slopes_.has_value(), "alibi_slopes not supported");
+    TORCH_CHECK(p_dropout == 0.f, "dropout not supported");
+    TORCH_CHECK(window_size_left == -1, "window_size_left not supported");
+    TORCH_CHECK(window_size_right == -1 || (is_causal && window_size_right == 0), "window not supported");
+    TORCH_CHECK(softcap == 0.f, "softcap not supported");
+    TORCH_CHECK(!return_softmax, "return_softmax not supported");
+    TORCH_CHECK(!gen_.has_value(), "Generator not supported");
 
-    TORCH_CHECK(Q.is_cuda() && K.is_cuda() && V.is_cuda(), "Tensors must be on CUDA");
-    TORCH_CHECK(Q.dtype() == torch::kFloat16, "Q must be float16");
-    TORCH_CHECK(Out.dtype() == torch::kFloat32, "Out must be float32");
-    TORCH_CHECK(D % 2 == 0, "Embedding dimension D must be even, but got D = ", D);
+    // Check layouts
+    TORCH_CHECK(q.dtype() == torch::kFloat16, "q must be fp16");
+    TORCH_CHECK(k.dtype() == torch::kFloat16, "k must be fp16");
+    TORCH_CHECK(v.dtype() == torch::kFloat16, "v must be fp16");
+    TORCH_CHECK(q.is_cuda() && k.is_cuda() && v.is_cuda(), "Tensors must be on CUDA");
+    TORCH_CHECK(q.stride(-1) == 1 && k.stride(-1) == 1 && v.stride(-1) == 1, "Last dim must be contiguous");
+
+    const auto sizes = q.sizes();
+    const int B = sizes[0], H = sizes[1], M = sizes[2], D = sizes[3];
+    const int N = k.size(2);
+    TORCH_CHECK(D <= 256 && D % 8 == 0 && D % 2 == 0, "D must be even, <=256, multiple of 8");
+
+    // Out tensors
+    at::Tensor out_fp16 = out_.has_value() ? out_.value() : torch::empty_like(q);
+    TORCH_CHECK(out_fp16.dtype() == torch::kFloat16, "out must be fp16");
+    auto softmax_lse = torch::empty({B, H, M}, torch::dtype(torch::kFloat32).device(q.device()));
+    TORCH_CHECK(softmax_lse.dtype() == torch::kFloat32, "softmax_lse must be fp32");
 
     auto stream = at::cuda::getCurrentCUDAStream().stream();
-    auto dprops = at::cuda::getCurrentDeviceProperties();
-    bool is_sm70 = dprops->major == 7 && dprops->minor == 0;
-    TORCH_CHECK(is_sm70, "Kernel supports only Volta GPUs.");
+    auto props  = at::cuda::getCurrentDeviceProperties();
+    bool sm70   = props->major == 7 && props->minor == 0;
+    TORCH_CHECK(sm70, "Kernel supports only Volta GPUs.");
 
     switch (D) {
-        case 16:  launcher_flash_attention_forward<16>(Q, K, V, Out, softmax_lse, softmax_scale, causal, stream); break;
-        case 32:  launcher_flash_attention_forward<32>(Q, K, V, Out, softmax_lse, softmax_scale, causal, stream); break;
-        case 64:  launcher_flash_attention_forward<64>(Q, K, V, Out, softmax_lse, softmax_scale, causal, stream); break;
-        case 128: launcher_flash_attention_forward<128>(Q, K, V, Out, softmax_lse, softmax_scale, causal, stream); break;
-        case 256: launcher_flash_attention_forward<256>(Q, K, V, Out, softmax_lse, softmax_scale, causal, stream); break;
+        case 16:  launcher_flash_attention_forward<16>(q, k, v, out_fp16, softmax_lse, softmax_scale, is_causal, stream); break;
+        case 32:  launcher_flash_attention_forward<32>(q, k, v, out_fp16, softmax_lse, softmax_scale, is_causal, stream); break;
+        case 64:  launcher_flash_attention_forward<64>(q, k, v, out_fp16, softmax_lse, softmax_scale, is_causal, stream); break;
+        case 128: launcher_flash_attention_forward<128>(q, k, v, out_fp16, softmax_lse, softmax_scale, is_causal, stream); break;
+        case 256: launcher_flash_attention_forward<256>(q, k, v, out_fp16, softmax_lse, softmax_scale, is_causal, stream); break;
         default: TORCH_CHECK(false, "Unsupported D: ", D);
     }
     
-    cudaError_t err = cudaGetLastError();
-    TORCH_CHECK(err == cudaSuccess, "Kernel failed: ", cudaGetErrorString(err));
+    auto p = torch::empty({0}, q.options());
+    auto rng_state = torch::empty({2}, torch::dtype(torch::kInt64).device(q.device()));
+    return {out_fp16, softmax_lse, p, rng_state};
 }
