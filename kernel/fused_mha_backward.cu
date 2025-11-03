@@ -239,23 +239,53 @@ flash_attention_backward_dq_kernel(
     if (tid < valid_q_rows * THREADS_PER_ROW) {
         const int row = tid / THREADS_PER_ROW;
         const int thread_in_row = tid % THREADS_PER_ROW;
+        const int fp16_x4_per_row = D / 4;
+        const int work_per_thread = (fp16_x4_per_row + THREADS_PER_ROW - 1) / THREADS_PER_ROW;
+    
         float thread_dot = 0.0f;
-        const int cols_per_thread = (D + THREADS_PER_ROW - 1) / THREADS_PER_ROW;
-
+    
         #pragma unroll
-        for (int j = 0; j < cols_per_thread; ++j) {
-            const int col = thread_in_row + j * THREADS_PER_ROW;
-            if (col < D) {
-                float o_val = __half2float(o_ptr_half[row * D + col]);
-                float dO_val = __half2float(sdO_base[row * Q_STRIDE + col]);
-                thread_dot += o_val * dO_val;
-            }
+        for (int j = 0; j < work_per_thread; ++j) {
+            const int chunk_idx = thread_in_row + j * THREADS_PER_ROW;
+            if (chunk_idx >= fp16_x4_per_row) break;
+        
+            const int col = chunk_idx * 4;
+        
+            // Pointers for O (global) and dO (shared memory)
+            const half* o_addr = o_ptr_half + row * D + col;
+            const half* dO_addr = sdO_base + row * Q_STRIDE + col;
+        
+            // Load 4 fp16 elements using vectorized load from global O
+            ushort o_h0, o_h1, o_h2, o_h3;
+            asm volatile(
+                "ld.global.v4.u16 {%0, %1, %2, %3}, [%4];"
+                : "=h"(o_h0), "=h"(o_h1), "=h"(o_h2), "=h"(o_h3)
+                : "l"(o_addr)
+                : "memory"
+            );
+        
+            // Load 4 fp16 elements from shared memory dO
+            const half dO_0 = dO_addr[0], dO_1 = dO_addr[1], dO_2 = dO_addr[2], dO_3 = dO_addr[3];
+        
+            // Convert ushort to half for O
+            const half o_0 = __ushort_as_half(o_h0), o_1 = __ushort_as_half(o_h1), o_2 = __ushort_as_half(o_h2), o_3 = __ushort_as_half(o_h3);
+        
+            // Convert to float and accumulate (O ⊙ dO)
+            const float fo_0 = __half2float(o_0),  fo_1 = __half2float(o_1),  fo_2 = __half2float(o_2),  fo_3 = __half2float(o_3);
+            const float fd_0 = __half2float(dO_0), fd_1 = __half2float(dO_1), fd_2 = __half2float(dO_2), fd_3 = __half2float(dO_3);
+        
+            // FMA accumulation
+            thread_dot = __fmaf_rn(fo_0, fd_0, thread_dot);
+            thread_dot = __fmaf_rn(fo_1, fd_1, thread_dot);
+            thread_dot = __fmaf_rn(fo_2, fd_2, thread_dot);
+            thread_dot = __fmaf_rn(fo_3, fd_3, thread_dot);
         }
-
+    
         #pragma unroll
         for (int offset = 1; offset < THREADS_PER_ROW; offset <<= 1) {
             thread_dot += __shfl_xor_sync(0xffffffff, thread_dot, offset);
         }
+    
         if (thread_in_row == 0) { sRowDot[row] = thread_dot; }
     }
 
@@ -713,28 +743,55 @@ flash_attention_backward_dkv_kernel(
 
         // Compute row_dot = O ⊙ dO (element-wise dot product)
         const __half* current_o_ptr = o_ptr + start_col * D;
-        
+
         if (tid < valid_q_rows * THREADS_PER_ROW) {
             const int row = tid / THREADS_PER_ROW;
             const int thread_in_row = tid % THREADS_PER_ROW;
+            const int fp16_x4_per_row = D / 4;
+            const int work_per_thread = (fp16_x4_per_row + THREADS_PER_ROW - 1) / THREADS_PER_ROW;
+    
             float thread_dot = 0.0f;
-            const int cols_per_thread = (D + THREADS_PER_ROW - 1) / THREADS_PER_ROW;
-
+    
             #pragma unroll
-            for (int j = 0; j < cols_per_thread; ++j) {
-                const int col = thread_in_row + j * THREADS_PER_ROW;
-                if (col < D) {
-                    float o_val = __half2float(current_o_ptr[row * D + col]);
-                    float dO_val = __half2float(sdO[row * Q_STRIDE + col]);
-                    thread_dot += o_val * dO_val;
-                }
+            for (int j = 0; j < work_per_thread; ++j) {
+                const int chunk_idx = thread_in_row + j * THREADS_PER_ROW;
+                if (chunk_idx >= fp16_x4_per_row) break;
+        
+                const int col = chunk_idx * 4;
+        
+                const half* o_addr = current_o_ptr + row * D + col;
+                const half* dO_addr = sdO + row * Q_STRIDE + col;
+        
+                ushort o_h0, o_h1, o_h2, o_h3;
+                asm volatile(
+                    "ld.global.v4.u16 {%0, %1, %2, %3}, [%4];"
+                    : "=h"(o_h0), "=h"(o_h1), "=h"(o_h2), "=h"(o_h3)
+                    : "l"(o_addr)
+                    : "memory"
+                );
+        
+                // Load 4 fp16 elements from shared memory dO
+                const half dO_0 = dO_addr[0], dO_1 = dO_addr[1], dO_2 = dO_addr[2], dO_3 = dO_addr[3];
+        
+                // Convert ushort to half for O
+                const half o_0 = __ushort_as_half(o_h0), o_1 = __ushort_as_half(o_h1), o_2 = __ushort_as_half(o_h2), o_3 = __ushort_as_half(o_h3);
+        
+                // Convert to float and accumulate (O ⊙ dO)
+                const float fo_0 = __half2float(o_0),  fo_1 = __half2float(o_1),  fo_2 = __half2float(o_2),  fo_3 = __half2float(o_3);
+                const float fd_0 = __half2float(dO_0), fd_1 = __half2float(dO_1), fd_2 = __half2float(dO_2), fd_3 = __half2float(dO_3);
+        
+                // FMA accumulation
+                thread_dot = __fmaf_rn(fo_0, fd_0, thread_dot);
+                thread_dot = __fmaf_rn(fo_1, fd_1, thread_dot);
+                thread_dot = __fmaf_rn(fo_2, fd_2, thread_dot);
+                thread_dot = __fmaf_rn(fo_3, fd_3, thread_dot);
             }
-
+    
             #pragma unroll
             for (int offset = 1; offset < THREADS_PER_ROW; offset <<= 1) {
                 thread_dot += __shfl_xor_sync(0xffffffff, thread_dot, offset);
             }
-
+    
             if (thread_in_row == 0) { sRowDot[row] = thread_dot; }
         }
 
