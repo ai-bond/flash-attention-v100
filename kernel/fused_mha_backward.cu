@@ -137,13 +137,13 @@ struct dKVKernelConfig {
 template<int D, bool IS_CAUSAL>
 __global__ void __launch_bounds__(dQKernelConfig<D>::THREADS_PER_BLOCK, 2)
 flash_attention_backward_dq_kernel(
-    const __half* __restrict__ Q,
-    const __half* __restrict__ K,
-    const __half* __restrict__ V,
-    const float*  __restrict__ O,
-    const __half* __restrict__ dO,
-    const float*  __restrict__ softmax_lse,
-    float*        __restrict__ dQ,
+    const __half*  __restrict__ Q,
+    const __half*  __restrict__ K,
+    const __half*  __restrict__ V,
+    const __half*  __restrict__ O,
+    const __half*  __restrict__ dO,
+    const  float*  __restrict__ softmax_lse,
+          __half*  __restrict__ dQ,
     const int B,
     const int H,
     const int M,
@@ -181,16 +181,17 @@ flash_attention_backward_dq_kernel(
     const int warp_id      = tid / WARP_SIZE;
 
     // Global pointers
-    const __half* q_ptr   = Q + (size_t)batch_head_id * M * D + start_row * D;
-    const __half* k_ptr   = K + (size_t)batch_head_id * N * D;
-    const __half* v_ptr   = V + (size_t)batch_head_id * N * D;
-    const float*  o_ptr   = O + (size_t)batch_head_id * M * D + start_row * D;
-    const __half* dO_ptr  = dO + (size_t)batch_head_id * M * D + start_row * D;
-    float*        dQ_ptr  = dQ + (size_t)batch_head_id * M * D + start_row * D;
+    const __half* q_ptr   = Q           + (size_t)batch_head_id * M * D + start_row * D;
+    const __half* k_ptr   = K           + (size_t)batch_head_id * N * D;
+    const __half* v_ptr   = V           + (size_t)batch_head_id * N * D;
+    const __half* o_ptr   = O           + (size_t)batch_head_id * M * D + start_row * D;
+    const __half* dO_ptr  = dO          + (size_t)batch_head_id * M * D + start_row * D;
+          __half* dQ_ptr  = dQ          + (size_t)batch_head_id * M * D + start_row * D;
     const float*  lse_ptr = softmax_lse + (size_t)batch_head_id * M + start_row;
 
     // Shared memory layout
     extern __shared__ char smem[];
+    
     __half* qkv_buffer   = reinterpret_cast<__half*>(smem);
     float*  acc_buffer   = reinterpret_cast<float*>(smem + Config::SMEM_QKV_BUFFER);
     float*  dov_buffer   = acc_buffer + BLOCK_M * S_STRIDE;
@@ -198,65 +199,113 @@ flash_attention_backward_dq_kernel(
     float*  sRowDot      = stats_buffer;
     float*  sLse         = stats_buffer + BLOCK_M;
     float*  s_dQ         = reinterpret_cast<float*>(smem + Config::SMEM_QKV_BUFFER + 2 * Config::SMEM_ACC_BUFFER + Config::SMEM_STATS);
-    
-    __half* sQ       = qkv_buffer;
-    __half* sKV_base = qkv_buffer + BLOCK_M * Q_STRIDE;
-    __half* sdO_base = sKV_base + BLOCK_N * KV_STRIDE;
-    __half* sdS_base = reinterpret_cast<__half*>(dov_buffer);
+    __half* sQ           = qkv_buffer;
+    __half* sKV_base     = qkv_buffer + BLOCK_M * Q_STRIDE;
+    __half* sdO_base     = sKV_base + BLOCK_N * KV_STRIDE;
+    __half* sdS_base     = reinterpret_cast<__half*>(dov_buffer);
 
-    // Load Q + dO into shared memory at once
-    const uint4* q_vec     = reinterpret_cast<const uint4*>(q_ptr);
-    uint4*       sQ_vec    = reinterpret_cast<uint4*>(sQ);
-    const int    q_stride_uint4 = (Q_STRIDE + PER_UINT4 - 1) / PER_UINT4;
-    const uint4* do_vec     = reinterpret_cast<const uint4*>(dO_ptr);
-    uint4*       sdO_vec   = reinterpret_cast<uint4*>(sdO_base);
+    // Unified initialization: Q/dO load + dQ zeroing
+    const int q_stride_uint4 = (Q_STRIDE + PER_UINT4 - 1) / PER_UINT4;
+    const int max_work       = max((BLOCK_M * Q_STRIDE), VECTOR_Q);
+    const uint4* q_vec       = reinterpret_cast<const uint4*>(q_ptr);
+    const uint4* do_vec      = reinterpret_cast<const uint4*>(dO_ptr);
+          uint4* sQ_vec      = reinterpret_cast<uint4*>(sQ);
+          uint4* sdO_vec     = reinterpret_cast<uint4*>(sdO_base);
 
-    #pragma unroll 2
-    for (int idx = tid; idx < VECTOR_Q; idx += THREADS) {
-        const int row     = idx / VECTOR_D;
-        const int vec_col = idx % VECTOR_D;
-        uint4 q_val = make_uint4(0, 0, 0, 0);
-        uint4 do_val = make_uint4(0, 0, 0, 0);
-        if (row < valid_q_rows && vec_col < VECTOR_D) {
-            q_val = __ldg(&q_vec[row * VECTOR_D + vec_col]);
-            do_val = __ldg(&do_vec[row * VECTOR_D + vec_col]);
+    for (int i = tid; i < max_work; i += THREADS) {
+
+        // 1. Zero dQ accumulator
+        if (i < (BLOCK_M * Q_STRIDE)) { s_dQ[i] = 0.0f; }
+
+        // 2. Load Q and dO
+        if (i < VECTOR_Q) {
+            const int row = i / VECTOR_D;
+            const int col = i % VECTOR_D;
+            uint4 q_val   = make_uint4(0, 0, 0, 0);
+            uint4 do_val  = make_uint4(0, 0, 0, 0);
+            if (row < valid_q_rows && col < VECTOR_D) {
+                q_val  = __ldg(&q_vec[row * VECTOR_D + col]);
+                do_val = __ldg(&do_vec[row * VECTOR_D + col]);
+            }
+            sQ_vec[row * q_stride_uint4 + col] = q_val;
+            sdO_vec[row * q_stride_uint4 + col] = do_val;
         }
-        sQ_vec[row * q_stride_uint4 + vec_col] = q_val;
-        sdO_vec[row * q_stride_uint4 + vec_col] = do_val;
-    }
-
-    // Initialize dQ buffer to zero
-    for (int idx = tid; idx < BLOCK_M * Q_STRIDE; idx += THREADS) {
-        s_dQ[idx] = 0.0f;
     }
     __syncthreads();
 
     // Compute row_dot = O @ dO using sdO from shared memory
+    const __half* o_ptr_half = reinterpret_cast<const __half*>(o_ptr);
+
     if (tid < valid_q_rows * THREADS_PER_ROW) {
         const int row = tid / THREADS_PER_ROW;
         const int thread_in_row = tid % THREADS_PER_ROW;
+        const int fp16_x4_per_row = D / 4;
+        const int work_per_thread = (fp16_x4_per_row + THREADS_PER_ROW - 1) / THREADS_PER_ROW;
+    
         float thread_dot = 0.0f;
-        const int cols_per_thread = (D + THREADS_PER_ROW - 1) / THREADS_PER_ROW;
-
+    
         #pragma unroll
-        for (int j = 0; j < cols_per_thread; ++j) {
-            const int col = thread_in_row + j * THREADS_PER_ROW;
-            if (col < D) {
-                float dO_val = __half2float(sdO_base[row * Q_STRIDE + col]);
-                thread_dot += o_ptr[row * D + col] * dO_val;
-            }
+        for (int j = 0; j < work_per_thread; ++j) {
+            const int chunk_idx = thread_in_row + j * THREADS_PER_ROW;
+            if (chunk_idx >= fp16_x4_per_row) break;
+        
+            const int col = chunk_idx * 4;
+        
+            // Pointers for O (global) and dO (shared memory)
+            const half* o_addr = o_ptr_half + row * D + col;
+            const half* dO_addr = sdO_base + row * Q_STRIDE + col;
+        
+            // Load 4 fp16 elements using vectorized load from global O
+            ushort o_h0, o_h1, o_h2, o_h3;
+            asm volatile(
+                "ld.global.v4.u16 {%0, %1, %2, %3}, [%4];"
+                : "=h"(o_h0), "=h"(o_h1), "=h"(o_h2), "=h"(o_h3)
+                : "l"(o_addr)
+                : "memory"
+            );
+        
+            // Load 4 fp16 elements from shared memory dO
+            const half dO_0 = dO_addr[0], dO_1 = dO_addr[1], dO_2 = dO_addr[2], dO_3 = dO_addr[3];
+        
+            // Convert ushort to half for O
+            const half o_0 = __ushort_as_half(o_h0), o_1 = __ushort_as_half(o_h1), o_2 = __ushort_as_half(o_h2), o_3 = __ushort_as_half(o_h3);
+        
+            // Convert to float and accumulate (O ⊙ dO)
+            const float fo_0 = __half2float(o_0),  fo_1 = __half2float(o_1),  fo_2 = __half2float(o_2),  fo_3 = __half2float(o_3);
+            const float fd_0 = __half2float(dO_0), fd_1 = __half2float(dO_1), fd_2 = __half2float(dO_2), fd_3 = __half2float(dO_3);
+        
+            // FMA accumulation
+            thread_dot = __fmaf_rn(fo_0, fd_0, thread_dot);
+            thread_dot = __fmaf_rn(fo_1, fd_1, thread_dot);
+            thread_dot = __fmaf_rn(fo_2, fd_2, thread_dot);
+            thread_dot = __fmaf_rn(fo_3, fd_3, thread_dot);
         }
-
+    
         #pragma unroll
         for (int offset = 1; offset < THREADS_PER_ROW; offset <<= 1) {
             thread_dot += __shfl_xor_sync(0xffffffff, thread_dot, offset);
         }
-
+    
         if (thread_in_row == 0) { sRowDot[row] = thread_dot; }
     }
 
     if (tid < valid_q_rows) { sLse[tid] = lse_ptr[tid]; }
     __syncthreads();
+
+    // Prefetch first block of K and V (L2 cache line = 128 bytes = 64 fp16)
+    const int cache_lines = ((BLOCK_N * D) + 63) / 64;
+    const int prefetch_threads = min(THREADS, cache_lines);
+    if (tid < prefetch_threads) {
+        const __half* first_k = k_ptr + tid * 64;
+        const __half* first_v = v_ptr + tid * 64;
+        asm volatile("prefetch.global.L2 [%0];" :: "l"(first_k));
+        asm volatile("prefetch.global.L2 [%0];" :: "l"(first_v));
+    }
+    __syncthreads();
+
+    // ========================================================================
+    // MAIN LOOP
+    // ========================================================================
 
     const int num_n_blocks = (N + BLOCK_N - 1) / BLOCK_N;
 
@@ -265,6 +314,18 @@ flash_attention_backward_dq_kernel(
         const int start_col = block_n * BLOCK_N;
         if (start_col >= N) break;
         const int valid_k_rows = min(BLOCK_N, N - start_col);
+
+        // Prefetch next block of K and V
+        if (block_n + 1 < num_n_blocks) {
+            const int cache_lines = ((BLOCK_N * D) + 63) / 64;
+            const int prefetch_threads = min(THREADS, cache_lines);
+            if (tid < prefetch_threads) {
+                const __half* next_k = k_ptr + (block_n + 1) * BLOCK_N * D + tid * 64;
+                const __half* next_v = v_ptr + (block_n + 1) * BLOCK_N * D + tid * 64;
+                asm volatile("prefetch.global.L2 [%0];" :: "l"(next_k));
+                asm volatile("prefetch.global.L2 [%0];" :: "l"(next_v));
+            }
+        }
 
         // Load K into shared memory
         __half* sK = sKV_base;
@@ -363,7 +424,6 @@ flash_attention_backward_dq_kernel(
             }
             sV_vec[row * v_stride_uint4 + vec_col] = val;
         }
-
         __syncthreads();
 
         // Compute dOV = dO @ V^T with 2D warp distribution
@@ -520,24 +580,28 @@ flash_attention_backward_dq_kernel(
     }
 
     // Store final dQ to global memory
-    int vec_elem_dq = valid_q_rows * D;
-    int vec_size_dq = (vec_elem_dq + 4 - 1) / 4;
+    const int total_fp16_x4 = (valid_q_rows * D) / 4;
+    for (int i = tid; i < total_fp16_x4; i += THREADS) {
+        const int row = i / (D / 4);
+        const int col = (i % (D / 4)) * 4;
 
-    for (int vec_idx = tid; vec_idx < vec_size_dq; vec_idx += THREADS) {
-        int linear_idx = vec_idx * 4;
-        int row = linear_idx / D;
-        int col = linear_idx % D;
-    
-        if (row < valid_q_rows) {
-            float4 vec_val;
+        const float* s_dQ_row = s_dQ + row * Q_STRIDE;
 
-            vec_val.x = s_dQ[row * Q_STRIDE + col];
-            vec_val.y = (col + 1 < D) ? s_dQ[row * Q_STRIDE + col + 1] : 0.0f;
-            vec_val.z = (col + 2 < D) ? s_dQ[row * Q_STRIDE + col + 2] : 0.0f;
-            vec_val.w = (col + 3 < D) ? s_dQ[row * Q_STRIDE + col + 3] : 0.0f;
-        
-            reinterpret_cast<float4*>(&dQ_ptr[row * D + col])[0] = vec_val;
-        }
+        const __half h0 = __float2half_rn(s_dQ_row[col + 0]);
+        const __half h1 = __float2half_rn(s_dQ_row[col + 1]);
+        const __half h2 = __float2half_rn(s_dQ_row[col + 2]);
+        const __half h3 = __float2half_rn(s_dQ_row[col + 3]);
+
+        asm volatile(
+            "st.global.v4.u16 [%0], {%1, %2, %3, %4};"
+            :
+            : "l"(dQ_ptr + row * D + col),
+              "h"(__half_as_ushort(h0)),
+              "h"(__half_as_ushort(h1)),
+              "h"(__half_as_ushort(h2)),
+              "h"(__half_as_ushort(h3))
+            : "memory"
+        );
     }
 }
 
@@ -550,11 +614,11 @@ flash_attention_backward_dkv_kernel(
     const __half* __restrict__ Q,
     const __half* __restrict__ K,
     const __half* __restrict__ V,
-    const float* __restrict__ O,
+    const __half* __restrict__ O,
     const __half* __restrict__ dO,
-    const float* __restrict__ softmax_lse,
-    float* __restrict__ dK,
-    float* __restrict__ dV,
+    const  float* __restrict__ softmax_lse,
+          __half* __restrict__ dK,
+          __half* __restrict__ dV,
     const int B,
     const int H,
     const int M,
@@ -588,65 +652,74 @@ flash_attention_backward_dkv_kernel(
     const int tid = threadIdx.x;
     const int warp_id = tid / WARP_SIZE;
 
-    const __half* q_ptr = Q + (size_t)batch_head_id * M * D;
-    const __half* k_ptr = K + (size_t)batch_head_id * N * D + start_kv * D;
-    const __half* v_ptr = V + (size_t)batch_head_id * N * D + start_kv * D;
-    const float* o_ptr = O + (size_t)batch_head_id * M * D;
-    const __half* dO_ptr = dO + (size_t)batch_head_id * M * D;
-    const float* lse_ptr = softmax_lse + (size_t)batch_head_id * M;
-    float* dK_ptr = dK + (size_t)batch_head_id * N * D + start_kv * D;
-    float* dV_ptr = dV + (size_t)batch_head_id * N * D + start_kv * D;
+    // Global pointers
+    const __half*   q_ptr = Q           + (size_t)batch_head_id * M * D;
+    const __half*   k_ptr = K           + (size_t)batch_head_id * N * D + start_kv * D;
+    const __half*   v_ptr = V           + (size_t)batch_head_id * N * D + start_kv * D;
+    const __half*   o_ptr = O           + (size_t)batch_head_id * M * D;
+    const __half*  dO_ptr = dO          + (size_t)batch_head_id * M * D;
+    const  float* lse_ptr = softmax_lse + (size_t)batch_head_id * M;
+          __half*  dK_ptr = dK          + (size_t)batch_head_id * N * D + start_kv * D;
+          __half*  dV_ptr = dV          + (size_t)batch_head_id * N * D + start_kv * D;
 
     // Shared memory layout
     extern __shared__ char smem[];
-    __half* qkv_buffer = reinterpret_cast<__half*>(smem);
-    __half* sKV_base = qkv_buffer;
+    
+    __half* qkv_buffer  = reinterpret_cast<__half*>(smem);
+    __half* sKV_base    = qkv_buffer;
+    __half* sQ          = reinterpret_cast<__half*>(reinterpret_cast<char*>(qkv_buffer) + Config::SMEM_KV_BUFFER);
+    __half* sdO         = reinterpret_cast<__half*>(reinterpret_cast<char*>(sQ) + Config::SMEM_Q_BUFFER);
+    float* acc_buffer   = reinterpret_cast<float*>(smem + Config::SMEM_QKV_BUFFER);
+    float* dov_buffer   = acc_buffer + BLOCK_N * S_STRIDE;
+    float* stats_buffer = dov_buffer + BLOCK_N * S_STRIDE;
+    float* sRowDot      = stats_buffer;
+    float* sLse         = stats_buffer + BLOCK_N;
+    float* s_dK_accum   = reinterpret_cast<float*>(smem + Config::SMEM_QKV_BUFFER + 2 * Config::SMEM_ACC_BUFFER + Config::SMEM_STATS);
+    float* s_dV_accum   = s_dK_accum + BLOCK_M * KV_STRIDE;
+    
+    // Load and reuse K/V
     __half* sK = sKV_base;
     __half* sV = sKV_base;
-    __half* sQ = reinterpret_cast<__half*>(reinterpret_cast<char*>(qkv_buffer) + Config::SMEM_KV_BUFFER);
-    __half* sdO = reinterpret_cast<__half*>(reinterpret_cast<char*>(sQ) + Config::SMEM_Q_BUFFER);
-    float* acc_buffer = reinterpret_cast<float*>(smem + Config::SMEM_QKV_BUFFER);
-    float* dov_buffer = acc_buffer + BLOCK_N * S_STRIDE;
-    float* stats_buffer = dov_buffer + BLOCK_N * S_STRIDE;
-    float* sRowDot = stats_buffer;
-    float* sLse = stats_buffer + BLOCK_N;
-    float* s_dK_accum = reinterpret_cast<float*>(smem + Config::SMEM_QKV_BUFFER + 2 * Config::SMEM_ACC_BUFFER + Config::SMEM_STATS);
-    float* s_dV_accum = s_dK_accum + BLOCK_M * KV_STRIDE;
-    
+
+    // Unified initialization: K load + sdK/sdV zeroing
+    const uint4* k_vec        = reinterpret_cast<const uint4*>(k_ptr);
+          uint4* sK_vec       = reinterpret_cast<uint4*>(sK);
     const int kv_stride_uint4 = (KV_STRIDE + PER_UINT4 - 1) / PER_UINT4;
+    const int max_work        = max((BLOCK_M * KV_STRIDE), VECTOR_KV);
+
+    for (int i = tid; i < max_work; i += THREADS) {
+
+        // 1. Zero accumulators (s_dK_accum, s_dV_accum)
+        if (i < (BLOCK_M * KV_STRIDE)) { 
+            s_dK_accum[i] = 0.0f;
+            s_dV_accum[i] = 0.0f;
+        }
+
+        // 2. Load K
+        if (i < VECTOR_KV) {
+            const int row = i / VECTOR_D;
+            const int col = i % VECTOR_D;
+            uint4 val = make_uint4(0, 0, 0, 0);
+            if (row < valid_kv_rows && col < VECTOR_D) {
+                val = __ldg(&k_vec[row * VECTOR_D + col]);
+            }
+            sK_vec[row * kv_stride_uint4 + col] = val;
+        }
+    }
+    __syncthreads();
+
+    // ========================================================================
+    // MAIN LOOP
+    // ========================================================================
+
     const int num_q_blocks = (M + BLOCK_N - 1) / BLOCK_N;
 
-    // Init accum with zero
-    for (int idx = tid; idx < BLOCK_M * KV_STRIDE; idx += THREADS) {
-        s_dK_accum[idx] = 0.0f;
-        s_dV_accum[idx] = 0.0f;
-    }
-    __syncthreads();
-
-    // Load K
-    const uint4* k_vec = reinterpret_cast<const uint4*>(k_ptr);
-    uint4* sK_vec = reinterpret_cast<uint4*>(sK);
-    #pragma unroll 2
-    for (int idx = tid; idx < VECTOR_KV; idx += THREADS) {
-        const int row = idx / VECTOR_D;
-        const int vec_col = idx % VECTOR_D;
-        uint4 val = make_uint4(0, 0, 0, 0);
-        if (row < valid_kv_rows && vec_col < VECTOR_D) {
-            val = __ldg(&k_vec[row * VECTOR_D + vec_col]);
-        }
-        sK_vec[row * kv_stride_uint4 + vec_col] = val;
-    }
-    __syncthreads();
-
-    // ========================================================================
-    // UNIFIED LOOP
-    // ========================================================================
     for (int block_n = 0; block_n < num_q_blocks; ++block_n) {
         const int start_col = block_n * BLOCK_N;
         if (start_col >= M) break;
         const int valid_q_rows = min(BLOCK_N, M - start_col);
 
-        // Load Q + dO together
+        // Load Q + dO together (as fp16)
         const uint4* q_vec  = reinterpret_cast<const uint4*>(q_ptr + start_col * D);
         const uint4* do_vec = reinterpret_cast<const uint4*>(dO_ptr + start_col * D);
         uint4* sQ_vec    = reinterpret_cast<uint4*>(sQ);
@@ -668,43 +741,69 @@ flash_attention_backward_dkv_kernel(
         }
         __syncthreads();
 
-        // Compute (row_dot + lse)
-        const float* current_o_ptr = o_ptr + start_col * D;
+        // Compute row_dot = O ⊙ dO (element-wise dot product)
+        const __half* current_o_ptr = o_ptr + start_col * D;
+
         if (tid < valid_q_rows * THREADS_PER_ROW) {
             const int row = tid / THREADS_PER_ROW;
             const int thread_in_row = tid % THREADS_PER_ROW;
+            const int fp16_x4_per_row = D / 4;
+            const int work_per_thread = (fp16_x4_per_row + THREADS_PER_ROW - 1) / THREADS_PER_ROW;
+    
             float thread_dot = 0.0f;
-            const int cols_per_thread = (D + THREADS_PER_ROW - 1) / THREADS_PER_ROW;
-
+    
             #pragma unroll
-            for (int j = 0; j < cols_per_thread; ++j) {
-                const int col = thread_in_row + j * THREADS_PER_ROW;
-                if (col < D) {
-                    float dO_val = __half2float(sdO[row * Q_STRIDE + col]);
-                    thread_dot += current_o_ptr[row * D + col] * dO_val;
-                }
+            for (int j = 0; j < work_per_thread; ++j) {
+                const int chunk_idx = thread_in_row + j * THREADS_PER_ROW;
+                if (chunk_idx >= fp16_x4_per_row) break;
+        
+                const int col = chunk_idx * 4;
+        
+                const half* o_addr = current_o_ptr + row * D + col;
+                const half* dO_addr = sdO + row * Q_STRIDE + col;
+        
+                ushort o_h0, o_h1, o_h2, o_h3;
+                asm volatile(
+                    "ld.global.v4.u16 {%0, %1, %2, %3}, [%4];"
+                    : "=h"(o_h0), "=h"(o_h1), "=h"(o_h2), "=h"(o_h3)
+                    : "l"(o_addr)
+                    : "memory"
+                );
+        
+                // Load 4 fp16 elements from shared memory dO
+                const half dO_0 = dO_addr[0], dO_1 = dO_addr[1], dO_2 = dO_addr[2], dO_3 = dO_addr[3];
+        
+                // Convert ushort to half for O
+                const half o_0 = __ushort_as_half(o_h0), o_1 = __ushort_as_half(o_h1), o_2 = __ushort_as_half(o_h2), o_3 = __ushort_as_half(o_h3);
+        
+                // Convert to float and accumulate (O ⊙ dO)
+                const float fo_0 = __half2float(o_0),  fo_1 = __half2float(o_1),  fo_2 = __half2float(o_2),  fo_3 = __half2float(o_3);
+                const float fd_0 = __half2float(dO_0), fd_1 = __half2float(dO_1), fd_2 = __half2float(dO_2), fd_3 = __half2float(dO_3);
+        
+                // FMA accumulation
+                thread_dot = __fmaf_rn(fo_0, fd_0, thread_dot);
+                thread_dot = __fmaf_rn(fo_1, fd_1, thread_dot);
+                thread_dot = __fmaf_rn(fo_2, fd_2, thread_dot);
+                thread_dot = __fmaf_rn(fo_3, fd_3, thread_dot);
             }
-
+    
             #pragma unroll
             for (int offset = 1; offset < THREADS_PER_ROW; offset <<= 1) {
                 thread_dot += __shfl_xor_sync(0xffffffff, thread_dot, offset);
             }
-
-            if (thread_in_row == 0) {
-                sRowDot[row] = thread_dot;
-            }
+    
+            if (thread_in_row == 0) { sRowDot[row] = thread_dot; }
         }
 
-        if (tid < valid_q_rows) {
-            sLse[tid] = lse_ptr[start_col + tid];
-        }
+        // Load LSE
+        if (tid < valid_q_rows) { sLse[tid] = lse_ptr[start_col + tid]; }
         __syncthreads();
 
         // Compute dQ += dS @ K with 2D warp distribution
         float* sS = acc_buffer;
         
-        constexpr int num_tiles_s_m = (BLOCK_N + WMMA_M - 1) / WMMA_M;  // по Q
-        constexpr int num_tiles_s_n = (BLOCK_M + WMMA_N - 1) / WMMA_N;  // по K/V
+        constexpr int num_tiles_s_m = (BLOCK_N + WMMA_M - 1) / WMMA_M;
+        constexpr int num_tiles_s_n = (BLOCK_M + WMMA_N - 1) / WMMA_N;
         constexpr int total_tiles_s = num_tiles_s_m * num_tiles_s_n;
         constexpr int tiles_per_warp_s = (total_tiles_s + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
         
@@ -712,7 +811,6 @@ flash_attention_backward_dkv_kernel(
             const int tile_idx = warp_id * tiles_per_warp_s + tile_local;
             if (tile_idx >= total_tiles_s) break;
             
-            // Row-major mapping: iterate M first, then N
             const int tile_m_idx = tile_idx / num_tiles_s_n;
             const int tile_n_idx = tile_idx % num_tiles_s_n;
             const int tile_m = tile_m_idx * WMMA_M;
@@ -964,29 +1062,45 @@ flash_attention_backward_dkv_kernel(
     }
 
     // Write dK + dV to global memory at once
-    int vec_elem_dkv = valid_kv_rows * D;
-    int vec_size_dkv = (vec_elem_dkv + 4 - 1) / 4;
+    const int total_fp16_x4 = (valid_kv_rows * D) / 4;
+    for (int i = tid; i < total_fp16_x4; i += THREADS) {
+        const int row = i / (D / 4);
+        const int col = (i % (D / 4)) * 4;
 
-    for (int vec_idx = tid; vec_idx < vec_size_dkv; vec_idx += THREADS) {
-        int linear_idx = vec_idx * 4;
-        int row = linear_idx / D;
-        int col = linear_idx % D;
-        
-        if (row < valid_kv_rows) {
-            float4 dK_val, dV_val;
-            dK_val.x = s_dK_accum[row * KV_STRIDE + col];
-            dK_val.y = (col + 1 < D) ? s_dK_accum[row * KV_STRIDE + col + 1] : 0.0f;
-            dK_val.z = (col + 2 < D) ? s_dK_accum[row * KV_STRIDE + col + 2] : 0.0f;
-            dK_val.w = (col + 3 < D) ? s_dK_accum[row * KV_STRIDE + col + 3] : 0.0f;
-            
-            dV_val.x = s_dV_accum[row * KV_STRIDE + col];
-            dV_val.y = (col + 1 < D) ? s_dV_accum[row * KV_STRIDE + col + 1] : 0.0f;
-            dV_val.z = (col + 2 < D) ? s_dV_accum[row * KV_STRIDE + col + 2] : 0.0f;
-            dV_val.w = (col + 3 < D) ? s_dV_accum[row * KV_STRIDE + col + 3] : 0.0f;
-            
-            reinterpret_cast<float4*>(&dK_ptr[row * D + col])[0] = dK_val;
-            reinterpret_cast<float4*>(&dV_ptr[row * D + col])[0] = dV_val;
-        }
+        const float* s_dK_row = s_dK_accum + row * KV_STRIDE;
+        const float* s_dV_row = s_dV_accum + row * KV_STRIDE;
+
+        const __half hk0 = __float2half_rn(s_dK_row[col + 0]);
+        const __half hk1 = __float2half_rn(s_dK_row[col + 1]);
+        const __half hk2 = __float2half_rn(s_dK_row[col + 2]);
+        const __half hk3 = __float2half_rn(s_dK_row[col + 3]);
+
+        const __half hv0 = __float2half_rn(s_dV_row[col + 0]);
+        const __half hv1 = __float2half_rn(s_dV_row[col + 1]);
+        const __half hv2 = __float2half_rn(s_dV_row[col + 2]);
+        const __half hv3 = __float2half_rn(s_dV_row[col + 3]);
+
+        asm volatile(
+            "st.global.v4.u16 [%0], {%1, %2, %3, %4};"
+            :
+            : "l"(dK_ptr + row * D + col),
+              "h"(__half_as_ushort(hk0)),
+              "h"(__half_as_ushort(hk1)),
+              "h"(__half_as_ushort(hk2)),
+              "h"(__half_as_ushort(hk3))
+            : "memory"
+        );
+
+        asm volatile(
+            "st.global.v4.u16 [%0], {%1, %2, %3, %4};"
+            :
+            : "l"(dV_ptr + row * D + col),
+              "h"(__half_as_ushort(hv0)),
+              "h"(__half_as_ushort(hv1)),
+              "h"(__half_as_ushort(hv2)),
+              "h"(__half_as_ushort(hv3))
+            : "memory"
+        );
     }
 }
 
@@ -998,7 +1112,7 @@ void launcher_flash_attention_backward_dq(
     const torch::Tensor& Q,
     const torch::Tensor& K,
     const torch::Tensor& V,
-    torch::Tensor& O,
+    const torch::Tensor& O,
     torch::Tensor& dO,
     const torch::Tensor& softmax_lse,
     torch::Tensor& dQ,
@@ -1031,10 +1145,10 @@ void launcher_flash_attention_backward_dq(
             reinterpret_cast<const __half*>(Q.data_ptr()),
             reinterpret_cast<const __half*>(K.data_ptr()),
             reinterpret_cast<const __half*>(V.data_ptr()),
-            O.data_ptr<float>(),
-            reinterpret_cast<const __half*>(dO.data_ptr()),
+            reinterpret_cast<const __half*>(O.data_ptr()),
+            reinterpret_cast<__half*>(dO.data_ptr()),
             softmax_lse.data_ptr<float>(),
-            dQ.data_ptr<float>(),
+            reinterpret_cast<__half*>(dQ.data_ptr()),
             B, H, M, N, softmax_scale
         );
     } else {
@@ -1042,10 +1156,10 @@ void launcher_flash_attention_backward_dq(
             reinterpret_cast<const __half*>(Q.data_ptr()),
             reinterpret_cast<const __half*>(K.data_ptr()),
             reinterpret_cast<const __half*>(V.data_ptr()),
-            O.data_ptr<float>(),
-            reinterpret_cast<const __half*>(dO.data_ptr()),
+            reinterpret_cast<const __half*>(O.data_ptr()),
+            reinterpret_cast<__half*>(dO.data_ptr()),
             softmax_lse.data_ptr<float>(),
-            dQ.data_ptr<float>(),
+            reinterpret_cast<__half*>(dQ.data_ptr()),
             B, H, M, N, softmax_scale
         );
     }
@@ -1059,7 +1173,7 @@ void launcher_flash_attention_backward_dkv(
     const torch::Tensor& Q,
     const torch::Tensor& K,
     const torch::Tensor& V,
-    torch::Tensor& O,
+    const torch::Tensor& O,
     torch::Tensor& dO,
     const torch::Tensor& softmax_lse,
     torch::Tensor& dK,
@@ -1093,11 +1207,11 @@ void launcher_flash_attention_backward_dkv(
             reinterpret_cast<const __half*>(Q.data_ptr()),
             reinterpret_cast<const __half*>(K.data_ptr()),
             reinterpret_cast<const __half*>(V.data_ptr()),
-            O.data_ptr<float>(),
-            reinterpret_cast<const __half*>(dO.data_ptr()),
+            reinterpret_cast<const __half*>(O.data_ptr()),
+            reinterpret_cast<__half*>(dO.data_ptr()),
             softmax_lse.data_ptr<float>(),
-            dK.data_ptr<float>(),
-            dV.data_ptr<float>(),
+            reinterpret_cast<__half*>(dK.data_ptr()),
+            reinterpret_cast<__half*>(dV.data_ptr()),
             B, H, M, N, softmax_scale
         );
     } else {
@@ -1105,11 +1219,11 @@ void launcher_flash_attention_backward_dkv(
             reinterpret_cast<const __half*>(Q.data_ptr()),
             reinterpret_cast<const __half*>(K.data_ptr()),
             reinterpret_cast<const __half*>(V.data_ptr()),
-            O.data_ptr<float>(),
-            reinterpret_cast<const __half*>(dO.data_ptr()),
+            reinterpret_cast<const __half*>(O.data_ptr()),
+            reinterpret_cast<__half*>(dO.data_ptr()),
             softmax_lse.data_ptr<float>(),
-            dK.data_ptr<float>(),
-            dV.data_ptr<float>(),
+            reinterpret_cast<__half*>(dK.data_ptr()),
+            reinterpret_cast<__half*>(dV.data_ptr()),
             B, H, M, N, softmax_scale
         );
     }
@@ -1119,61 +1233,88 @@ void launcher_flash_attention_backward_dkv(
 // ============================================================================
 // WRAPPER
 // ============================================================================
-void flash_attention_backward(
-    const torch::Tensor& Q,
-    const torch::Tensor& K,
-    const torch::Tensor& V,
-    torch::Tensor& O,
-    torch::Tensor& dO,
-    torch::Tensor& softmax_lse,
-    torch::Tensor& dQ,
-    torch::Tensor& dK,
-    torch::Tensor& dV,
-    float softmax_scale,
-    bool is_causal
+std::vector<at::Tensor> flash_attention_backward(
+    const at::Tensor& dout,
+    const at::Tensor& q,
+    const at::Tensor& k,
+    const at::Tensor& v,
+    const at::Tensor& out,
+    const at::Tensor& softmax_lse,
+    std::optional<at::Tensor>& dq_,
+    std::optional<at::Tensor>& dk_,
+    std::optional<at::Tensor>& dv_,
+    std::optional<at::Tensor>& alibi_slopes_,
+    const float p_dropout,
+    const float softmax_scale,
+    const bool is_causal,
+    int window_size_left,
+    int window_size_right,
+    const float softcap,
+    const bool deterministic,
+    std::optional<at::Generator> gen_,
+    std::optional<at::Tensor>& rng_state
 ) {
-    TORCH_CHECK(Q.is_cuda() && K.is_cuda() && V.is_cuda() && O.is_cuda() && dO.is_cuda() && softmax_lse.is_cuda(), "All tensors must be on CUDA");
-    TORCH_CHECK(Q.dtype() == torch::kFloat16 && K.dtype() == torch::kFloat16 && V.dtype() == torch::kFloat16, "Q/K/V must be fp16");
-    TORCH_CHECK(dO.dtype() == torch::kFloat16, "dO must be fp16");
-    TORCH_CHECK(O.dtype() == torch::kFloat32 && dQ.dtype() == torch::kFloat32 && dK.dtype() == torch::kFloat32 && dV.dtype() == torch::kFloat32, 
-                "O and gradients must be fp32");
-    TORCH_CHECK(softmax_lse.dtype() == torch::kFloat32, "softmax_lse must be fp32");
-    const int D = Q.size(3);
-    TORCH_CHECK(D % 2 == 0, "Embedding dimension D must be even, but got D = ", D);
+    // Now unsupported functions
+    TORCH_CHECK(!alibi_slopes_.has_value(), "alibi_slopes not supported");
+    TORCH_CHECK(p_dropout == 0.f, "dropout not supported");
+    TORCH_CHECK(window_size_left == -1, "window_size_left not supported");
+    TORCH_CHECK(window_size_right == -1 || (is_causal && window_size_right == 0), "window not supported");
+    TORCH_CHECK(softcap == 0.f, "softcap not supported");
+    TORCH_CHECK(!deterministic, "deterministic mode not supported");
+    TORCH_CHECK(!gen_.has_value(), "Generator not supported");
+    TORCH_CHECK(!rng_state.has_value() || rng_state->numel() == 0, "rng_state not supported");
 
-    dQ.zero_();
-    dK.zero_();
-    dV.zero_();
+    // Check layouts
+    TORCH_CHECK(q.dtype() == torch::kFloat16, "q must be fp16");
+    TORCH_CHECK(k.dtype() == torch::kFloat16, "k must be fp16");
+    TORCH_CHECK(v.dtype() == torch::kFloat16, "v must be fp16");
+    TORCH_CHECK(dout.dtype() == torch::kFloat16, "dout must be fp16");
+    TORCH_CHECK(out.dtype() == torch::kFloat16, "out must be fp16");
+    TORCH_CHECK(softmax_lse.dtype() == torch::kFloat32, "softmax_lse must be fp32");
+
+    const auto sizes = q.sizes();
+    const int B = sizes[0], H = sizes[1], M = sizes[2], D = sizes[3];
+    const int N = k.size(2);
+    TORCH_CHECK(D <= 256 && D % 8 == 0 && D % 2 == 0, "D must be even, <=256, multiple of 8");
+
+    // Internal tensors
+    at::Tensor dq_fp16 = dq_.has_value() ? dq_.value() : torch::empty_like(q);
+    at::Tensor dk_fp16 = dk_.has_value() ? dk_.value() : torch::empty_like(k);
+    at::Tensor dv_fp16 = dv_.has_value() ? dv_.value() : torch::empty_like(v);
+    
+    TORCH_CHECK(dq_fp16.dtype() == torch::kFloat16, "dq must be fp16");
+    TORCH_CHECK(dk_fp16.dtype() == torch::kFloat16, "dk must be fp16");
+    TORCH_CHECK(dv_fp16.dtype() == torch::kFloat16, "dv must be fp16");
+
+    auto dsoftmax_sum = torch::empty({B, H, M}, torch::dtype(torch::kFloat32).device(q.device()));
 
     auto stream = at::cuda::getCurrentCUDAStream().stream();
-    auto dprops = at::cuda::getCurrentDeviceProperties();
-    bool is_sm70 = dprops->major == 7 && dprops->minor == 0;
-    TORCH_CHECK(is_sm70, "Kernel supports only Volta GPUs.");
+    auto props  = at::cuda::getCurrentDeviceProperties();
+    bool sm70   = props->major == 7 && props->minor == 0;
+    TORCH_CHECK(sm70, "Kernel supports only Volta GPUs.");
     
     switch (D) {
-        case 16:  
-            launcher_flash_attention_backward_dq<16>(Q, K, V, O, dO, softmax_lse, dQ, softmax_scale, is_causal, stream); 
-            launcher_flash_attention_backward_dkv<16>(Q, K, V, O, dO, softmax_lse, dK, dV, softmax_scale, is_causal, stream); 
+        case 16:
+            launcher_flash_attention_backward_dq<16>(q, k, v, out, const_cast<at::Tensor&>(dout), softmax_lse, dq_fp16, softmax_scale, is_causal, stream);
+            launcher_flash_attention_backward_dkv<16>(q, k, v, out, const_cast<at::Tensor&>(dout), softmax_lse, dk_fp16, dv_fp16, softmax_scale, is_causal, stream);
             break;
-        case 32:  
-            launcher_flash_attention_backward_dq<32>(Q, K, V, O, dO, softmax_lse, dQ, softmax_scale, is_causal, stream); 
-            launcher_flash_attention_backward_dkv<32>(Q, K, V, O, dO, softmax_lse, dK, dV, softmax_scale, is_causal, stream); 
+        case 32:
+            launcher_flash_attention_backward_dq<32>(q, k, v, out, const_cast<at::Tensor&>(dout), softmax_lse, dq_fp16, softmax_scale, is_causal, stream);
+            launcher_flash_attention_backward_dkv<32>(q, k, v, out, const_cast<at::Tensor&>(dout), softmax_lse, dk_fp16, dv_fp16, softmax_scale, is_causal, stream);
             break;
-        case 64:  
-            launcher_flash_attention_backward_dq<64>(Q, K, V, O, dO, softmax_lse, dQ, softmax_scale, is_causal, stream); 
-            launcher_flash_attention_backward_dkv<64>(Q, K, V, O, dO, softmax_lse, dK, dV, softmax_scale, is_causal, stream); 
+        case 64:
+            launcher_flash_attention_backward_dq<64>(q, k, v, out, const_cast<at::Tensor&>(dout), softmax_lse, dq_fp16, softmax_scale, is_causal, stream);
+            launcher_flash_attention_backward_dkv<64>(q, k, v, out, const_cast<at::Tensor&>(dout), softmax_lse, dk_fp16, dv_fp16, softmax_scale, is_causal, stream);
             break;
-        case 128: 
-            launcher_flash_attention_backward_dq<128>(Q, K, V, O, dO, softmax_lse, dQ, softmax_scale, is_causal, stream); 
-            launcher_flash_attention_backward_dkv<128>(Q, K, V, O, dO, softmax_lse, dK, dV, softmax_scale, is_causal, stream); 
+        case 128:
+            launcher_flash_attention_backward_dq<128>(q, k, v, out, const_cast<at::Tensor&>(dout), softmax_lse, dq_fp16, softmax_scale, is_causal, stream);
+            launcher_flash_attention_backward_dkv<128>(q, k, v, out, const_cast<at::Tensor&>(dout), softmax_lse, dk_fp16, dv_fp16, softmax_scale, is_causal, stream);
             break;
-        case 256: 
-            launcher_flash_attention_backward_dq<256>(Q, K, V, O, dO, softmax_lse, dQ, softmax_scale, is_causal, stream); 
-            launcher_flash_attention_backward_dkv<256>(Q, K, V, O, dO, softmax_lse, dK, dV, softmax_scale, is_causal, stream); 
+        case 256:
+            launcher_flash_attention_backward_dq<256>(q, k, v, out, const_cast<at::Tensor&>(dout), softmax_lse, dq_fp16, softmax_scale, is_causal, stream);
+            launcher_flash_attention_backward_dkv<256>(q, k, v, out, const_cast<at::Tensor&>(dout), softmax_lse, dk_fp16, dv_fp16, softmax_scale, is_causal, stream);
             break;
         default: TORCH_CHECK(false, "Unsupported D: ", D);
     }
-    
-    cudaError_t err = cudaGetLastError();
-    TORCH_CHECK(err == cudaSuccess, "Kernel failed: ", cudaGetErrorString(err));
+    return {dq_fp16, dk_fp16, dv_fp16, dsoftmax_sum};
 }

@@ -43,6 +43,19 @@ def flash_attn_func(
         raise NotImplementedError("Dropout is not implemented in this Volta kernel.")
     if alibi_slopes is not None:
         raise NotImplementedError("ALiBi is not supported.")
+    window_size_left = kwargs.get('window_size_left', -1)
+    window_size_right = kwargs.get('window_size_right', -1)
+    softcap = kwargs.get('softcap', 0.0)
+    return_softmax = kwargs.get('return_softmax', False)
+
+    if window_size_left != -1:
+        raise NotImplementedError("window_size_left not supported")
+    if window_size_right != -1 and not (causal and window_size_right == 0):
+        raise NotImplementedError("window not supported")
+    if softcap != 0.0:
+        raise NotImplementedError("softcap not supported")
+    if return_softmax:
+        raise NotImplementedError("return_softmax not supported")
     if deterministic:
         pass  # ignored
 
@@ -60,13 +73,17 @@ def flash_attn_func(
         raise ValueError(f"Unsupported head_dim: {D}. Supported: 16, 32, 64, 128, 256")
     if D % 2 != 0:
         raise ValueError("head_dim must be even")
+    if D % 8 != 0:
+        raise ValueError("head_dim must be multiple of 8")
     if not all(t.is_contiguous() for t in [q, k, v]):
         raise ValueError("All input tensors must be contiguous")
+    if q.dtype != torch.float16 or k.dtype != torch.float16 or v.dtype != torch.float16:
+        raise ValueError("All input tensors must be fp16")
 
     if softmax_scale is None:
         softmax_scale = 1.0 / (D ** 0.5)
 
-    out = torch.empty_like(q, dtype=torch.float32)
+    out = torch.empty_like(q, dtype=torch.float16)
     softmax_lse_flat = torch.empty(B * H * M, dtype=torch.float32, device=q.device)
 
     flash_attn_v100_cuda.fwd(
@@ -131,6 +148,8 @@ def flash_attn_backward(
         raise ValueError(f"Unsupported head_dim: {D}")
     if D % 2 != 0:
         raise ValueError("head_dim must be even")
+    if D % 8 != 0:
+        raise ValueError("head_dim must be multiple of 8")
 
     if softmax_scale is None:
         softmax_scale = 1.0 / (D ** 0.5)
@@ -150,23 +169,25 @@ def flash_attn_backward(
 
     # Prepare outputs
     if dq is None:
-        dq = torch.empty_like(q, dtype=torch.float32)
+        dq = torch.empty_like(q, dtype=torch.float16)
     else:
-        if dq.shape != q.shape or dq.dtype != torch.float32:
-            raise ValueError("dq must match q shape and be float32")
+        if dq.shape != q.shape or dq.dtype != torch.float16:
+            raise ValueError("dq must match q shape and be fp16")
     if dk is None:
-        dk = torch.empty_like(k, dtype=torch.float32)
+        dk = torch.empty_like(k, dtype=torch.float16)
     else:
-        if dk.shape != k.shape or dk.dtype != torch.float32:
-            raise ValueError("dk must match k shape and be float32")
+        if dk.shape != k.shape or dk.dtype != torch.float16:
+            raise ValueError("dk must match k shape and be fp16")
     if dv is None:
-        dv = torch.empty_like(v, dtype=torch.float32)
+        dv = torch.empty_like(v, dtype=torch.float16)
     else:
-        if dv.shape != v.shape or dv.dtype != torch.float32:
-            raise ValueError("dv must match v shape and be float32")
+        if dv.shape != v.shape or dv.dtype != torch.float16:
+            raise ValueError("dv must match v shape and be fp16")
 
     if not all(t.is_contiguous() for t in [q, k, v, out, dout, dq, dk, dv, lse_flat]):
         raise ValueError("All tensors must be contiguous")
+    if q.dtype != torch.float16 or k.dtype != torch.float16 or v.dtype != torch.float16:
+        raise ValueError("All input tensors must be fp16")
 
     flash_attn_v100.bwd(
         q, k, v, out, dout, lse_flat, dq, dk, dv, softmax_scale, causal

@@ -12,53 +12,86 @@
 /**
  * Flash Attention Forward Pass
  * 
- * @param Q                   Query tensor [B, H, M, D] (fp16)
- * @param K                   Key tensor [B, H, N, D] (fp16)
- * @param V                   Value tensor [B, H, N, D] (fp16)
- * @param Out                 Output tensor [B, H, M, D] (fp32)
- * @param softmax_lse Softmax lse for backward [B, H, M] (fp32)
- * @param scale               Softmax scale (typically 1/sqrt(D))
- * @param causal              Enable causal masking
+ * Computes attention output with memory-efficient implementation.
+ * 
+ * @param q                   Query tensor [B, H, M, D] (fp16)
+ * @param k                   Key tensor [B, H, N, D] (fp16) 
+ * @param v                   Value tensor [B, H, N, D] (fp16)
+ * @param out_                Optional output tensor [B, H, M, D] (fp32, output)
+ * @param alibi_slopes_       Optional ALiBi slopes tensor for relative positioning
+ * @param p_dropout           Dropout probability (0.0 for no dropout)
+ * @param softmax_scale       Softmax scale (typically 1/sqrt(D))
+ * @param is_causal           Enable causal masking (autoregressive)
+ * @param window_size_left    Left window size for sliding window attention
+ * @param window_size_right   Right window size for sliding window attention  
+ * @param softcap             Soft capping value for attention scores
+ * @param return_softmax      Whether to return softmax matrix (memory intensive)
+ * @param gen_                Optional random generator for dropout
+ * @return                    Vector of output tensors [output, softmax_lse, ...]
  */
-void flash_attention_forward(
-    const torch::Tensor& Q,      // [B, H, M, D], fp16
-    const torch::Tensor& K,      // [B, H, N, D], fp16
-    const torch::Tensor& V,      // [B, H, N, D], fp16
-    torch::Tensor& Out,          // [B, H, M, D], fp32
-    torch::Tensor& softmax_lse,  // [B, H, M], fp32
-    float scale,
-    bool causal
+std::vector<at::Tensor> flash_attention_forward(
+    at::Tensor& q,
+    const at::Tensor& k,
+    const at::Tensor& v,
+    std::optional<at::Tensor>& out_,
+    std::optional<at::Tensor>& alibi_slopes_,
+    const float p_dropout,
+    const float softmax_scale,
+    bool is_causal,
+    int window_size_left,
+    int window_size_right,
+    const float softcap,
+    const bool return_softmax,
+    std::optional<at::Generator> gen_
 );
 
 /**
- * Flash Attention Backward Pass (FlashAttention-2)
+ * Flash Attention Backward Pass
  * 
  * Computes gradients dQ, dK, dV given inputs and output gradients.
+ * Supports various attention variants including sliding window and ALiBi.
  * 
- * @param Q           Query tensor [B, H, M, D] (fp16)
- * @param K           Key tensor [B, H, N, D] (fp16)
- * @param V           Value tensor [B, H, N, D] (fp16)
- * @param O           Output from forward pass [B, H, M, D] (fp32)
- * @param dO          Gradient w.r.t. output [B, H, M, D] (fp16)
- * @param softmax_lse Softmax lse from forward [B, H, M] (fp32)
- * @param dQ          Gradient w.r.t. query [B, H, M, D] (fp32, output)
- * @param dK          Gradient w.r.t. key [B, H, N, D] (fp16, output)
- * @param dV          Gradient w.r.t. value [B, H, N, D] (fp16, output)
- * @param scale       Softmax scale (typically 1/sqrt(D))
- * @param causal      Enable causal masking (must match forward pass)
+ * @param dout          Gradient w.r.t. output [B, H, M, D] (fp16)
+ * @param q             Query tensor from forward [B, H, M, D] (fp16)
+ * @param k             Key tensor from forward [B, H, N, D] (fp16)
+ * @param v             Value tensor from forward [B, H, N, D] (fp16)
+ * @param out           Output from forward pass [B, H, M, D] (fp32)
+ * @param softmax_lse   Softmax logsumexp from forward [B, H, M] (fp32)
+ * @param dq_           Optional gradient w.r.t. query [B, H, M, D] (fp32, output)
+ * @param dk_           Optional gradient w.r.t. key [B, H, N, D] (fp16, output)
+ * @param dv_           Optional gradient w.r.t. value [B, H, N, D] (fp16, output)
+ * @param alibi_slopes_ Optional ALiBi slopes tensor (must match forward)
+ * @param p_dropout     Dropout probability (must match forward)
+ * @param softmax_scale Softmax scale (must match forward)
+ * @param is_causal     Causal masking flag (must match forward)
+ * @param window_size_left    Left window size (must match forward)
+ * @param window_size_right   Right window size (must match forward)
+ * @param softcap       Soft capping value (must match forward)
+ * @param deterministic Whether to use deterministic backward pass
+ * @param gen_          Optional random generator for dropout
+ * @param rng_state     Optional RNG state for reproducibility
+ * @return              Vector of gradient tensors [dq, dk, dv, ...]
  */
-void flash_attention_backward(
-    const torch::Tensor& Q,      // [B, H, M, D], fp16
-    const torch::Tensor& K,      // [B, H, N, D], fp16
-    const torch::Tensor& V,      // [B, H, N, D], fp16
-    torch::Tensor& O,            // [B, H, M, D], fp32
-    torch::Tensor& dO,           // [B, H, M, D], fp16
-    torch::Tensor& softmax_lse,  // [B, H, M],    fp32
-    torch::Tensor& dQ,           // [B, H, M, D], fp32
-    torch::Tensor& dK,           // [B, H, N, D], fp16
-    torch::Tensor& dV,           // [B, H, N, D], fp16
-    float scale,
-    bool causal
+std::vector<at::Tensor> flash_attention_backward(
+    const at::Tensor& dout,
+    const at::Tensor& q,
+    const at::Tensor& k,
+    const at::Tensor& v,
+    const at::Tensor& out,
+    const at::Tensor& softmax_lse,
+    std::optional<at::Tensor>& dq_,
+    std::optional<at::Tensor>& dk_,
+    std::optional<at::Tensor>& dv_,
+    std::optional<at::Tensor>& alibi_slopes_,
+    const float p_dropout,
+    const float softmax_scale,
+    const bool is_causal,
+    int window_size_left,
+    int window_size_right,
+    const float softcap,
+    const bool deterministic,
+    std::optional<at::Generator> gen_,
+    std::optional<at::Tensor>& rng_state
 );
 
 #endif // FUSED_MHA_H

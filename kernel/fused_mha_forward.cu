@@ -82,8 +82,8 @@ flash_attention_forward_kernel(
     const __half* __restrict__ Q,
     const __half* __restrict__ K,
     const __half* __restrict__ V,
-    float* __restrict__ Out,
-    float* __restrict__ softmax_lse,
+          __half* __restrict__ Out,
+           float* __restrict__ softmax_lse,
     const int B,
     const int H,
     const int M,
@@ -120,63 +120,84 @@ flash_attention_forward_kernel(
     const int lane_id = tid % WARP_SIZE;
     
     // Global pointers
-    const __half* q_ptr = Q + (size_t)batch_head_id * M * D + start_row * D;
-    const __half* k_ptr = K + (size_t)batch_head_id * N * D;
-    const __half* v_ptr = V + (size_t)batch_head_id * N * D;
-    float* out_ptr = Out + (size_t)batch_head_id * M * D + start_row * D;
+    const __half* q_ptr    = Q +           (size_t)batch_head_id * M * D + start_row * D;
+    const __half* k_ptr    = K +           (size_t)batch_head_id * N * D;
+    const __half* v_ptr    = V +           (size_t)batch_head_id * N * D;
+          __half* out_ptr  = Out +         (size_t)batch_head_id * M * D + start_row * D;
     float* softmax_lse_ptr = softmax_lse + (size_t)batch_head_id * M + start_row;
     
     // Shared memory layout
     extern __shared__ char smem[];
-    __half* sQ = reinterpret_cast<__half*>(smem);
-    __half* sKV = sQ + BLOCK_M * Q_STRIDE;
-    float* sS = reinterpret_cast<float*>(sKV + BLOCK_N * KV_STRIDE);
-    float* sO = sS + BLOCK_M * S_STRIDE;
-    float* sRowMax = sO + BLOCK_M * O_STRIDE;
-    float* sRowSum = sRowMax + BLOCK_M;
-    float* sOldMax = sRowSum + BLOCK_M;
+   
+    __half* sQ      = reinterpret_cast<__half*>(smem);
+    __half* sKV     = sQ + BLOCK_M * Q_STRIDE;
+    float*  sS      = reinterpret_cast<float*>(sKV + BLOCK_N * KV_STRIDE);
+    float*  sO      = sS + BLOCK_M * S_STRIDE;
+    float*  sRowMax = sO + BLOCK_M * O_STRIDE;
+    float*  sRowSum = sRowMax + BLOCK_M;
+    float*  sOldMax = sRowSum + BLOCK_M;
 
-    // Load Q into shared memory at once
+    // Unified initialization: Q load + O zeroing + state buffers
     const uint4* q_vec = reinterpret_cast<const uint4*>(q_ptr);
-    uint4* sQ_vec = reinterpret_cast<uint4*>(sQ);
-    const int q_stride_uint4 = (Q_STRIDE + PER_UINT4 - 1) / PER_UINT4;
+    uint4*      sQ_vec = reinterpret_cast<uint4*>(sQ);
+    float4*     sO_vec = reinterpret_cast<float4*>(sO);
+    const float4 zero4 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    const int max_work = max(max(BLOCK_M * VECTOR_D, VECTOR_F), BLOCK_M);
+
     #pragma unroll 4
-    for (int idx = tid; idx < BLOCK_M * VECTOR_D; idx += THREADS) {
-        const int row = idx / VECTOR_D;
-        const int vec_col = idx % VECTOR_D;
-        uint4 val = make_uint4(0, 0, 0, 0);
-        if (row < valid_q_rows && vec_col < VECTOR_D) {
-            val = __ldg(&q_vec[row * VECTOR_D + vec_col]);
+    for (int i = tid; i < max_work; i += THREADS) {
+        // 1. Load Q into sQ
+        if (i < BLOCK_M * VECTOR_D) {
+            const int row = i / VECTOR_D;
+            const int col = i % VECTOR_D;
+            uint4 val = make_uint4(0, 0, 0, 0);
+            if (row < valid_q_rows && col < VECTOR_D) {
+                val = __ldg(&q_vec[row * VECTOR_D + col]);
+            }
+            sQ_vec[row * ((Q_STRIDE + PER_UINT4 - 1) / PER_UINT4) + col] = val;
         }
-        sQ_vec[row * q_stride_uint4 + vec_col] = val;
+
+        // 2. Zero out O accumulator
+        if (i < VECTOR_F) { sO_vec[i] = zero4; }
+
+        // 3. Initialize per-row state buffers (sRowMax, sRowSum, sOldMax)
+        if (i < BLOCK_M) { sRowMax[i] = NEG_INF; sRowSum[i] = 0.0f; sOldMax[i] = 1.0f; }
     }
     __syncthreads();
-    
-    // Initialize buffer's
-    if (tid < BLOCK_M) {
-        sRowMax[tid] = NEG_INF;
-        sRowSum[tid] = 0.0f;
-        sOldMax[tid] = 1.0f;
-    }
-    
-    // Initialize O to zero
-    float4* sO_vec = reinterpret_cast<float4*>(sO);
-    const float4 zero4 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);    
-    #pragma unroll 4
-    for (int i = tid; i < VECTOR_F; i += THREADS) {
-        sO_vec[i] = zero4;
+
+    // Prefetch first block of K and V (L2 cache line = 128 bytes = 64 fp16)
+    const int cache_lines = ((BLOCK_N * D) + 63) / 64;
+    const int prefetch_threads = min(THREADS, cache_lines);
+    if (tid < prefetch_threads) {
+        const __half* first_k = k_ptr + tid * 64;
+        const __half* first_v = v_ptr + tid * 64;
+        asm volatile("prefetch.global.L2 [%0];" :: "l"(first_k));
+        asm volatile("prefetch.global.L2 [%0];" :: "l"(first_v));
     }
     __syncthreads();
-    
-    const int num_n_blocks = (N + BLOCK_N - 1) / BLOCK_N;
     
     // ========================================================================
     // MAIN LOOP
     // ========================================================================
+
+    const int num_n_blocks = (N + BLOCK_N - 1) / BLOCK_N;
+
     for (int block_n = 0; block_n < num_n_blocks; ++block_n) {
         const int start_col = block_n * BLOCK_N;
         if (start_col >= N) break;
         const int valid_k_rows = min(BLOCK_N, N - start_col);
+
+        // Prefetch next block of K and V
+        if (block_n + 1 < num_n_blocks) {
+            const int cache_lines = ((BLOCK_N * D) + 63) / 64;
+            const int prefetch_threads = min(THREADS, cache_lines);
+            if (tid < prefetch_threads) {
+                const __half* next_k = k_ptr + (block_n + 1) * BLOCK_N * D + tid * 64;
+                const __half* next_v = v_ptr + (block_n + 1) * BLOCK_N * D + tid * 64;
+                asm volatile("prefetch.global.L2 [%0];" :: "l"(next_k));
+                asm volatile("prefetch.global.L2 [%0];" :: "l"(next_v));
+            }
+        }
         
         // Load K into shared memory
         __half* sK = sKV;
@@ -391,15 +412,6 @@ flash_attention_forward_kernel(
             
             if (tile_m >= valid_q_rows) continue;
             
-            if (tile_d + WMMA_N < D && lane_id < 4) {
-                const int prefetch_offset = tile_d + WMMA_N;
-                const int prefetch_row = lane_id * 4;
-                if (prefetch_row < valid_k_rows) {
-                    const __half* prefetch_addr = sV + prefetch_row * KV_STRIDE + prefetch_offset;
-                    asm volatile("prefetch.global.L1 [%0];" :: "l"(prefetch_addr));
-                }
-            }
-            
             fragment<matrix_a, WMMA_M, WMMA_N, WMMA_K, half, row_major> p_frag;
             fragment<matrix_b, WMMA_M, WMMA_N, WMMA_K, half, row_major> v_frag;
             fragment<accumulator, WMMA_M, WMMA_N, WMMA_K, float> o_frag;
@@ -422,31 +434,30 @@ flash_attention_forward_kernel(
     }
     
     // Store final Sum to global memory
-    int ver_row_elem = valid_q_rows * D;
-    int vec_row_size = (ver_row_elem + 4 - 1) / 4;
+    const int total_fp16_x4 = (valid_q_rows * D) / 4;
     
-    #pragma unroll 4
-    for (int vec_idx = tid; vec_idx < vec_row_size; vec_idx += THREADS) {
-        int linear_idx = vec_idx * 4;
-        int row = linear_idx / D;
-        int col = linear_idx % D;
-        
-        if (row < valid_q_rows && col < D) {
-            const float row_sum = sRowSum[row];
-            float inv_sum = 1.0f;
-            
-            if (row_sum > 1e-6f) {
-                inv_sum = 1.0f / row_sum;
-            }
-            
-            float4 vec_val;
-            vec_val.x = sO[row * O_STRIDE + col] * inv_sum;
-            vec_val.y = (col + 1 < D) ? sO[row * O_STRIDE + col + 1] * inv_sum : 0.0f;
-            vec_val.z = (col + 2 < D) ? sO[row * O_STRIDE + col + 2] * inv_sum : 0.0f;
-            vec_val.w = (col + 3 < D) ? sO[row * O_STRIDE + col + 3] * inv_sum : 0.0f;
-            
-            reinterpret_cast<float4*>(&out_ptr[row * D + col])[0] = vec_val;
-        }
+    for (int i = tid; i < total_fp16_x4; i += THREADS) {
+        const int row = i / (D / 4);
+        const int col = (i % (D / 4)) * 4;
+
+        const float inv_sum = (sRowSum[row] > 1e-6f) ? (1.0f / sRowSum[row]) : 1.0f;
+        const float* sO_row = sO + row * O_STRIDE;
+
+        const __half h0 = __float2half_rn(sO_row[col + 0] * inv_sum);
+        const __half h1 = __float2half_rn(sO_row[col + 1] * inv_sum);
+        const __half h2 = __float2half_rn(sO_row[col + 2] * inv_sum);
+        const __half h3 = __float2half_rn(sO_row[col + 3] * inv_sum);
+
+        asm volatile(
+            "st.global.v4.u16 [%0], {%1, %2, %3, %4};"
+            :
+            : "l"(out_ptr + row * D + col),
+              "h"(__half_as_ushort(h0)),
+              "h"(__half_as_ushort(h1)),
+              "h"(__half_as_ushort(h2)),
+              "h"(__half_as_ushort(h3))
+            : "memory"
+        );
     }
     
     if (tid < valid_q_rows) {
@@ -494,7 +505,7 @@ void launcher_flash_attention_forward(
             reinterpret_cast<const __half*>(Q.data_ptr()),
             reinterpret_cast<const __half*>(K.data_ptr()),
             reinterpret_cast<const __half*>(V.data_ptr()),
-            Out.data_ptr<float>(),
+            reinterpret_cast<__half*>(Out.data_ptr()),
             softmax_lse.data_ptr<float>(),
             B, H, M, N, softmax_scale
         );
@@ -503,7 +514,7 @@ void launcher_flash_attention_forward(
             reinterpret_cast<const __half*>(Q.data_ptr()),
             reinterpret_cast<const __half*>(K.data_ptr()),
             reinterpret_cast<const __half*>(V.data_ptr()),
-            Out.data_ptr<float>(),
+            reinterpret_cast<__half*>(Out.data_ptr()),
             softmax_lse.data_ptr<float>(),
             B, H, M, N, softmax_scale
         );
@@ -513,36 +524,63 @@ void launcher_flash_attention_forward(
 // ============================================================================
 // WRAPPER
 // ============================================================================
-void flash_attention_forward(
-    const torch::Tensor& Q,
-    const torch::Tensor& K,
-    const torch::Tensor& V,
-    torch::Tensor& Out,
-    torch::Tensor& softmax_lse,
-    float softmax_scale,
-    bool causal
+std::vector<at::Tensor> flash_attention_forward(
+    at::Tensor& q,
+    const at::Tensor& k,
+    const at::Tensor& v,
+    std::optional<at::Tensor>& out_,
+    std::optional<at::Tensor>& alibi_slopes_,
+    const float p_dropout,
+    const float softmax_scale,
+    bool is_causal,
+    int window_size_left,
+    int window_size_right,
+    const float softcap,
+    const bool return_softmax,
+    std::optional<at::Generator> gen_
 ) {
-    const int D = Q.size(3);
+    // Now unsupported functions
+    TORCH_CHECK(!alibi_slopes_.has_value(), "alibi_slopes not supported");
+    TORCH_CHECK(p_dropout == 0.f, "dropout not supported");
+    TORCH_CHECK(window_size_left == -1, "window_size_left not supported");
+    TORCH_CHECK(window_size_right == -1 || (is_causal && window_size_right == 0), "window not supported");
+    TORCH_CHECK(softcap == 0.f, "softcap not supported");
+    TORCH_CHECK(!return_softmax, "return_softmax not supported");
+    TORCH_CHECK(!gen_.has_value(), "Generator not supported");
 
-    TORCH_CHECK(Q.is_cuda() && K.is_cuda() && V.is_cuda(), "Tensors must be on CUDA");
-    TORCH_CHECK(Q.dtype() == torch::kFloat16, "Q must be float16");
-    TORCH_CHECK(Out.dtype() == torch::kFloat32, "Out must be float32");
-    TORCH_CHECK(D % 2 == 0, "Embedding dimension D must be even, but got D = ", D);
+    // Check layouts
+    TORCH_CHECK(q.dtype() == torch::kFloat16, "q must be fp16");
+    TORCH_CHECK(k.dtype() == torch::kFloat16, "k must be fp16");
+    TORCH_CHECK(v.dtype() == torch::kFloat16, "v must be fp16");
+    TORCH_CHECK(q.is_cuda() && k.is_cuda() && v.is_cuda(), "Tensors must be on CUDA");
+    TORCH_CHECK(q.stride(-1) == 1 && k.stride(-1) == 1 && v.stride(-1) == 1, "Last dim must be contiguous");
+
+    const auto sizes = q.sizes();
+    const int B = sizes[0], H = sizes[1], M = sizes[2], D = sizes[3];
+    const int N = k.size(2);
+    TORCH_CHECK(D <= 256 && D % 8 == 0 && D % 2 == 0, "D must be even, <=256, multiple of 8");
+
+    // Out tensors
+    at::Tensor out_fp16 = out_.has_value() ? out_.value() : torch::empty_like(q);
+    TORCH_CHECK(out_fp16.dtype() == torch::kFloat16, "out must be fp16");
+    auto softmax_lse = torch::empty({B, H, M}, torch::dtype(torch::kFloat32).device(q.device()));
+    TORCH_CHECK(softmax_lse.dtype() == torch::kFloat32, "softmax_lse must be fp32");
 
     auto stream = at::cuda::getCurrentCUDAStream().stream();
-    auto dprops = at::cuda::getCurrentDeviceProperties();
-    bool is_sm70 = dprops->major == 7 && dprops->minor == 0;
-    TORCH_CHECK(is_sm70, "Kernel supports only Volta GPUs.");
+    auto props  = at::cuda::getCurrentDeviceProperties();
+    bool sm70   = props->major == 7 && props->minor == 0;
+    TORCH_CHECK(sm70, "Kernel supports only Volta GPUs.");
 
     switch (D) {
-        case 16:  launcher_flash_attention_forward<16>(Q, K, V, Out, softmax_lse, softmax_scale, causal, stream); break;
-        case 32:  launcher_flash_attention_forward<32>(Q, K, V, Out, softmax_lse, softmax_scale, causal, stream); break;
-        case 64:  launcher_flash_attention_forward<64>(Q, K, V, Out, softmax_lse, softmax_scale, causal, stream); break;
-        case 128: launcher_flash_attention_forward<128>(Q, K, V, Out, softmax_lse, softmax_scale, causal, stream); break;
-        case 256: launcher_flash_attention_forward<256>(Q, K, V, Out, softmax_lse, softmax_scale, causal, stream); break;
+        case 16:  launcher_flash_attention_forward<16>(q, k, v, out_fp16, softmax_lse, softmax_scale, is_causal, stream); break;
+        case 32:  launcher_flash_attention_forward<32>(q, k, v, out_fp16, softmax_lse, softmax_scale, is_causal, stream); break;
+        case 64:  launcher_flash_attention_forward<64>(q, k, v, out_fp16, softmax_lse, softmax_scale, is_causal, stream); break;
+        case 128: launcher_flash_attention_forward<128>(q, k, v, out_fp16, softmax_lse, softmax_scale, is_causal, stream); break;
+        case 256: launcher_flash_attention_forward<256>(q, k, v, out_fp16, softmax_lse, softmax_scale, is_causal, stream); break;
         default: TORCH_CHECK(false, "Unsupported D: ", D);
     }
     
-    cudaError_t err = cudaGetLastError();
-    TORCH_CHECK(err == cudaSuccess, "Kernel failed: ", cudaGetErrorString(err));
+    auto p = torch::empty({0}, q.options());
+    auto rng_state = torch::empty({2}, torch::dtype(torch::kInt64).device(q.device()));
+    return {out_fp16, softmax_lse, p, rng_state};
 }
