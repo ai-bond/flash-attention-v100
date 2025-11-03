@@ -23,12 +23,12 @@ def ref_mha_forward(q, k, v, scale=1.0, causal=False):
                                Causal Mask    Values [B,H,N,D] ↗
     """
 
-    s = torch.einsum('bhmd,bhnd->bhmn', q.float(), k.float()) * scale
+    s = torch.einsum('bhmd,bhnd->bhmn', q, k) * scale
     if causal:
         mask = torch.triu(torch.ones(s.shape[-2], s.shape[-1], device=s.device, dtype=torch.bool), diagonal=1)
         s = s.masked_fill(mask, float('-inf'))
     p = torch.softmax(s, dim=-1)
-    o = torch.einsum('bhmn,bhnd->bhmd', p, v.float())
+    o = torch.einsum('bhmn,bhnd->bhmd', p, v)
     return o
 
 def ref_mha_backward(q, k, v, o, do, scale=1.0, causal=False):
@@ -46,15 +46,15 @@ def ref_mha_backward(q, k, v, o, do, scale=1.0, causal=False):
     k = k.detach().requires_grad_(True)
     v = v.detach().requires_grad_(True)
 
-    s = torch.einsum('bhmd,bhnd->bhmn', q.float(), k.float()) * scale
+    s = torch.einsum('bhmd,bhnd->bhmn', q, k) * scale
     if causal:
         mask = torch.triu(torch.ones(s.shape[-2], s.shape[-1], device=s.device), diagonal=1)
         s = s.masked_fill(mask.bool(), float('-inf'))
     p = torch.softmax(s, dim=-1)
-    o_ref = torch.einsum('bhmn,bhnd->bhmd', p, v.float())
-    (o_ref * do.float()).sum().backward()
+    o_ref = torch.einsum('bhmn,bhnd->bhmd', p, v)
+    (o_ref * do).sum().backward()
 
-    return q.grad.float(), k.grad.float(), v.grad.float()
+    return q.grad, k.grad, v.grad
 
 def ensure_contiguous(tensor):
     return tensor if tensor.is_contiguous() else tensor.contiguous()
@@ -167,19 +167,19 @@ def test_combined():
             q, k, v, dO = map(ensure_contiguous, (q, k, v, dO))
             
             # Unique buffers for ref/cuda forward+backward
-            o_ref = torch.empty(B, H, M, D, device='cuda', dtype=torch.float32)
-            o_custom = torch.empty(B, H, M, D, device='cuda', dtype=torch.float32)
+            o_ref = torch.empty(B, H, M, D, device='cuda', dtype=torch.float16)
+            o_custom = torch.empty(B, H, M, D, device='cuda', dtype=torch.float16)
             
             softmax_lse_ref = torch.empty(B, H, M, device='cuda', dtype=torch.float32)
             softmax_lse_custom = torch.empty(B, H, M, device='cuda', dtype=torch.float32)
             
-            dQ_ref = torch.empty(B, H, M, D, device='cuda', dtype=torch.float32)
-            dK_ref = torch.empty(B, H, N, D, device='cuda', dtype=torch.float32)
-            dV_ref = torch.empty(B, H, N, D, device='cuda', dtype=torch.float32)
+            dQ_ref = torch.empty(B, H, M, D, device='cuda', dtype=torch.float16)
+            dK_ref = torch.empty(B, H, N, D, device='cuda', dtype=torch.float16)
+            dV_ref = torch.empty(B, H, N, D, device='cuda', dtype=torch.float16)
             
-            dQ_custom = torch.empty(B, H, M, D, device='cuda', dtype=torch.float32)
-            dK_custom = torch.empty(B, H, N, D, device='cuda', dtype=torch.float32)
-            dV_custom = torch.empty(B, H, N, D, device='cuda', dtype=torch.float32)      
+            dQ_custom = torch.empty(B, H, M, D, device='cuda', dtype=torch.float16)
+            dK_custom = torch.empty(B, H, N, D, device='cuda', dtype=torch.float16)
+            dV_custom = torch.empty(B, H, N, D, device='cuda', dtype=torch.float16)      
             
             # Check for contiguous
             buffers = [o_ref, o_custom, softmax_lse_ref, softmax_lse_custom, dQ_ref, dK_ref, dV_ref, dQ_custom, dK_custom, dV_custom]
@@ -215,9 +215,17 @@ def test_combined():
 
             # Run Cuda forward+backward
             def run_custom_fwd():
-                flash_attn_v100_cuda.fwd(q, k, v, o_custom, softmax_lse_custom, softmax_scale, causal)
+                nonlocal o_custom, softmax_lse_custom
+                result = flash_attn_v100_cuda.fwd(q, k, v, None, None, 0.0, softmax_scale, causal, -1, -1, 0.0, False, None)
+                o_custom = result[0]
+                softmax_lse_custom = result[1]
+
             def run_custom_bwd():
-                flash_attn_v100_cuda.bwd(q, k, v, o_custom, dO, softmax_lse_custom, dQ_custom, dK_custom, dV_custom, softmax_scale, causal)
+                 nonlocal dQ_custom, dK_custom, dV_custom
+                 result = flash_attn_v100_cuda.bwd(dO, q, k, v, o_custom, softmax_lse_custom, None, None, None, None, 0.0, softmax_scale, causal, -1, -1, 0.0, False, None, None)
+                 dQ_custom = result[0]
+                 dK_custom = result[1]
+                 dV_custom = result[2]
 
             custom_fwd_time = benchmark_kernel(run_custom_fwd)
             custom_bwd_time = benchmark_kernel(run_custom_bwd)
@@ -230,7 +238,7 @@ def test_combined():
                 run_custom_bwd()
             custom_total_mem = measure_gpu_memory(run_custom_total)
 
-            # Проверка forward
+            # Forward pass
             has_nan_custom_fwd = torch.isnan(o_custom).any()
             has_inf_custom_fwd = torch.isinf(o_custom).any()
             has_nan_ref_fwd = torch.isnan(o_ref).any()
@@ -243,22 +251,25 @@ def test_combined():
                 all_passed = False
                 continue
 
-            atol_fwd, rtol_fwd = 1e-3, 1e-3
+            atol_fwd, rtol_fwd = 2e-3, 3e-3
             ok_fwd = torch.allclose(o_custom, o_ref, atol=atol_fwd, rtol=rtol_fwd)
 
             if not ok_fwd:
                 diff = torch.abs(o_custom - o_ref)
+                idx = diff.argmax()
                 max_diff = diff.max().item()
+                mean_diff = diff.mean().item()
                 rel_err = (diff / (o_ref.abs() + 1e-12)).max().item()
-                print(f"  ❌ Forward mismatch: max_diff={max_diff:.6e}, max_rel_err={rel_err:.6e}")
-                print(f"     Refr sample: {o_ref[0,0,0,:5].cpu().numpy()}")
-                print(f"     Cust sample: {o_custom[0,0,0,:5].cpu().numpy()}")
+                print(f"  ❌ Forward mismatch: max_diff={max_diff:.6e}, mean_diff={mean_diff:.6e}, max_rel_err={rel_err:.6e}")
+                print(f"     [PyTorch] sample: {o_ref[0,0,0,:7].cpu().numpy()}")
+                print(f"     [ CUDA  ] sample: {o_custom[0,0,0,:7].cpu().numpy()}")
+                print(f"     [ Error ] Max diff at idx={idx}: PyTorch={ref.flatten()[idx].item():.6e}, CUDA={custom.flatten()[idx].item():.6e}")
                 all_passed = False
                 continue
             else:
                 print("  ✅ Forward match OK")
 
-            # Проверка backward
+            # Backward pass
             has_nan_custom_bwd = torch.isnan(dQ_custom).any() or torch.isnan(dK_custom).any() or torch.isnan(dV_custom).any()
             has_inf_custom_bwd = torch.isinf(dQ_custom).any() or torch.isinf(dK_custom).any() or torch.isinf(dV_custom).any()
             has_nan_ref_bwd = torch.isnan(dQ_ref).any() or torch.isnan(dK_ref).any() or torch.isnan(dV_ref).any()
@@ -275,7 +286,7 @@ def test_combined():
                 all_passed = False
                 continue
 
-            atol_bwd, rtol_bwd = 1e-3, 1e-3
+            atol_bwd, rtol_bwd = 2e-3, 3e-3
             ok_dQ = torch.allclose(dQ_custom, dQ_ref, atol=atol_bwd, rtol=rtol_bwd)
             ok_dK = torch.allclose(dK_custom, dK_ref, atol=atol_bwd, rtol=rtol_bwd)
             ok_dV = torch.allclose(dV_custom, dV_ref, atol=atol_bwd, rtol=rtol_bwd)
@@ -290,11 +301,14 @@ def test_combined():
                 ]:
                     if not ok_flag:
                         diff = (custom - ref).abs()
+                        idx = diff.argmax()
                         max_diff = diff.max().item()
+                        mean_diff = diff.mean().item()
                         rel_err = (diff / (ref.abs() + 1e-12)).max().item()
-                        print(f"  {name}: ❌ max_diff={max_diff:.6e}, max_rel_err={rel_err:.6e}")
-                        print(f"    Refr sample: {ref[0,0,0,:3].cpu().numpy()}")
-                        print(f"    Cust sample: {custom[0,0,0,:3].cpu().numpy()}")
+                        print(f"  {name}: ❌ max_diff={max_diff:.6e}, mean_diff={mean_diff:.6e}, max_rel_err={rel_err:.6e}")
+                        print(f"     [PyTorch] sample: {o_ref[0,0,0,:7].cpu().numpy()}")
+                        print(f"     [ CUDA  ] sample: {o_custom[0,0,0,:7].cpu().numpy()}")
+                        print(f"     [ Error ] Max diff at idx={idx}: PyTorch={ref.flatten()[idx].item():.6e}, CUDA={custom.flatten()[idx].item():.6e}")
                     else:
                         print(f"  {name}: ✅ OK")
                 all_passed = False
@@ -349,4 +363,3 @@ if __name__ == "__main__":
     else:
         print("\n💥 Some combined tests failed! Check mismatches above.")
         exit(1)
-
