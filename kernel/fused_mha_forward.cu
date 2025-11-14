@@ -18,19 +18,32 @@ using namespace nvcuda::wmma;
 #define WMMA_M 16
 #define WMMA_N 16
 #define WMMA_K 16
-#define WARP_SIZE 32
-#define MAX_SMEM (96 * 1024)
+
+#define MAX_THREADS_PER_WARP    32
+#define MAX_THREADS_PER_SM      2048
+#define MAX_THREAD_BLOCK_SIZE   1024
+#define MAX_THREAD_BLOCK_PER_SM 32
+#define MAX_WARPS_PER_SM        64
+#define MAX_SM_PER_GPU          80
+#define MAX_SMEM_PER_SM         98304
+
+#define WARP_ALLOC_GROUP        4
+
+#define MAX_REG_PER_UNIT        256
+#define MAX_REG_PER_THREAD      255
+#define MAX_REG_PER_BLOCK       65536
+#define MAX_REG_BUFFER          65536
 
 // ============================================================================
 // CONFIGURATIONS
 // ============================================================================
 #define BLOCK_M_16  16
 #define BLOCK_N_16  512
-#define WARPS_16    2
+#define WARPS_16    8
 
 #define BLOCK_M_32  32
 #define BLOCK_N_32  256
-#define WARPS_32    4
+#define WARPS_32    8
 
 #define BLOCK_M_64  64
 #define BLOCK_N_64  128
@@ -53,7 +66,7 @@ struct KernelConfig {
     static constexpr int BLOCK_N = (D == 16) ? BLOCK_N_16 : (D == 32) ? BLOCK_N_32 : (D == 64) ? BLOCK_N_64 : (D == 128) ? BLOCK_N_128 : BLOCK_N_256;
     static constexpr int WARPS_PER_BLOCK = (D == 16) ? WARPS_16 : (D == 32) ? WARPS_32 : (D == 64) ? WARPS_64 : (D == 128) ? WARPS_128 : WARPS_256;
     
-    static constexpr int THREADS_PER_BLOCK = WARPS_PER_BLOCK * WARP_SIZE;
+    static constexpr int THREADS_PER_BLOCK = WARPS_PER_BLOCK * MAX_THREADS_PER_WARP;
     static constexpr int NUM_K_TILES       = (D + WMMA_K - 1) / WMMA_K;
     static constexpr int THREADS_PER_ROW   = THREADS_PER_BLOCK / BLOCK_M;
     static constexpr int PAD               = (8 - (D % 32) + 32) % 32;
@@ -65,13 +78,36 @@ struct KernelConfig {
     static constexpr int PER_FLOAT4        = 4;
     static constexpr int VECTOR_D          = (D + PER_UINT4 - 1) / PER_UINT4;
     static constexpr int VECTOR_F          = (BLOCK_M * O_STRIDE + PER_FLOAT4 - 1) / PER_FLOAT4;
-    static constexpr size_t SMEM_Q = (((size_t)BLOCK_M * Q_STRIDE * sizeof(__half) + 127) & ~static_cast<size_t>(127));
-    static constexpr size_t SMEM_K = (((size_t)BLOCK_N * KV_STRIDE * sizeof(__half) + 127) & ~static_cast<size_t>(127));
-    static constexpr size_t SMEM_S = (((size_t)BLOCK_M * S_STRIDE * sizeof(float) + 127) & ~static_cast<size_t>(127));
-    static constexpr size_t SMEM_O = (((size_t)BLOCK_M * O_STRIDE * sizeof(float) + 127) & ~static_cast<size_t>(127));
+    static constexpr size_t SMEM_Q  = (((size_t)BLOCK_M * Q_STRIDE * sizeof(__half) + 127) & ~static_cast<size_t>(127));
+    static constexpr size_t SMEM_KV = (((size_t)BLOCK_N * KV_STRIDE * sizeof(__half) + 127) & ~static_cast<size_t>(127));
+    static constexpr size_t SMEM_S  = (((size_t)BLOCK_M * S_STRIDE * sizeof(float) + 127) & ~static_cast<size_t>(127));
+    static constexpr size_t SMEM_O  = (((size_t)BLOCK_M * O_STRIDE * sizeof(float) + 127) & ~static_cast<size_t>(127));
     static constexpr size_t SMEM_STATE = (((size_t)3 * BLOCK_M * sizeof(float) + 127) & ~static_cast<size_t>(127));
-    static constexpr size_t TOTAL_SMEM = SMEM_Q + SMEM_K + SMEM_S + SMEM_O + SMEM_STATE;
+    static constexpr size_t TOTAL_SMEM = SMEM_Q + SMEM_KV + SMEM_S + SMEM_O + SMEM_STATE;
 };
+
+// ============================================================================
+// LANE SWIZZLE (layout-preserving 8×4)
+// ============================================================================
+__device__ __forceinline__ void store_u4_swizzle(
+    const uint4* g_vec, uint4* s_vec, int rows, int vec_per_row, int stride_u4, int lane_id, int warp_id, int total_warps) {
+    const int ROW_GROUP = 8;
+    for (int base_row = warp_id * ROW_GROUP; base_row < rows; base_row += total_warps * ROW_GROUP) {
+        const int r = lane_id % ROW_GROUP;
+        const int c = lane_id / ROW_GROUP;
+        const int row = base_row + r;
+        if (row >= rows) continue;
+
+        for (int col0 = 0; col0 < vec_per_row; col0 += 4) {
+            int cg = min(4, vec_per_row - col0);
+            int c_eff = (cg == 4) ? (c ^ (r & 3)) : ((c + r) % cg);
+            if (c_eff >= cg) continue;
+
+            int col = col0 + c_eff;
+            s_vec[row * stride_u4 + col] = __ldg(&g_vec[row * vec_per_row + col]);
+        }
+    }
+}
 
 // ============================================================================
 // OPTIMIZED KERNEL
@@ -116,8 +152,8 @@ flash_attention_forward_kernel(
     
     const int valid_q_rows = min(BLOCK_M, M - start_row);
     const int tid = threadIdx.x;
-    const int warp_id = tid / WARP_SIZE;
-    const int lane_id = tid % WARP_SIZE;
+    const int warp_id = tid / MAX_THREADS_PER_WARP;
+    const int lane_id = tid % MAX_THREADS_PER_WARP;
     
     // Global pointers
     const __half* q_ptr    = Q +           (size_t)batch_head_id * M * D + start_row * D;
@@ -130,8 +166,9 @@ flash_attention_forward_kernel(
     extern __shared__ char smem[];
    
     __half* sQ      = reinterpret_cast<__half*>(smem);
-    __half* sKV     = sQ + BLOCK_M * Q_STRIDE;
-    float*  sS      = reinterpret_cast<float*>(sKV + BLOCK_N * KV_STRIDE);
+    __half* sK      = sQ + BLOCK_M * Q_STRIDE;
+    __half* sV      = sK;
+    float*  sS      = reinterpret_cast<float*>(sK + BLOCK_N * KV_STRIDE);
     float*  sO      = sS + BLOCK_M * S_STRIDE;
     float*  sRowMax = sO + BLOCK_M * O_STRIDE;
     float*  sRowSum = sRowMax + BLOCK_M;
@@ -141,27 +178,21 @@ flash_attention_forward_kernel(
     const uint4* q_vec = reinterpret_cast<const uint4*>(q_ptr);
     uint4*      sQ_vec = reinterpret_cast<uint4*>(sQ);
     float4*     sO_vec = reinterpret_cast<float4*>(sO);
-    const float4 zero4 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-    const int max_work = max(max(BLOCK_M * VECTOR_D, VECTOR_F), BLOCK_M);
+    const int q_stride_uint4  = (Q_STRIDE  + PER_UINT4 - 1) / PER_UINT4;
+    const int kv_stride_uint4 = (KV_STRIDE + PER_UINT4 - 1) / PER_UINT4;
 
+    // Load sQ from global to smem
+    store_u4_swizzle(q_vec, sQ_vec, valid_q_rows, VECTOR_D, q_stride_uint4, lane_id, warp_id, WARPS_PER_BLOCK);
+
+    // Init sO with zero + stats
     #pragma unroll 4
-    for (int i = tid; i < max_work; i += THREADS) {
-        // 1. Load Q into sQ
-        if (i < BLOCK_M * VECTOR_D) {
-            const int row = i / VECTOR_D;
-            const int col = i % VECTOR_D;
-            uint4 val = make_uint4(0, 0, 0, 0);
-            if (row < valid_q_rows && col < VECTOR_D) {
-                val = __ldg(&q_vec[row * VECTOR_D + col]);
-            }
-            sQ_vec[row * ((Q_STRIDE + PER_UINT4 - 1) / PER_UINT4) + col] = val;
+    for (int i = tid; i < max(VECTOR_F, BLOCK_M); i += THREADS) {
+        if (i < VECTOR_F) sO_vec[i] = {0.0f};
+        if (i < BLOCK_M) { 
+            sRowMax[i] = NEG_INF; 
+            sRowSum[i] = 0.0f; 
+            sOldMax[i] = 1.0f; 
         }
-
-        // 2. Zero out O accumulator
-        if (i < VECTOR_F) { sO_vec[i] = zero4; }
-
-        // 3. Initialize per-row state buffers (sRowMax, sRowSum, sOldMax)
-        if (i < BLOCK_M) { sRowMax[i] = NEG_INF; sRowSum[i] = 0.0f; sOldMax[i] = 1.0f; }
     }
     __syncthreads();
 
@@ -199,21 +230,11 @@ flash_attention_forward_kernel(
             }
         }
         
-        // Load K into shared memory
-        __half* sK = sKV;
-        const uint4* k_vec = reinterpret_cast<const uint4*>(k_ptr + start_col * D);
-        uint4* sK_vec = reinterpret_cast<uint4*>(sK);
-        const int kv_stride_uint4 = (KV_STRIDE + PER_UINT4 - 1) / PER_UINT4;
-        #pragma unroll 4
-        for (int idx = tid; idx < BLOCK_N * VECTOR_D; idx += THREADS) {
-            const int row = idx / VECTOR_D;
-            const int vec_col = idx % VECTOR_D;
-            uint4 val = make_uint4(0, 0, 0, 0);
-            if (row < valid_k_rows && vec_col < VECTOR_D) {
-                val = __ldg(&k_vec[row * VECTOR_D + vec_col]);
-            }
-            sK_vec[row * kv_stride_uint4 + vec_col] = val;
-        }
+        // Load K from gobal into smem
+        const uint4* k_vec  = reinterpret_cast<const uint4*>(k_ptr + start_col * D);
+              uint4* sK_vec = reinterpret_cast<uint4*>(sK);
+
+        store_u4_swizzle(k_vec, sK_vec, valid_k_rows, VECTOR_D, kv_stride_uint4, lane_id, warp_id, WARPS_PER_BLOCK);
         __syncthreads();
         
         // Compute S = Q @ K^T
@@ -375,24 +396,12 @@ flash_attention_forward_kernel(
         }
         __syncthreads();
         
+        // Load V from global to smem
+        const uint4* v_vec  = reinterpret_cast<const uint4*>(v_ptr + start_col * D);
+              uint4* sV_vec = reinterpret_cast<uint4*>(sV);
 
-        // Load V
-        __half* sV = sKV;
-        const uint4* v_vec = reinterpret_cast<const uint4*>(v_ptr + start_col * D);
-        uint4* sV_vec = reinterpret_cast<uint4*>(sV);
-        
-        #pragma unroll 4
-        for (int idx = tid; idx < BLOCK_N * VECTOR_D; idx += THREADS) {
-            const int row = idx / VECTOR_D;
-            const int vec_col = idx % VECTOR_D;
-            uint4 val = make_uint4(0, 0, 0, 0);
-            if (row < valid_k_rows && vec_col < VECTOR_D) {
-                val = __ldg(&v_vec[row * VECTOR_D + vec_col]);
-            }
-            sV_vec[row * kv_stride_uint4 + vec_col] = val;
-        }
+        store_u4_swizzle(v_vec, sV_vec, valid_k_rows, VECTOR_D, kv_stride_uint4, lane_id, warp_id, WARPS_PER_BLOCK);
         __syncthreads();
-        
 
         // Compute P @ V
         const int num_tiles_m_pv = (BLOCK_M + WMMA_M - 1) / WMMA_M;
@@ -492,7 +501,7 @@ void launcher_flash_attention_forward(
     const dim3 block(Config::THREADS_PER_BLOCK);
     const size_t smem = Config::TOTAL_SMEM;
 
-    TORCH_CHECK(smem <= MAX_SMEM, "Shared memory exceeds 96KB: ", smem, " bytes");
+    TORCH_CHECK(smem <= MAX_SMEM_PER_SM, "Shared memory exceeds 96KB: ", smem, " bytes");
     
     auto kernel = is_causal ?
         (void*)flash_attention_forward_kernel<D, true> :
