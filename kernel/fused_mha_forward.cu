@@ -299,51 +299,83 @@ flash_attention_forward_kernel(
         if (tid < valid_q_rows * THREADS_PER_ROW) {
             const int row = tid / THREADS_PER_ROW;
             const int thread_in_row = tid % THREADS_PER_ROW;
+
             float* row_scores = sS + row * S_STRIDE;
-            
+
+            const int vec_cols = valid_k_rows / 4;
+            const int vecs_per_thread = (vec_cols + THREADS_PER_ROW - 1) / THREADS_PER_ROW;
+            float4* row_vec = reinterpret_cast<float4*>(row_scores);
+
             float thread_max = NEG_INF;
-            const int cols_per_thread = (valid_k_rows + THREADS_PER_ROW - 1) / THREADS_PER_ROW;
-            
             #pragma unroll 4
-            for (int j = 0; j < cols_per_thread; ++j) {
-                const int col = thread_in_row + j * THREADS_PER_ROW;
-                if (col < valid_k_rows) {
-                    thread_max = fmaxf(thread_max, row_scores[col]);
+            for (int j = 0; j < vecs_per_thread; ++j) {
+                int vc = thread_in_row + j * THREADS_PER_ROW;
+                if (vc < vec_cols) {
+                    float4 v4 = row_vec[vc];
+                    thread_max = fmaxf(thread_max, fmaxf(fmaxf(v4.x, v4.y), fmaxf(v4.z, v4.w)));
                 }
             }
-            
+
             #pragma unroll
-            for (int offset = 1; offset < THREADS_PER_ROW; offset *= 2) {
-                thread_max = fmaxf(thread_max, __shfl_xor_sync(0xffffffff, thread_max, offset));
+            for (int offset = THREADS_PER_ROW / 2; offset > 0; offset >>= 1) {
+                float other = __shfl_down_sync(0xffffffff, thread_max, offset);
+                thread_max = fmaxf(thread_max, other);
             }
-            
+
             const float old_max = sRowMax[row];
-            const float new_max = fmaxf(old_max, thread_max);
+            const float row_warp_max = __shfl_sync(0xffffffff, thread_max, 0);
+            const float new_max = fmaxf(old_max, row_warp_max);
             const float exp_diff = __expf(old_max - new_max);
-            
+
             float thread_sum = 0.0f;
             #pragma unroll 4
-            for (int j = 0; j < cols_per_thread; ++j) {
-                const int col = thread_in_row + j * THREADS_PER_ROW;
-                if (col < valid_k_rows) {
-                    float shifted = row_scores[col] - new_max;
-                    float exp_val = (shifted < -80.0f) ? 0.0f : __expf(shifted);
-                    row_scores[col] = exp_val;
-                    thread_sum += exp_val;
+            for (int j = 0; j < vecs_per_thread; ++j) {
+                int vc = thread_in_row + j * THREADS_PER_ROW;
+                if (vc < vec_cols) {
+                    float4 v4 = row_vec[vc];
+                    float4 e4;
+
+                    v4.x = fmaxf(v4.x - new_max, -80.0f); v4.y = fmaxf(v4.y - new_max, -80.0f);
+                    v4.z = fmaxf(v4.z - new_max, -80.0f); v4.w = fmaxf(v4.w - new_max, -80.0f);
+
+                    e4.x = __expf(v4.x); e4.y = __expf(v4.y);
+                    e4.z = __expf(v4.z); e4.w = __expf(v4.w);
+
+                    row_vec[vc] = e4;
+                    thread_sum += e4.x + e4.y + e4.z + e4.w;
                 }
             }
-            
+
             #pragma unroll
-            for (int offset = 1; offset < THREADS_PER_ROW; offset *= 2) {
-                thread_sum += __shfl_xor_sync(0xffffffff, thread_sum, offset);
+            for (int offset = THREADS_PER_ROW / 2; offset > 0; offset >>= 1) {
+                float other = __shfl_down_sync(0xffffffff, thread_sum, offset);
+                thread_sum += other;
             }
-            
+
             if (thread_in_row == 0) {
-                const float old_sum = sRowSum[row];
-                const float new_sum = exp_diff * old_sum + thread_sum;
+                float old_sum = sRowSum[row];
+                float new_sum = exp_diff * old_sum + thread_sum;
                 sRowSum[row] = new_sum;
                 sRowMax[row] = new_max;
                 sOldMax[row] = exp_diff;
+            }
+
+            const int tail_start = vec_cols * 4;
+            for (int col = tail_start + thread_in_row; col < valid_k_rows; col += THREADS_PER_ROW) {
+                float val = row_scores[col];
+                float shifted = fmaxf(val - new_max, -80.0f);
+                float exp_val = __expf(shifted);
+                row_scores[col] = exp_val;
+
+                float tail_sum = exp_val;
+
+                #pragma unroll
+                for (int offset = THREADS_PER_ROW / 2; offset > 0; offset >>= 1) {
+                    float other = __shfl_down_sync(0xffffffff, tail_sum, offset);
+                    tail_sum += other;
+                }
+
+                if (thread_in_row == 0) { sRowSum[row] += tail_sum; }
             }
         }
         __syncthreads();
