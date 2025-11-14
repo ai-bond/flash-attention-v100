@@ -153,7 +153,7 @@ def test_combined():
             print(f"Test: B={B}, H={H}, M={M}, N={N}, D={D}, causal={causal}")
             
             # For represent
-            torch.manual_seed(42)
+            torch.manual_seed(421)
 
             # Generate reference input data forward+backward
             q = torch.randn(B, H, M, D, device='cuda', dtype=torch.float16)
