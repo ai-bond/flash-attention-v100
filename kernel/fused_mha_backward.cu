@@ -272,17 +272,6 @@ flash_attention_backward_dq_kernel(
     if (tid < valid_q_rows) { sLse[tid] = lse_ptr[tid]; }
     __syncthreads();
 
-    // Prefetch first block of K and V (L2 cache line = 128 bytes = 64 fp16)
-    const int cache_lines = ((BLOCK_N * D) + 63) / 64;
-    const int prefetch_threads = min(THREADS, cache_lines);
-    if (tid < prefetch_threads) {
-        const __half* first_k = k_ptr + tid * 64;
-        const __half* first_v = v_ptr + tid * 64;
-        asm volatile("prefetch.global.L2 [%0];" :: "l"(first_k));
-        asm volatile("prefetch.global.L2 [%0];" :: "l"(first_v));
-    }
-    __syncthreads();
-
     // ========================================================================
     // MAIN LOOP
     // ========================================================================
@@ -294,18 +283,6 @@ flash_attention_backward_dq_kernel(
         const int start_col = block_n * BLOCK_N;
         if (start_col >= N) break;
         const int valid_k_rows = min(BLOCK_N, N - start_col);
-
-        // Prefetch next block of K and V
-        if (block_n + 1 < num_n_blocks) {
-            const int cache_lines = ((BLOCK_N * D) + 63) / 64;
-            const int prefetch_threads = min(THREADS, cache_lines);
-            if (tid < prefetch_threads) {
-                const __half* next_k = k_ptr + (block_n + 1) * BLOCK_N * D + tid * 64;
-                const __half* next_v = v_ptr + (block_n + 1) * BLOCK_N * D + tid * 64;
-                asm volatile("prefetch.global.L2 [%0];" :: "l"(next_k));
-                asm volatile("prefetch.global.L2 [%0];" :: "l"(next_v));
-            }
-        }
 
         // Unified load: dO and V
         const uint4* do_vec       = reinterpret_cast<const uint4*>(dO_ptr);
