@@ -19,8 +19,21 @@ using namespace nvcuda::wmma;
 #define WMMA_M 16
 #define WMMA_N 16
 #define WMMA_K 16
-#define WARP_SIZE 32
-#define MAX_SMEM (96 * 1024)
+
+#define MAX_THREADS_PER_WARP    32
+#define MAX_THREADS_PER_SM      2048
+#define MAX_THREAD_BLOCK_SIZE   1024
+#define MAX_THREAD_BLOCK_PER_SM 32
+#define MAX_WARPS_PER_SM        64
+#define MAX_SM_PER_GPU          80
+#define MAX_SMEM_PER_SM         98304
+
+#define WARP_ALLOC_GROUP        4
+
+#define MAX_REG_PER_UNIT        256
+#define MAX_REG_PER_THREAD      255
+#define MAX_REG_PER_BLOCK       65536
+#define MAX_REG_BUFFER          65536
 
 // ============================================================================
 // CONFIGURATIONS DQ
@@ -77,7 +90,7 @@ struct dQKernelConfig {
     static constexpr int BLOCK_N = (D == 16) ? BLOCK_N_16 : (D == 32) ? BLOCK_N_32 : (D == 64)  ? BLOCK_N_64 : (D == 128) ? BLOCK_N_128 : BLOCK_N_256;
     static constexpr int WARPS_PER_BLOCK = (D == 16) ? WARPS_16 : (D == 32) ? WARPS_32 : (D == 64) ? WARPS_64 : (D == 128) ? WARPS_128 : WARPS_256;
     
-    static constexpr int THREADS_PER_BLOCK = WARPS_PER_BLOCK * WARP_SIZE;
+    static constexpr int THREADS_PER_BLOCK = WARPS_PER_BLOCK * MAX_THREADS_PER_WARP;
     static constexpr int THREADS_PER_ROW   = THREADS_PER_BLOCK / BLOCK_M;
     static constexpr int NUM_K_TILES       = (D + WMMA_K - 1) / WMMA_K;
     static constexpr int PAD               = (8 - (D % 32) + 32) % 32;
@@ -108,7 +121,7 @@ struct dKVKernelConfig {
     static constexpr int BLOCK_N = (D == 16) ? BLOCK_Q_16 : (D == 32) ? BLOCK_Q_32 : (D == 64) ? BLOCK_Q_64 : (D == 128) ? BLOCK_Q_128 : BLOCK_Q_256;
     static constexpr int WARPS_PER_BLOCK = (D == 16) ? WARPS_DKV_16 : (D == 32) ? WARPS_DKV_32 : (D == 64) ? WARPS_DKV_64 : (D == 128) ? WARPS_DKV_128 : WARPS_DKV_256;
     
-    static constexpr int THREADS_PER_BLOCK = WARPS_PER_BLOCK * WARP_SIZE;
+    static constexpr int THREADS_PER_BLOCK = WARPS_PER_BLOCK * MAX_THREADS_PER_WARP;
     static constexpr int THREADS_PER_ROW   = THREADS_PER_BLOCK / BLOCK_N;
     static constexpr int NUM_K_TILES       = (D + WMMA_K - 1) / WMMA_K;
     static constexpr int PAD               = 8;
@@ -176,9 +189,23 @@ flash_attention_backward_dq_kernel(
     const int start_row = block_m * BLOCK_M;
     if (start_row >= M) return;
 
+    int num_n_blocks = (N + BLOCK_N - 1) / BLOCK_N;
+
+    // Early loop limit n_blocks for causal
+    if constexpr (IS_CAUSAL) {
+        const int valid_q_rows = min(BLOCK_M, M - start_row);
+        const int max_key_pos = start_row + valid_q_rows - 1;
+        if (max_key_pos < 0) {
+            num_n_blocks = 0;
+        } else {
+            num_n_blocks = min(num_n_blocks, (max_key_pos + BLOCK_N) / BLOCK_N);
+        }
+    }
+
     const int valid_q_rows = min(BLOCK_M, M - start_row);
     const int tid          = threadIdx.x;
-    const int warp_id      = tid / WARP_SIZE;
+    const int warp_id      = tid / MAX_THREADS_PER_WARP;
+    const int lane_id      = tid % MAX_THREADS_PER_WARP;
 
     // Global pointers
     const __half* q_ptr   = Q           + (size_t)batch_head_id * M * D + start_row * D;
@@ -272,22 +299,9 @@ flash_attention_backward_dq_kernel(
     if (tid < valid_q_rows) { sLse[tid] = lse_ptr[tid]; }
     __syncthreads();
 
-    // Prefetch first block of K and V (L2 cache line = 128 bytes = 64 fp16)
-    const int cache_lines = ((BLOCK_N * D) + 63) / 64;
-    const int prefetch_threads = min(THREADS, cache_lines);
-    if (tid < prefetch_threads) {
-        const __half* first_k = k_ptr + tid * 64;
-        const __half* first_v = v_ptr + tid * 64;
-        asm volatile("prefetch.global.L2 [%0];" :: "l"(first_k));
-        asm volatile("prefetch.global.L2 [%0];" :: "l"(first_v));
-    }
-    __syncthreads();
-
     // ========================================================================
     // MAIN LOOP
     // ========================================================================
-
-    const int num_n_blocks = (N + BLOCK_N - 1) / BLOCK_N;
 
     // Iterate over K/V blocks
     for (int block_n = 0; block_n < num_n_blocks; ++block_n) {
@@ -295,16 +309,9 @@ flash_attention_backward_dq_kernel(
         if (start_col >= N) break;
         const int valid_k_rows = min(BLOCK_N, N - start_col);
 
-        // Prefetch next block of K and V
-        if (block_n + 1 < num_n_blocks) {
-            const int cache_lines = ((BLOCK_N * D) + 63) / 64;
-            const int prefetch_threads = min(THREADS, cache_lines);
-            if (tid < prefetch_threads) {
-                const __half* next_k = k_ptr + (block_n + 1) * BLOCK_N * D + tid * 64;
-                const __half* next_v = v_ptr + (block_n + 1) * BLOCK_N * D + tid * 64;
-                asm volatile("prefetch.global.L2 [%0];" :: "l"(next_k));
-                asm volatile("prefetch.global.L2 [%0];" :: "l"(next_v));
-            }
+        // Early skip per tile
+        if constexpr (IS_CAUSAL) {
+            if (start_col >= start_row + valid_q_rows) { continue; }
         }
 
         // Unified load: dO and V
@@ -416,6 +423,9 @@ flash_attention_backward_dq_kernel(
 
         // Compute S = Q @ K^T with 2D warp distribution
         float* sS = acc_buffer;
+        
+        const unsigned row_causal = (lane_id & 0b1) + ((lane_id >> 2) & 0b1) * 8 + ((lane_id >> 4) & 0b1) * 4;
+        const unsigned col_causal = ((lane_id >> 1) & 0b1) * 2 + ((lane_id >> 3) & 0b1) * 8;
        
         for (int tile_idx = 0; tile_idx < tiles_per_warp; ++tile_idx) {
             const int global_tile_idx = warp_id * tiles_per_warp + tile_idx;
@@ -445,31 +455,26 @@ flash_attention_backward_dq_kernel(
                 mma_sync(acc_frag, a_frag, b_frag, acc_frag);
             }
 
-            #pragma unroll
-            for (int i = 0; i < acc_frag.num_elements; ++i) {
-                acc_frag.x[i] *= softmax_scale;
+            // Fused scaling + causal mask
+            if constexpr (IS_CAUSAL) {
+                 #pragma unroll
+                 for (int i = 0; i < acc_frag.num_elements; ++i) {
+                     const unsigned col = col_causal + (i & 0b1) + ((i >> 2) & 0b1) * 4;
+                     const unsigned row = row_causal + ((i >> 1) & 0b1) * 2;
+                     const int global_m = start_row + tile_m + row;
+                     const int global_n = start_col + tile_n + col;
+            
+                     acc_frag.x[i] = (global_n > global_m) ? NEG_INF : (acc_frag.x[i] * softmax_scale);
+                 }
+            } else {
+                 #pragma unroll
+                 for (int i = 0; i < acc_frag.num_elements; ++i) {
+                     acc_frag.x[i] *= softmax_scale;
+                 }
             }
-
             store_matrix_sync(sS + tile_m * S_STRIDE + tile_n, acc_frag, S_STRIDE, mem_row_major);
         }
-
         __syncthreads();
-
-        // Apply causal mask
-        if (IS_CAUSAL) {
-            #pragma unroll 2
-            for (int idx = tid; idx < BLOCK_M * BLOCK_N; idx += THREADS) {
-                const int local_m  = idx / BLOCK_N;
-                const int local_n  = idx % BLOCK_N;
-                const int global_m = start_row + local_m;
-                const int global_n = start_col + local_n;
-
-                if (local_m < valid_q_rows && local_n < valid_k_rows && global_n > global_m) {
-                    sS[local_m * S_STRIDE + local_n] = NEG_INF;
-                }
-            }
-            __syncthreads();
-        }
         
         // Compute dS = exp(S - lse) * (dOV - row_dot) * scale → store directly as half
         __half* sdS_base = reinterpret_cast<__half*>(dov_buffer);
@@ -636,8 +641,12 @@ flash_attention_backward_dkv_kernel(
     if (start_kv >= N) return;
 
     const int valid_kv_rows = min(BLOCK_M, N - start_kv);
-    const int tid = threadIdx.x;
-    const int warp_id = tid / WARP_SIZE;
+
+    int num_q_blocks = (M + BLOCK_N - 1) / BLOCK_N;
+
+    const int tid     = threadIdx.x;
+    const int warp_id = tid / MAX_THREADS_PER_WARP;
+    const int lane_id = tid % MAX_THREADS_PER_WARP;
 
     // Global pointers
     const __half*   q_ptr = Q           + (size_t)batch_head_id * M * D;
@@ -676,12 +685,15 @@ flash_attention_backward_dkv_kernel(
     // MAIN LOOP
     // ========================================================================
 
-    const int num_q_blocks = (M + BLOCK_N - 1) / BLOCK_N;
-    
     for (int block_n = 0; block_n < num_q_blocks; ++block_n) {
         const int start_col = block_n * BLOCK_N;
         if (start_col >= M) break;
         const int valid_q_rows = min(BLOCK_N, M - start_col);
+
+        // Skip per tile
+        if constexpr (IS_CAUSAL) {
+            if (start_kv >= start_col + valid_q_rows) { continue; }
+        }
         
         // Load K (into qkv_buffer) and Q (into sdO)
         const uint4* k_vec = reinterpret_cast<const uint4*>(k_ptr);
@@ -727,6 +739,9 @@ flash_attention_backward_dkv_kernel(
         constexpr int num_tiles_s_n = (BLOCK_M + WMMA_N - 1) / WMMA_N;
         constexpr int total_tiles_s = num_tiles_s_m * num_tiles_s_n;
         constexpr int tiles_per_warp_s = (total_tiles_s + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
+
+        const unsigned row_causal = (lane_id & 0b1) + ((lane_id >> 2) & 0b1) * 8 + ((lane_id >> 4) & 0b1) * 4;
+        const unsigned col_causal = ((lane_id >> 1) & 0b1) * 2 + ((lane_id >> 3) & 0b1) * 8;
         
         for (int tile_local = 0; tile_local < tiles_per_warp_s; ++tile_local) {
             const int tile_idx = warp_id * tiles_per_warp_s + tile_local;
@@ -753,30 +768,27 @@ flash_attention_backward_dkv_kernel(
                 mma_sync(acc_frag, a_frag, b_frag, acc_frag);
             }
 
-            #pragma unroll
-            for (int i = 0; i < acc_frag.num_elements; ++i) {
-                acc_frag.x[i] *= softmax_scale;
-            }
+            // Fused scaling + causal mask
+            if constexpr (IS_CAUSAL) {
+                #pragma unroll
+                for (int i = 0; i < acc_frag.num_elements; ++i) {
+                    const unsigned col = col_causal + (i & 0b1) + ((i >> 2) & 0b1) * 4;
+                    const unsigned row = row_causal + ((i >> 1) & 0b1) * 2;
+                    const int global_m = start_col + tile_m + row;
+                    const int global_n = start_kv + tile_n + col;
 
+                    acc_frag.x[i] = (global_n > global_m) ? NEG_INF : (acc_frag.x[i] * softmax_scale);
+                }
+            } else {
+                #pragma unroll
+                for (int i = 0; i < acc_frag.num_elements; ++i) {
+                    acc_frag.x[i] *= softmax_scale;
+                }
+            }
             store_matrix_sync(sS + tile_m * S_STRIDE + tile_n, acc_frag, S_STRIDE, mem_row_major);
         }
         __syncthreads();
         
-        // Apply causal mask
-        if (IS_CAUSAL) {
-            #pragma unroll 2
-            for (int idx = tid; idx < BLOCK_N * BLOCK_M; idx += THREADS) {
-                const int local_m = idx / BLOCK_M;
-                const int local_n = idx % BLOCK_M;
-                const int global_m = start_col + local_m;
-                const int global_n = start_kv + local_n;
-                if (local_m < valid_q_rows && local_n < valid_kv_rows && global_n > global_m) {
-                    sS[local_m * S_STRIDE + local_n] = NEG_INF;
-                }
-            }
-            __syncthreads();
-        }
-
         // Load dO into sdO (as fp16)
         const uint4* do_vec = reinterpret_cast<const uint4*>(dO_ptr + start_col * D);
         uint4* sdO_vec      = reinterpret_cast<uint4*>(sdO);
@@ -1115,7 +1127,7 @@ void launcher_flash_attention_backward_dq(
     const dim3 block(Config::THREADS_PER_BLOCK);
     const size_t smem = Config::TOTAL_SMEM;
     
-    TORCH_CHECK(smem <= MAX_SMEM, "Shared memory exceeds 96KB for dQ: ", smem, " bytes");
+    TORCH_CHECK(smem <= MAX_SMEM_PER_SM, "Shared memory exceeds 96KB for dQ: ", smem, " bytes");
     
     auto kernel = is_causal ? 
         (void*)flash_attention_backward_dq_kernel<D, true> :
@@ -1177,7 +1189,7 @@ void launcher_flash_attention_backward_dkv(
     const dim3 block(Config::THREADS_PER_BLOCK);
     const size_t smem = Config::TOTAL_SMEM;
     
-    TORCH_CHECK(smem <= MAX_SMEM, "Shared memory exceeds 96KB for unified dKV: ", smem, " bytes (", smem / 1024, " KB)");
+    TORCH_CHECK(smem <= MAX_SMEM_PER_SM, "Shared memory exceeds 96KB for unified dKV: ", smem, " bytes (", smem / 1024, " KB)");
     
     auto kernel = is_causal ?
         (void*)flash_attention_backward_dkv_kernel<D, true> :

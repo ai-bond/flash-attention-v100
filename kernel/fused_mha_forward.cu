@@ -149,6 +149,19 @@ flash_attention_forward_kernel(
     const int block_m = blockIdx.x;
     const int start_row = block_m * BLOCK_M;
     if (start_row >= M) return;
+
+    int num_n_blocks = (N + BLOCK_N - 1) / BLOCK_N;
+
+    // Early loop limit n_blocks for causal
+    if constexpr (IS_CAUSAL) {
+        const int valid_q_rows = min(BLOCK_M, M - start_row);
+        const int max_key_pos = start_row + valid_q_rows - 1;
+        if (max_key_pos < 0) {
+            num_n_blocks = 0;
+        } else {
+            num_n_blocks = min(num_n_blocks, (max_key_pos + BLOCK_N + 0) / BLOCK_N);
+        }
+    }
     
     const int valid_q_rows = min(BLOCK_M, M - start_row);
     const int tid = threadIdx.x;
@@ -196,40 +209,20 @@ flash_attention_forward_kernel(
     }
     __syncthreads();
 
-    // Prefetch first block of K and V (L2 cache line = 128 bytes = 64 fp16)
-    const int cache_lines = ((BLOCK_N * D) + 63) / 64;
-    const int prefetch_threads = min(THREADS, cache_lines);
-    if (tid < prefetch_threads) {
-        const __half* first_k = k_ptr + tid * 64;
-        const __half* first_v = v_ptr + tid * 64;
-        asm volatile("prefetch.global.L2 [%0];" :: "l"(first_k));
-        asm volatile("prefetch.global.L2 [%0];" :: "l"(first_v));
-    }
-    __syncthreads();
-    
     // ========================================================================
     // MAIN LOOP
     // ========================================================================
-
-    const int num_n_blocks = (N + BLOCK_N - 1) / BLOCK_N;
 
     for (int block_n = 0; block_n < num_n_blocks; ++block_n) {
         const int start_col = block_n * BLOCK_N;
         if (start_col >= N) break;
         const int valid_k_rows = min(BLOCK_N, N - start_col);
 
-        // Prefetch next block of K and V
-        if (block_n + 1 < num_n_blocks) {
-            const int cache_lines = ((BLOCK_N * D) + 63) / 64;
-            const int prefetch_threads = min(THREADS, cache_lines);
-            if (tid < prefetch_threads) {
-                const __half* next_k = k_ptr + (block_n + 1) * BLOCK_N * D + tid * 64;
-                const __half* next_v = v_ptr + (block_n + 1) * BLOCK_N * D + tid * 64;
-                asm volatile("prefetch.global.L2 [%0];" :: "l"(next_k));
-                asm volatile("prefetch.global.L2 [%0];" :: "l"(next_v));
-            }
+        // Skip per tile
+        if constexpr (IS_CAUSAL) {
+            if (start_col >= start_row + valid_q_rows) { continue; }
         }
-        
+
         // Load K from gobal into smem
         const uint4* k_vec  = reinterpret_cast<const uint4*>(k_ptr + start_col * D);
               uint4* sK_vec = reinterpret_cast<uint4*>(sK);
@@ -242,6 +235,9 @@ flash_attention_forward_kernel(
         const int num_tiles_n_actual = (valid_k_rows + WMMA_N - 1) / WMMA_N;
         const int total_tiles = num_tiles_m * num_tiles_n_actual;
         const int tiles_per_warp = (total_tiles + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
+
+        const unsigned row_causal = (lane_id & 0b1) + ((lane_id >> 2) & 0b1) * 8 + ((lane_id >> 4) & 0b1) * 4;
+        const unsigned col_causal = ((lane_id >> 1) & 0b1) * 2 + ((lane_id >> 3) & 0b1) * 8;
         
         for (int tile_idx = 0; tile_idx < tiles_per_warp; ++tile_idx) {
             const int global_tile_idx = warp_id * tiles_per_warp + tile_idx;
@@ -270,30 +266,28 @@ flash_attention_forward_kernel(
                 mma_sync(acc_frag, a_frag, b_frag, acc_frag);
             }
             
-            #pragma unroll
-            for (int i = 0; i < acc_frag.num_elements; ++i) {
-                acc_frag.x[i] *= softmax_scale;
+            // Fused scaling + causal mask
+            if constexpr (IS_CAUSAL) {
+                #pragma unroll
+                for (int i = 0; i < acc_frag.num_elements; ++i) {
+                    const unsigned col = col_causal + (i & 0b1) + ((i >> 2) & 0b1) * 4;
+                    const unsigned row = row_causal + ((i >> 1) & 0b1) * 2;
+            
+                    const int global_m = start_row + tile_m + row;
+                    const int global_n = start_col + tile_n + col;
+            
+                    acc_frag.x[i] = (global_n > global_m) ? NEG_INF : (acc_frag.x[i] * softmax_scale);
+                }
+            } else {
+                #pragma unroll
+                for (int i = 0; i < acc_frag.num_elements; ++i) {
+                    acc_frag.x[i] *= softmax_scale;
+                }
             }
             
             store_matrix_sync(sS + tile_m * S_STRIDE + tile_n, acc_frag, S_STRIDE, mem_row_major);
         }
         __syncthreads();
-        
-        // Apply causal mask
-        if (IS_CAUSAL) {
-            #pragma unroll 2
-            for (int idx = tid; idx < BLOCK_M * BLOCK_N; idx += THREADS) {
-                const int local_m = idx / BLOCK_N;
-                const int local_n = idx % BLOCK_N;
-                const int global_m = start_row + local_m;
-                const int global_n = start_col + local_n;
-                
-                if (local_m < valid_q_rows && local_n < valid_k_rows && global_n > global_m) {
-                    sS[local_m * S_STRIDE + local_n] = NEG_INF;
-                }
-            }
-            __syncthreads();
-        }
         
         // Online Softmax
         if (tid < valid_q_rows * THREADS_PER_ROW) {
