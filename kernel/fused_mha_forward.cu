@@ -219,6 +219,9 @@ flash_attention_forward_kernel(
         const int num_tiles_n_actual = (valid_k_rows + WMMA_N - 1) / WMMA_N;
         const int total_tiles = num_tiles_m * num_tiles_n_actual;
         const int tiles_per_warp = (total_tiles + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
+
+        const unsigned row_causal = (lane_id & 0b1) + ((lane_id >> 2) & 0b1) * 8 + ((lane_id >> 4) & 0b1) * 4;
+        const unsigned col_causal = ((lane_id >> 1) & 0b1) * 2 + ((lane_id >> 3) & 0b1) * 8;
         
         for (int tile_idx = 0; tile_idx < tiles_per_warp; ++tile_idx) {
             const int global_tile_idx = warp_id * tiles_per_warp + tile_idx;
@@ -247,30 +250,28 @@ flash_attention_forward_kernel(
                 mma_sync(acc_frag, a_frag, b_frag, acc_frag);
             }
             
-            #pragma unroll
-            for (int i = 0; i < acc_frag.num_elements; ++i) {
-                acc_frag.x[i] *= softmax_scale;
+            // Fused scaling + causal mask
+            if constexpr (IS_CAUSAL) {
+                #pragma unroll
+                for (int i = 0; i < acc_frag.num_elements; ++i) {
+                    const unsigned col = col_causal + (i & 0b1) + ((i >> 2) & 0b1) * 4;
+                    const unsigned row = row_causal + ((i >> 1) & 0b1) * 2;
+            
+                    const int global_m = start_row + tile_m + row;
+                    const int global_n = start_col + tile_n + col;
+            
+                    acc_frag.x[i] = (global_n > global_m) ? NEG_INF : (acc_frag.x[i] * softmax_scale);
+                }
+            } else {
+                #pragma unroll
+                for (int i = 0; i < acc_frag.num_elements; ++i) {
+                    acc_frag.x[i] *= softmax_scale;
+                }
             }
             
             store_matrix_sync(sS + tile_m * S_STRIDE + tile_n, acc_frag, S_STRIDE, mem_row_major);
         }
         __syncthreads();
-        
-        // Apply causal mask
-        if (IS_CAUSAL) {
-            #pragma unroll 2
-            for (int idx = tid; idx < BLOCK_M * BLOCK_N; idx += THREADS) {
-                const int local_m = idx / BLOCK_N;
-                const int local_n = idx % BLOCK_N;
-                const int global_m = start_row + local_m;
-                const int global_n = start_col + local_n;
-                
-                if (local_m < valid_q_rows && local_n < valid_k_rows && global_n > global_m) {
-                    sS[local_m * S_STRIDE + local_n] = NEG_INF;
-                }
-            }
-            __syncthreads();
-        }
         
         // Online Softmax
         if (tid < valid_q_rows * THREADS_PER_ROW) {
