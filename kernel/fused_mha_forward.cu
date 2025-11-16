@@ -149,6 +149,19 @@ flash_attention_forward_kernel(
     const int block_m = blockIdx.x;
     const int start_row = block_m * BLOCK_M;
     if (start_row >= M) return;
+
+    int num_n_blocks = (N + BLOCK_N - 1) / BLOCK_N;
+
+    // Early loop limit n_blocks for causal
+    if constexpr (IS_CAUSAL) {
+        const int valid_q_rows = min(BLOCK_M, M - start_row);
+        const int max_key_pos = start_row + valid_q_rows - 1;
+        if (max_key_pos < 0) {
+            num_n_blocks = 0;
+        } else {
+            num_n_blocks = min(num_n_blocks, (max_key_pos + BLOCK_N + 0) / BLOCK_N);
+        }
+    }
     
     const int valid_q_rows = min(BLOCK_M, M - start_row);
     const int tid = threadIdx.x;
@@ -200,12 +213,15 @@ flash_attention_forward_kernel(
     // MAIN LOOP
     // ========================================================================
 
-    const int num_n_blocks = (N + BLOCK_N - 1) / BLOCK_N;
-
     for (int block_n = 0; block_n < num_n_blocks; ++block_n) {
         const int start_col = block_n * BLOCK_N;
         if (start_col >= N) break;
         const int valid_k_rows = min(BLOCK_N, N - start_col);
+
+        // Skip per tile
+        if constexpr (IS_CAUSAL) {
+            if (start_col >= start_row + valid_q_rows) { continue; }
+        }
 
         // Load K from gobal into smem
         const uint4* k_vec  = reinterpret_cast<const uint4*>(k_ptr + start_col * D);

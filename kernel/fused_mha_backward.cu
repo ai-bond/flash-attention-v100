@@ -189,6 +189,19 @@ flash_attention_backward_dq_kernel(
     const int start_row = block_m * BLOCK_M;
     if (start_row >= M) return;
 
+    int num_n_blocks = (N + BLOCK_N - 1) / BLOCK_N;
+
+    // Early loop limit n_blocks for causal
+    if constexpr (IS_CAUSAL) {
+        const int valid_q_rows = min(BLOCK_M, M - start_row);
+        const int max_key_pos = start_row + valid_q_rows - 1;
+        if (max_key_pos < 0) {
+            num_n_blocks = 0;
+        } else {
+            num_n_blocks = min(num_n_blocks, (max_key_pos + BLOCK_N) / BLOCK_N);
+        }
+    }
+
     const int valid_q_rows = min(BLOCK_M, M - start_row);
     const int tid          = threadIdx.x;
     const int warp_id      = tid / MAX_THREADS_PER_WARP;
@@ -290,13 +303,16 @@ flash_attention_backward_dq_kernel(
     // MAIN LOOP
     // ========================================================================
 
-    const int num_n_blocks = (N + BLOCK_N - 1) / BLOCK_N;
-
     // Iterate over K/V blocks
     for (int block_n = 0; block_n < num_n_blocks; ++block_n) {
         const int start_col = block_n * BLOCK_N;
         if (start_col >= N) break;
         const int valid_k_rows = min(BLOCK_N, N - start_col);
+
+        // Early skip per tile
+        if constexpr (IS_CAUSAL) {
+            if (start_col >= start_row + valid_q_rows) { continue; }
+        }
 
         // Unified load: dO and V
         const uint4* do_vec       = reinterpret_cast<const uint4*>(dO_ptr);
@@ -626,6 +642,8 @@ flash_attention_backward_dkv_kernel(
 
     const int valid_kv_rows = min(BLOCK_M, N - start_kv);
 
+    int num_q_blocks = (M + BLOCK_N - 1) / BLOCK_N;
+
     const int tid     = threadIdx.x;
     const int warp_id = tid / MAX_THREADS_PER_WARP;
     const int lane_id = tid % MAX_THREADS_PER_WARP;
@@ -667,12 +685,15 @@ flash_attention_backward_dkv_kernel(
     // MAIN LOOP
     // ========================================================================
 
-    const int num_q_blocks = (M + BLOCK_N - 1) / BLOCK_N;
-    
     for (int block_n = 0; block_n < num_q_blocks; ++block_n) {
         const int start_col = block_n * BLOCK_N;
         if (start_col >= M) break;
         const int valid_q_rows = min(BLOCK_N, M - start_col);
+
+        // Skip per tile
+        if constexpr (IS_CAUSAL) {
+            if (start_kv >= start_col + valid_q_rows) { continue; }
+        }
         
         // Load K (into qkv_buffer) and Q (into sdO)
         const uint4* k_vec = reinterpret_cast<const uint4*>(k_ptr);
