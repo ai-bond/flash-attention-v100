@@ -5,6 +5,7 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <torch/extension.h>
+
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -76,14 +77,24 @@ struct KernelConfig {
     static constexpr int O_STRIDE          = D + PAD;
     static constexpr int PER_UINT4         = 8;
     static constexpr int PER_FLOAT4        = 4;
-    static constexpr int VECTOR_D          = (D + PER_UINT4 - 1) / PER_UINT4;
-    static constexpr int VECTOR_F          = (BLOCK_M * O_STRIDE + PER_FLOAT4 - 1) / PER_FLOAT4;
-    static constexpr size_t SMEM_Q  = (((size_t)BLOCK_M * Q_STRIDE * sizeof(__half) + 127) & ~static_cast<size_t>(127));
-    static constexpr size_t SMEM_KV = (((size_t)BLOCK_N * KV_STRIDE * sizeof(__half) + 127) & ~static_cast<size_t>(127));
-    static constexpr size_t SMEM_S  = (((size_t)BLOCK_M * S_STRIDE * sizeof(float) + 127) & ~static_cast<size_t>(127));
-    static constexpr size_t SMEM_O  = (((size_t)BLOCK_M * O_STRIDE * sizeof(float) + 127) & ~static_cast<size_t>(127));
-    static constexpr size_t SMEM_STATE = (((size_t)3 * BLOCK_M * sizeof(float) + 127) & ~static_cast<size_t>(127));
-    static constexpr size_t TOTAL_SMEM = SMEM_Q + SMEM_KV + SMEM_S + SMEM_O + SMEM_STATE;
+
+    struct alignas(128) SmemLayout {
+        alignas(16) __half q [BLOCK_M * Q_STRIDE];
+    union {
+        alignas(16) __half k [BLOCK_N * KV_STRIDE];
+        alignas(16) __half v [BLOCK_N * KV_STRIDE];
+    } reuse_kv;
+    union { 
+        alignas(16) float  s [BLOCK_M * S_STRIDE];
+        alignas(16) __half p [BLOCK_M * S_STRIDE];
+    } reuse_sp;
+        alignas(16) float  o [BLOCK_M * O_STRIDE];
+        alignas(16) float  row_max[BLOCK_M];
+        alignas(16) float  row_sum[BLOCK_M];
+        alignas(16) float  old_max[BLOCK_M];
+    };
+
+    static constexpr size_t TOTAL_SMEM = ((sizeof(SmemLayout) + 127) & ~size_t(127)); 
 };
 
 // ============================================================================
@@ -139,8 +150,6 @@ flash_attention_forward_kernel(
     constexpr int O_STRIDE = Config::O_STRIDE;
     constexpr int PER_UINT4 = Config::PER_UINT4;
     constexpr int PER_FLOAT4 = Config::PER_FLOAT4;
-    constexpr int VECTOR_D = Config::VECTOR_D;
-    constexpr int VECTOR_F = Config::VECTOR_F;
     const float NEG_INF = -1e30f;
     
     const int batch_head_id = blockIdx.z;
@@ -151,10 +160,10 @@ flash_attention_forward_kernel(
     if (start_row >= M) return;
 
     int num_n_blocks = (N + BLOCK_N - 1) / BLOCK_N;
+    const int valid_q_rows = min(BLOCK_M, M - start_row);
 
     // Early loop limit n_blocks for causal
     if constexpr (IS_CAUSAL) {
-        const int valid_q_rows = min(BLOCK_M, M - start_row);
         const int max_key_pos = start_row + valid_q_rows - 1;
         if (max_key_pos < 0) {
             num_n_blocks = 0;
@@ -163,7 +172,6 @@ flash_attention_forward_kernel(
         }
     }
     
-    const int valid_q_rows = min(BLOCK_M, M - start_row);
     const int tid = threadIdx.x;
     const int warp_id = tid / MAX_THREADS_PER_WARP;
     const int lane_id = tid % MAX_THREADS_PER_WARP;
@@ -176,36 +184,39 @@ flash_attention_forward_kernel(
     float* softmax_lse_ptr = softmax_lse + (size_t)batch_head_id * M + start_row;
     
     // Shared memory layout
-    extern __shared__ char smem[];
+    extern __shared__ char smem_raw[];
+    auto& smem = *reinterpret_cast<typename Config::SmemLayout*>(smem_raw);
    
-    __half* sQ      = reinterpret_cast<__half*>(smem);
-    __half* sK      = sQ + BLOCK_M * Q_STRIDE;
-    __half* sV      = sK;
-    float*  sS      = reinterpret_cast<float*>(sK + BLOCK_N * KV_STRIDE);
-    float*  sO      = sS + BLOCK_M * S_STRIDE;
-    float*  sRowMax = sO + BLOCK_M * O_STRIDE;
-    float*  sRowSum = sRowMax + BLOCK_M;
-    float*  sOldMax = sRowSum + BLOCK_M;
+    __half* sQ      = smem.q;           // ← phase 0: load Q
+    __half* sK      = smem.reuse_kv.k;  // ← phase 1: load K
+    __half* sV      = smem.reuse_kv.v;  // ← phase 2: load V (same address as sK!)
+    float*  sS      = smem.reuse_sp.s;  // ← phase 1: QK^T
+    __half* sP      = smem.reuse_sp.p;  // ← phase 2: softmax(P) (same addr as sS!)
+    float*  sO      = smem.o;           // ← phase 3: write to global
+    float*  sRowMax = smem.row_max;
+    float*  sRowSum = smem.row_sum;
+    float*  sOldMax = smem.old_max;
+
+    // Vector strides
+    const int  d_stride_uint4 = (D + PER_UINT4 - 1) / PER_UINT4;
+    const int  q_stride_uint4 = (Q_STRIDE  + PER_UINT4 - 1) / PER_UINT4;
+    const int kv_stride_uint4 = (KV_STRIDE + PER_UINT4 - 1) / PER_UINT4;
 
     // Unified initialization: Q load + O zeroing + state buffers
     const uint4* q_vec = reinterpret_cast<const uint4*>(q_ptr);
     uint4*      sQ_vec = reinterpret_cast<uint4*>(sQ);
     float4*     sO_vec = reinterpret_cast<float4*>(sO);
-    const int q_stride_uint4  = (Q_STRIDE  + PER_UINT4 - 1) / PER_UINT4;
-    const int kv_stride_uint4 = (KV_STRIDE + PER_UINT4 - 1) / PER_UINT4;
 
     // Load sQ from global to smem
-    store_u4_swizzle(q_vec, sQ_vec, valid_q_rows, VECTOR_D, q_stride_uint4, lane_id, warp_id, WARPS_PER_BLOCK);
+    store_u4_swizzle(q_vec, sQ_vec, valid_q_rows, d_stride_uint4, q_stride_uint4, lane_id, warp_id, WARPS_PER_BLOCK);
 
     // Init sO with zero + stats
-    #pragma unroll 4
-    for (int i = tid; i < max(VECTOR_F, BLOCK_M); i += THREADS) {
-        if (i < VECTOR_F) sO_vec[i] = {0.0f};
-        if (i < BLOCK_M) { 
-            sRowMax[i] = NEG_INF; 
-            sRowSum[i] = 0.0f; 
-            sOldMax[i] = 1.0f; 
-        }
+    #pragma unroll
+    for (int i = tid; i < ((BLOCK_M * O_STRIDE) / 4); i += THREADS) sO_vec[i] = make_float4(0.f, 0.f, 0.f, 0.f);
+    if (tid < BLOCK_M) {
+        sRowMax[tid] = NEG_INF;
+        sRowSum[tid] = 0.0f;
+        sOldMax[tid] = 1.0f;
     }
     __syncthreads();
 
@@ -227,7 +238,7 @@ flash_attention_forward_kernel(
         const uint4* k_vec  = reinterpret_cast<const uint4*>(k_ptr + start_col * D);
               uint4* sK_vec = reinterpret_cast<uint4*>(sK);
 
-        store_u4_swizzle(k_vec, sK_vec, valid_k_rows, VECTOR_D, kv_stride_uint4, lane_id, warp_id, WARPS_PER_BLOCK);
+        store_u4_swizzle(k_vec, sK_vec, valid_k_rows, d_stride_uint4, kv_stride_uint4, lane_id, warp_id, WARPS_PER_BLOCK);
         __syncthreads();
         
         // Compute S = Q @ K^T
@@ -396,7 +407,6 @@ flash_attention_forward_kernel(
         }
         
         // Convert dS to half precision
-        __half* sP = reinterpret_cast<__half*>(sS);
         #pragma unroll 4
         for (int i = tid; i < (BLOCK_M * BLOCK_N + 1) / 2; i += THREADS) {
             const int row = i / ((BLOCK_N + 1) / 2);
@@ -426,7 +436,7 @@ flash_attention_forward_kernel(
         const uint4* v_vec  = reinterpret_cast<const uint4*>(v_ptr + start_col * D);
               uint4* sV_vec = reinterpret_cast<uint4*>(sV);
 
-        store_u4_swizzle(v_vec, sV_vec, valid_k_rows, VECTOR_D, kv_stride_uint4, lane_id, warp_id, WARPS_PER_BLOCK);
+        store_u4_swizzle(v_vec, sV_vec, valid_k_rows, d_stride_uint4, kv_stride_uint4, lane_id, warp_id, WARPS_PER_BLOCK);
         __syncthreads();
 
         // Compute P @ V
