@@ -90,17 +90,16 @@ struct dQKernelConfig {
     static constexpr int BLOCK_N = (D == 16) ? BLOCK_N_16 : (D == 32) ? BLOCK_N_32 : (D == 64)  ? BLOCK_N_64 : (D == 128) ? BLOCK_N_128 : BLOCK_N_256;
     static constexpr int WARPS_PER_BLOCK = (D == 16) ? WARPS_16 : (D == 32) ? WARPS_32 : (D == 64) ? WARPS_64 : (D == 128) ? WARPS_128 : WARPS_256;
     
-    static constexpr int THREADS_PER_BLOCK = WARPS_PER_BLOCK * MAX_THREADS_PER_WARP;
-    static constexpr int THREADS_PER_ROW   = THREADS_PER_BLOCK / BLOCK_M;
-    static constexpr int NUM_K_TILES       = (D + WMMA_K - 1) / WMMA_K;
-    static constexpr int PAD               = (8 - (D % 32) + 32) % 32;
-    static constexpr int Q_STRIDE          = D + PAD;
-    static constexpr int KV_STRIDE         = D + PAD;
-    static constexpr int S_STRIDE          = BLOCK_N + PAD;
-    static constexpr int PER_UINT4         = 8;
-    static constexpr int VECTOR_D          = (D + PER_UINT4 - 1) / PER_UINT4;
-    static constexpr int VECTOR_Q          = BLOCK_M * VECTOR_D;
-    static constexpr int VECTOR_KV         = BLOCK_N * VECTOR_D;
+    static constexpr int THREADS_PER_BLOCK  = WARPS_PER_BLOCK * MAX_THREADS_PER_WARP;
+    static constexpr int THREADS_PER_ROW    = THREADS_PER_BLOCK / BLOCK_M;
+    static constexpr int NUM_K_TILES        = (D + WMMA_K - 1) / WMMA_K;
+    static constexpr int PAD                = (8 - (D % 32) + 32) % 32;
+    static constexpr int Q_STRIDE           = D + PAD;
+    static constexpr int KV_STRIDE          = D + PAD;
+    static constexpr int S_STRIDE           = BLOCK_N + PAD;
+    static constexpr int PER_UINT4          = 8;
+    static constexpr int NUM_UINT4_Q_BLOCK  = BLOCK_M * ((D + PER_UINT4 - 1) / PER_UINT4);
+    static constexpr int NUM_UINT4_KV_BLOCK = BLOCK_N * ((D + PER_UINT4 - 1) / PER_UINT4); 
     
     struct alignas(128) SmemLayout {
         union {
@@ -133,17 +132,16 @@ struct dKVKernelConfig {
     static constexpr int BLOCK_N = (D == 16) ? BLOCK_Q_16 : (D == 32) ? BLOCK_Q_32 : (D == 64) ? BLOCK_Q_64 : (D == 128) ? BLOCK_Q_128 : BLOCK_Q_256;
     static constexpr int WARPS_PER_BLOCK = (D == 16) ? WARPS_DKV_16 : (D == 32) ? WARPS_DKV_32 : (D == 64) ? WARPS_DKV_64 : (D == 128) ? WARPS_DKV_128 : WARPS_DKV_256;
     
-    static constexpr int THREADS_PER_BLOCK = WARPS_PER_BLOCK * MAX_THREADS_PER_WARP;
-    static constexpr int THREADS_PER_ROW   = THREADS_PER_BLOCK / BLOCK_N;
-    static constexpr int NUM_K_TILES       = (D + WMMA_K - 1) / WMMA_K;
-    static constexpr int PAD               = 8;
-    static constexpr int Q_STRIDE          = D + PAD;
-    static constexpr int KV_STRIDE         = D + PAD;
-    static constexpr int S_STRIDE          = BLOCK_M + PAD;
-    static constexpr int PER_UINT4         = 8;
-    static constexpr int VECTOR_D          = (D + PER_UINT4 - 1) / PER_UINT4;
-    static constexpr int VECTOR_Q          = BLOCK_N * VECTOR_D;
-    static constexpr int VECTOR_KV         = BLOCK_M * VECTOR_D;
+    static constexpr int THREADS_PER_BLOCK  = WARPS_PER_BLOCK * MAX_THREADS_PER_WARP;
+    static constexpr int THREADS_PER_ROW    = THREADS_PER_BLOCK / BLOCK_N;
+    static constexpr int NUM_K_TILES        = (D + WMMA_K - 1) / WMMA_K;
+    static constexpr int PAD                = 8;
+    static constexpr int Q_STRIDE           = D + PAD;
+    static constexpr int KV_STRIDE          = D + PAD;
+    static constexpr int S_STRIDE           = BLOCK_M + PAD;
+    static constexpr int PER_UINT4          = 8;
+    static constexpr int NUM_UINT4_Q_BLOCK  = BLOCK_N * ((D + PER_UINT4 - 1) / PER_UINT4);
+    static constexpr int NUM_UINT4_KV_BLOCK = BLOCK_M * ((D + PER_UINT4 - 1) / PER_UINT4);
     
     struct alignas(128) SmemLayout {
         union {
@@ -194,7 +192,7 @@ flash_attention_backward_dq_kernel(
 
     constexpr int BLOCK_M           = Config::BLOCK_M;
     constexpr int BLOCK_N           = Config::BLOCK_N;
-    constexpr int THREADS           = Config::THREADS_PER_BLOCK;
+    constexpr int THREADS_PER_BLOCK = Config::THREADS_PER_BLOCK;
     constexpr int THREADS_PER_ROW   = Config::THREADS_PER_ROW;
     constexpr int NUM_K_TILES       = Config::NUM_K_TILES;
     constexpr int WARPS_PER_BLOCK   = Config::WARPS_PER_BLOCK;
@@ -202,9 +200,8 @@ flash_attention_backward_dq_kernel(
     constexpr int KV_STRIDE         = Config::KV_STRIDE;
     constexpr int S_STRIDE          = Config::S_STRIDE;
     constexpr int PER_UINT4         = Config::PER_UINT4;
-    constexpr int VECTOR_D          = Config::VECTOR_D;
-    constexpr int VECTOR_Q          = Config::VECTOR_Q;
-    constexpr int VECTOR_KV         = Config::VECTOR_KV;
+    constexpr int NUM_UINT4_Q_BLOCK  = Config::NUM_UINT4_Q_BLOCK;
+    constexpr int NUM_UINT4_KV_BLOCK = Config::NUM_UINT4_KV_BLOCK;
 
     const float NEG_INF = -1e30f;
 
@@ -257,8 +254,13 @@ flash_attention_backward_dq_kernel(
      float* sLse    = smem.lse;
      float* sdQ     = smem.dQ;
 
+    // Vector strides
+    const int  d_stride_uint4 = (D + PER_UINT4 - 1) / PER_UINT4;
+    const int  q_stride_uint4 = (Q_STRIDE  + PER_UINT4 - 1) / PER_UINT4;
+    const int kv_stride_uint4 = (KV_STRIDE + PER_UINT4 - 1) / PER_UINT4;
+
     // Zero dQ accumulator
-    for (int i = tid; i < BLOCK_M * Q_STRIDE; i += THREADS) {
+    for (int i = tid; i < BLOCK_M * Q_STRIDE; i += THREADS_PER_BLOCK) {
         sdQ[i] = 0.0f;
     }
 
@@ -346,30 +348,28 @@ flash_attention_backward_dq_kernel(
         uint4*       sdO_vec      = reinterpret_cast<uint4*>(sdO);
         uint4*       sV_vec       = reinterpret_cast<uint4*>(sV);
 
-        const int q_stride_uint4  = (Q_STRIDE  + PER_UINT4 - 1) / PER_UINT4;
-        const int kv_stride_uint4 = (KV_STRIDE + PER_UINT4 - 1) / PER_UINT4;
-        const int max_work = max(VECTOR_Q, VECTOR_KV);
+        const int max_work = max(NUM_UINT4_Q_BLOCK, NUM_UINT4_KV_BLOCK);
 
         #pragma unroll 2
-        for (int idx = tid; idx < max_work; idx += THREADS) {
+        for (int idx = tid; idx < max_work; idx += THREADS_PER_BLOCK) {
             // Load dO → sdO
-            if (idx < VECTOR_Q) {
-                const int row = idx / VECTOR_D;
-                const int col = idx % VECTOR_D;
+            if (idx < NUM_UINT4_Q_BLOCK) {
+                const int row = idx / d_stride_uint4;
+                const int col = idx % d_stride_uint4;
                 uint4 do_val = make_uint4(0, 0, 0, 0);
-                if (row < valid_q_rows && col < VECTOR_D) {
-                    do_val = __ldg(&do_vec[row * VECTOR_D + col]);
+                if (row < valid_q_rows && col < d_stride_uint4) {
+                    do_val = __ldg(&do_vec[row * d_stride_uint4 + col]);
                 }
                 sdO_vec[row * q_stride_uint4 + col] = do_val;
             }
 
             // Load V → sV
-            if (idx < VECTOR_KV) {
-                const int row = idx / VECTOR_D;
-                const int vec_col = idx % VECTOR_D;
+            if (idx < NUM_UINT4_KV_BLOCK) {
+                const int row = idx / d_stride_uint4;
+                const int vec_col = idx % d_stride_uint4;
                 uint4 v_val = make_uint4(0, 0, 0, 0);
-                if (row < valid_k_rows && vec_col < VECTOR_D) {
-                    v_val = __ldg(&v_vec[row * VECTOR_D + vec_col]);
+                if (row < valid_k_rows && vec_col < d_stride_uint4) {
+                    v_val = __ldg(&v_vec[row * d_stride_uint4 + vec_col]);
                 }
                 sV_vec[row * kv_stride_uint4 + vec_col] = v_val;
             }
@@ -421,24 +421,24 @@ flash_attention_backward_dq_kernel(
         uint4*       sQ_vec    = reinterpret_cast<uint4*>(sdO);
 
         #pragma unroll 2
-        for (int idx = tid; idx < max_work; idx += THREADS) {
+        for (int idx = tid; idx < max_work; idx += THREADS_PER_BLOCK) {
             // Load K → sK
-            if (idx < VECTOR_KV) {
-                const int row = idx / VECTOR_D;
-                const int vec_col = idx % VECTOR_D;
+            if (idx < NUM_UINT4_KV_BLOCK) {
+                const int row = idx / d_stride_uint4;
+                const int vec_col = idx % d_stride_uint4;
                 uint4 k_val = make_uint4(0, 0, 0, 0);
-                if (row < valid_k_rows && vec_col < VECTOR_D) {
-                    k_val = __ldg(&k_vec[row * VECTOR_D + vec_col]);
+                if (row < valid_k_rows && vec_col < d_stride_uint4) {
+                    k_val = __ldg(&k_vec[row * d_stride_uint4 + vec_col]);
                 }
                 sK_vec[row * kv_stride_uint4 + vec_col] = k_val;
             }
             // Load Q → sQ (= sdO)
-            if (idx < VECTOR_Q) {
-                const int row = idx / VECTOR_D;
-                const int vec_col = idx % VECTOR_D;
+            if (idx < NUM_UINT4_Q_BLOCK) {
+                const int row = idx / d_stride_uint4;
+                const int vec_col = idx % d_stride_uint4;
                 uint4 q_val = make_uint4(0, 0, 0, 0);
-                if (row < valid_q_rows && vec_col < VECTOR_D) {
-                    q_val = __ldg(&q_vec[row * VECTOR_D + vec_col]);
+                if (row < valid_q_rows && vec_col < d_stride_uint4) {
+                    q_val = __ldg(&q_vec[row * d_stride_uint4 + vec_col]);
                 }
                 sQ_vec[row * q_stride_uint4 + vec_col] = q_val;
             }
@@ -503,7 +503,7 @@ flash_attention_backward_dq_kernel(
         const int total_pairs = (total_elements + 1) / 2;
 
         #pragma unroll 2
-        for (int i = tid; i < total_pairs; i += THREADS) {
+        for (int i = tid; i < total_pairs; i += THREADS_PER_BLOCK) {
             const int linear_idx0 = i * 2;
             const int linear_idx1 = linear_idx0 + 1;
 
@@ -592,7 +592,7 @@ flash_attention_backward_dq_kernel(
 
     // Store final dQ to global memory
     const int total_fp16_x4 = (valid_q_rows * D) / 4;
-    for (int i = tid; i < total_fp16_x4; i += THREADS) {
+    for (int i = tid; i < total_fp16_x4; i += THREADS_PER_BLOCK) {
         const int row = i / (D / 4);
         const int col = (i % (D / 4)) * 4;
 
@@ -637,19 +637,18 @@ flash_attention_backward_dkv_kernel(
     const float softmax_scale
 ) {
     using Config = dKVKernelConfig<D>;
-    constexpr int BLOCK_M         = Config::BLOCK_M;
-    constexpr int BLOCK_N         = Config::BLOCK_N;
-    constexpr int THREADS         = Config::THREADS_PER_BLOCK;
-    constexpr int THREADS_PER_ROW = Config::THREADS_PER_ROW;
-    constexpr int NUM_K_TILES     = Config::NUM_K_TILES;
-    constexpr int WARPS_PER_BLOCK = Config::WARPS_PER_BLOCK;
-    constexpr int Q_STRIDE        = Config::Q_STRIDE;
-    constexpr int KV_STRIDE       = Config::KV_STRIDE;
-    constexpr int S_STRIDE        = Config::S_STRIDE;
-    constexpr int PER_UINT4       = Config::PER_UINT4;
-    constexpr int VECTOR_D        = Config::VECTOR_D;
-    constexpr int VECTOR_Q        = Config::VECTOR_Q;
-    constexpr int VECTOR_KV       = Config::VECTOR_KV;
+    constexpr int BLOCK_M            = Config::BLOCK_M;
+    constexpr int BLOCK_N            = Config::BLOCK_N;
+    constexpr int THREADS_PER_BLOCK  = Config::THREADS_PER_BLOCK;
+    constexpr int THREADS_PER_ROW    = Config::THREADS_PER_ROW;
+    constexpr int NUM_K_TILES        = Config::NUM_K_TILES;
+    constexpr int WARPS_PER_BLOCK    = Config::WARPS_PER_BLOCK;
+    constexpr int Q_STRIDE           = Config::Q_STRIDE;
+    constexpr int KV_STRIDE          = Config::KV_STRIDE;
+    constexpr int S_STRIDE           = Config::S_STRIDE;
+    constexpr int PER_UINT4          = Config::PER_UINT4;
+    constexpr int NUM_UINT4_Q_BLOCK  = Config::NUM_UINT4_Q_BLOCK;
+    constexpr int NUM_UINT4_KV_BLOCK = Config::NUM_UINT4_KV_BLOCK;
 
     const float NEG_INF = -1e30f;
     const int batch_head_id = blockIdx.z;
@@ -659,9 +658,8 @@ flash_attention_backward_dkv_kernel(
     const int start_kv = block_kv * BLOCK_M;
     if (start_kv >= N) return;
 
-    const int valid_kv_rows = min(BLOCK_M, N - start_kv);
-
     int num_q_blocks = (M + BLOCK_N - 1) / BLOCK_N;
+    const int valid_kv_rows = min(BLOCK_M, N - start_kv);
 
     const int tid     = threadIdx.x;
     const int warp_id = tid / MAX_THREADS_PER_WARP;
@@ -693,9 +691,14 @@ flash_attention_backward_dkv_kernel(
      float* sLse     = smem.lse;
      float* sdK      = smem.dK;
      float* sdV      = smem.dV;
+
+    // Vector strides
+    const int  d_stride_uint4 = (D + PER_UINT4 - 1) / PER_UINT4;
+    const int  q_stride_uint4 = (Q_STRIDE  + PER_UINT4 - 1) / PER_UINT4;
+    const int kv_stride_uint4 = (KV_STRIDE + PER_UINT4 - 1) / PER_UINT4;
     
     // Init accum with zero
-    for (int idx = tid; idx < BLOCK_M * KV_STRIDE; idx += THREADS) {
+    for (int idx = tid; idx < BLOCK_M * KV_STRIDE; idx += THREADS_PER_BLOCK) {
         sdK[idx] = 0.0f;
         sdV[idx] = 0.0f;
     }
@@ -720,31 +723,28 @@ flash_attention_backward_dkv_kernel(
         uint4* sK_vec = reinterpret_cast<uint4*>(sK);
         uint4* sQ_vec = reinterpret_cast<uint4*>(sdO);
 
-        const int kv_stride_uint4 = (KV_STRIDE + PER_UINT4 - 1) / PER_UINT4;
-        const int q_stride_uint4  = (Q_STRIDE + PER_UINT4 - 1) / PER_UINT4;
-
-        const int max_work = max(VECTOR_KV, VECTOR_Q);
+        const int max_work = max(NUM_UINT4_KV_BLOCK, NUM_UINT4_Q_BLOCK);
 
         #pragma unroll 2
-        for (int idx = tid; idx < max_work; idx += THREADS) {
-            // Load K → sK = qkv_buffer
-            if (idx < VECTOR_KV) {
-                const int row = idx / VECTOR_D;
-                const int vec_col = idx % VECTOR_D;
+        for (int idx = tid; idx < max_work; idx += THREADS_PER_BLOCK) {
+            // Load K → sK = sK
+            if (idx < NUM_UINT4_KV_BLOCK) {
+                const int row = idx / d_stride_uint4;
+                const int vec_col = idx % d_stride_uint4;
                 uint4 k_val = make_uint4(0, 0, 0, 0);
-                if (row < valid_kv_rows && vec_col < VECTOR_D) {
-                    k_val = __ldg(&k_vec[row * VECTOR_D + vec_col]);
+                if (row < valid_kv_rows && vec_col < d_stride_uint4) {
+                    k_val = __ldg(&k_vec[row * d_stride_uint4 + vec_col]);
                 }
                 sK_vec[row * kv_stride_uint4 + vec_col] = k_val;
             }
 
             // Load Q → sQ = sdO
-            if (idx < VECTOR_Q) {
-                const int row = idx / VECTOR_D;
-                const int vec_col = idx % VECTOR_D;
+            if (idx < NUM_UINT4_Q_BLOCK) {
+                const int row = idx / d_stride_uint4;
+                const int vec_col = idx % d_stride_uint4;
                 uint4 q_val = make_uint4(0, 0, 0, 0);
-                if (row < valid_q_rows && vec_col < VECTOR_D) {
-                    q_val = __ldg(&q_vec[row * VECTOR_D + vec_col]);
+                if (row < valid_q_rows && vec_col < d_stride_uint4) {
+                    q_val = __ldg(&q_vec[row * d_stride_uint4 + vec_col]);
                 }
                 sQ_vec[row * q_stride_uint4 + vec_col] = q_val;
             }
@@ -810,12 +810,12 @@ flash_attention_backward_dkv_kernel(
         const uint4* do_vec = reinterpret_cast<const uint4*>(dO_ptr + start_col * D);
         uint4* sdO_vec      = reinterpret_cast<uint4*>(sdO);
         #pragma unroll 2
-        for (int idx = tid; idx < VECTOR_Q; idx += THREADS) {
-            const int row = idx / VECTOR_D;
-            const int vec_col = idx % VECTOR_D;
+        for (int idx = tid; idx < NUM_UINT4_Q_BLOCK; idx += THREADS_PER_BLOCK) {
+            const int row = idx / d_stride_uint4;
+            const int vec_col = idx % d_stride_uint4;
             uint4 do_val = make_uint4(0, 0, 0, 0);
-            if (row < valid_q_rows && vec_col < VECTOR_D) {
-                do_val = __ldg(&do_vec[row * VECTOR_D + vec_col]);
+            if (row < valid_q_rows && vec_col < d_stride_uint4) {
+                do_val = __ldg(&do_vec[row * d_stride_uint4 + vec_col]);
             }
             sdO_vec[row * q_stride_uint4 + vec_col] = do_val;
         }
@@ -879,12 +879,12 @@ flash_attention_backward_dkv_kernel(
         uint4* sV_vec = reinterpret_cast<uint4*>(sV);
 
         #pragma unroll 2
-        for (int idx = tid; idx < VECTOR_KV; idx += THREADS) {
-            const int row = idx / VECTOR_D;
-            const int vec_col = idx % VECTOR_D;
+        for (int idx = tid; idx < NUM_UINT4_KV_BLOCK; idx += THREADS_PER_BLOCK) {
+            const int row = idx / d_stride_uint4;
+            const int vec_col = idx % d_stride_uint4;
             uint4 val = make_uint4(0, 0, 0, 0);
-            if (row < valid_kv_rows && vec_col < VECTOR_D) {
-                val = __ldg(&v_vec[row * VECTOR_D + vec_col]);
+            if (row < valid_kv_rows && vec_col < d_stride_uint4) {
+                val = __ldg(&v_vec[row * d_stride_uint4 + vec_col]);
             }
             sV_vec[row * kv_stride_uint4 + vec_col] = val;
         }
@@ -925,7 +925,7 @@ flash_attention_backward_dkv_kernel(
         const int total_pairs = (total_elements + 1) / 2;
 
         #pragma unroll 2
-        for (int i = tid; i < total_pairs; i += THREADS) {
+        for (int i = tid; i < total_pairs; i += THREADS_PER_BLOCK) {
             const int linear_idx0 = i * 2;
             const int linear_idx1 = linear_idx0 + 1;
 
@@ -1019,12 +1019,12 @@ flash_attention_backward_dkv_kernel(
         // Load Q into sdO (as fp16)
         __half* sQ = sdO;
         #pragma unroll 2
-        for (int idx = tid; idx < VECTOR_Q; idx += THREADS) {
-            const int row = idx / VECTOR_D;
-            const int vec_col = idx % VECTOR_D;
+        for (int idx = tid; idx < NUM_UINT4_Q_BLOCK; idx += THREADS_PER_BLOCK) {
+            const int row = idx / d_stride_uint4;
+            const int vec_col = idx % d_stride_uint4;
             uint4 q_val = make_uint4(0, 0, 0, 0);
-            if (row < valid_q_rows && vec_col < VECTOR_D) {
-                q_val = __ldg(&q_vec[row * VECTOR_D + vec_col]);
+            if (row < valid_q_rows && vec_col < d_stride_uint4) {
+                q_val = __ldg(&q_vec[row * d_stride_uint4 + vec_col]);
             }
             sQ_vec[row * q_stride_uint4 + vec_col] = q_val;
         }
@@ -1070,7 +1070,7 @@ flash_attention_backward_dkv_kernel(
 
     // Write dK + dV to global memory at once
     const int total_fp16_x4 = (valid_kv_rows * D) / 4;
-    for (int i = tid; i < total_fp16_x4; i += THREADS) {
+    for (int i = tid; i < total_fp16_x4; i += THREADS_PER_BLOCK) {
         const int row = i / (D / 4);
         const int col = (i % (D / 4)) * 4;
 

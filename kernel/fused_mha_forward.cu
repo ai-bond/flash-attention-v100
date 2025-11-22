@@ -137,17 +137,17 @@ flash_attention_forward_kernel(
     const float softmax_scale
 ) {
     using Config = KernelConfig<D>;
-    constexpr int BLOCK_M = Config::BLOCK_M;
-    constexpr int BLOCK_N = Config::BLOCK_N;
-    constexpr int THREADS = Config::THREADS_PER_BLOCK;
-    constexpr int NUM_K_TILES = Config::NUM_K_TILES;
-    constexpr int THREADS_PER_ROW = Config::THREADS_PER_ROW;
-    constexpr int WARPS_PER_BLOCK = Config::WARPS_PER_BLOCK;
-    constexpr int Q_STRIDE = Config::Q_STRIDE;
-    constexpr int KV_STRIDE = Config::KV_STRIDE;
-    constexpr int S_STRIDE = Config::S_STRIDE;
-    constexpr int O_STRIDE = Config::O_STRIDE;
-    constexpr int PER_UINT4 = Config::PER_UINT4;
+    constexpr int BLOCK_M           = Config::BLOCK_M;
+    constexpr int BLOCK_N           = Config::BLOCK_N;
+    constexpr int NUM_K_TILES       = Config::NUM_K_TILES;
+    constexpr int THREADS_PER_BLOCK = Config::THREADS_PER_BLOCK;
+    constexpr int THREADS_PER_ROW   = Config::THREADS_PER_ROW;
+    constexpr int WARPS_PER_BLOCK   = Config::WARPS_PER_BLOCK;
+    constexpr int Q_STRIDE          = Config::Q_STRIDE;
+    constexpr int KV_STRIDE         = Config::KV_STRIDE;
+    constexpr int S_STRIDE          = Config::S_STRIDE;
+    constexpr int O_STRIDE          = Config::O_STRIDE;
+    constexpr int PER_UINT4         = Config::PER_UINT4;
     const float NEG_INF = -1e30f;
     
     const int batch_head_id = blockIdx.z;
@@ -210,7 +210,7 @@ flash_attention_forward_kernel(
 
     // Init sO with zero + stats
     #pragma unroll
-    for (int i = tid; i < ((BLOCK_M * O_STRIDE) / 4); i += THREADS) sO_vec[i] = make_float4(0.f, 0.f, 0.f, 0.f);
+    for (int i = tid; i < ((BLOCK_M * O_STRIDE) / 4); i += THREADS_PER_BLOCK) sO_vec[i] = make_float4(0.f, 0.f, 0.f, 0.f);
     if (tid < BLOCK_M) {
         sRowMax[tid] = NEG_INF;
         sRowSum[tid] = 0.0f;
@@ -463,7 +463,7 @@ flash_attention_forward_kernel(
     // Store final Sum to global memory
     const int total_fp16_x4 = (valid_q_rows * D) / 4;
     
-    for (int i = tid; i < total_fp16_x4; i += THREADS) {
+    for (int i = tid; i < total_fp16_x4; i += THREADS_PER_BLOCK) {
         const int row = i / (D / 4);
         const int col = (i % (D / 4)) * 4;
 
