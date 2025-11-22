@@ -1,6 +1,6 @@
-//============================================================================
-// * Copyright (c) 2025, D.Skryabin / tg @ai_bond007 SPDX-License BSD-3-Clause
-//============================================================================
+// ============================================================================
+// * Copyright (c) 2025, D.Skryabin / tg @ai_bond007 SPDX-License: BSD-3-Clause
+// ============================================================================
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
@@ -102,14 +102,26 @@ struct dQKernelConfig {
     static constexpr int VECTOR_Q          = BLOCK_M * VECTOR_D;
     static constexpr int VECTOR_KV         = BLOCK_N * VECTOR_D;
     
-    static constexpr size_t SMEM_Q_BUFFER   = (((size_t)BLOCK_M * Q_STRIDE * sizeof(__half) + 127) & ~static_cast<size_t>(127));
-    static constexpr size_t SMEM_KV_BUFFER  = (((size_t)BLOCK_N * KV_STRIDE * sizeof(__half) + 127) & ~static_cast<size_t>(127));
-    static constexpr size_t SMEM_QKV_BUFFER = SMEM_Q_BUFFER + SMEM_KV_BUFFER;
-    static constexpr size_t SMEM_ACC_BUFFER = (((size_t)BLOCK_M * S_STRIDE * sizeof(float) + 127) & ~static_cast<size_t>(127));
-    static constexpr size_t SMEM_DOV_BUFFER = SMEM_ACC_BUFFER;
-    static constexpr size_t SMEM_STATS      = (((size_t)2 * BLOCK_M * sizeof(float) + 127) & ~static_cast<size_t>(127));
-    static constexpr size_t SMEM_DQ         = (((size_t)BLOCK_M * Q_STRIDE * sizeof(float) + 127) & ~static_cast<size_t>(127));
-    static constexpr size_t TOTAL_SMEM      = SMEM_QKV_BUFFER + 2 * SMEM_ACC_BUFFER + SMEM_STATS + SMEM_DQ;
+    struct alignas(128) SmemLayout {
+        union {
+            alignas(16) __half k  [BLOCK_N * KV_STRIDE];
+            alignas(16) __half v  [BLOCK_N * KV_STRIDE];
+        } reuse_kv;
+        union { 
+            alignas(16) __half dO [BLOCK_M * Q_STRIDE];
+            alignas(16) __half q  [BLOCK_M * Q_STRIDE];
+        } reuse_qdO;
+            alignas(16) float  s  [BLOCK_M * S_STRIDE];
+        union {
+            alignas(16) float  dOV[BLOCK_M * S_STRIDE];
+            alignas(16) __half dS [BLOCK_M * S_STRIDE];
+        } reuse_sdOVS;
+            alignas(16) float row_dot[BLOCK_M];
+            alignas(16) float lse    [BLOCK_M];
+            alignas(16) float dQ  [BLOCK_M * Q_STRIDE];
+    };
+    
+    static constexpr size_t TOTAL_SMEM = ((sizeof(SmemLayout) + 127) & ~size_t(127));
 };
 
 // ============================================================================
@@ -190,10 +202,10 @@ flash_attention_backward_dq_kernel(
     if (start_row >= M) return;
 
     int num_n_blocks = (N + BLOCK_N - 1) / BLOCK_N;
+    const int valid_q_rows = min(BLOCK_M, M - start_row);
 
     // Early loop limit n_blocks for causal
     if constexpr (IS_CAUSAL) {
-        const int valid_q_rows = min(BLOCK_M, M - start_row);
         const int max_key_pos = start_row + valid_q_rows - 1;
         if (max_key_pos < 0) {
             num_n_blocks = 0;
@@ -202,7 +214,6 @@ flash_attention_backward_dq_kernel(
         }
     }
 
-    const int valid_q_rows = min(BLOCK_M, M - start_row);
     const int tid          = threadIdx.x;
     const int warp_id      = tid / MAX_THREADS_PER_WARP;
     const int lane_id      = tid % MAX_THREADS_PER_WARP;
@@ -217,23 +228,23 @@ flash_attention_backward_dq_kernel(
     const float*  lse_ptr = softmax_lse + (size_t)batch_head_id * M + start_row;
 
     // Shared memory layout
-    extern __shared__ char smem[];
-    
-    __half* qkv_buffer  = reinterpret_cast<__half*>(smem);
-    __half* sK          = qkv_buffer;
-    __half* sV          = qkv_buffer;
-    __half* sdO         = sK + BLOCK_N * KV_STRIDE;
-    __half* sQ          = sdO;    
-    float* acc_buffer   = reinterpret_cast<float*>(smem + Config::SMEM_QKV_BUFFER);
-    float* dov_buffer   = acc_buffer + BLOCK_M * S_STRIDE;
-    float* stats_buffer = dov_buffer + BLOCK_M * S_STRIDE;
-    float* sRowDot      = stats_buffer;
-    float* sLse         = stats_buffer + BLOCK_M;
-    float* sdQ_accum    = reinterpret_cast<float*>(smem + Config::SMEM_QKV_BUFFER + 2 * Config::SMEM_ACC_BUFFER + Config::SMEM_STATS);
+    extern __shared__ char smem_raw[];
+    auto& smem = *reinterpret_cast<typename Config::SmemLayout*>(smem_raw);
+
+    __half* sK      = smem.reuse_kv.k;
+    __half* sV      = smem.reuse_kv.v;
+    __half* sQ      = smem.reuse_qdO.q;    
+    __half* sdO     = smem.reuse_qdO.dO;
+     float* sS      = smem.s;
+     float* sdOV    = smem.reuse_sdOVS.dOV;
+    __half* sdS     = smem.reuse_sdOVS.dS;
+     float* sRowDot = smem.row_dot;
+     float* sLse    = smem.lse;
+     float* sdQ     = smem.dQ;
 
     // Zero dQ accumulator
     for (int i = tid; i < BLOCK_M * Q_STRIDE; i += THREADS) {
-        sdQ_accum[i] = 0.0f;
+        sdQ[i] = 0.0f;
     }
 
     // Compute row_dot = sum(O ⊙ dO) using global memory
@@ -356,8 +367,6 @@ flash_attention_backward_dq_kernel(
         constexpr int total_tiles = num_tiles_m * num_tiles_n;
         constexpr int tiles_per_warp = (total_tiles + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
         
-        float* sdOV = dov_buffer;
-        
         for (int tile_idx = 0; tile_idx < tiles_per_warp; ++tile_idx) {
             const int global_tile_idx = warp_id * tiles_per_warp + tile_idx;
             
@@ -422,8 +431,6 @@ flash_attention_backward_dq_kernel(
         __syncthreads();
 
         // Compute S = Q @ K^T with 2D warp distribution
-        float* sS = acc_buffer;
-        
         const unsigned row_causal = (lane_id & 0b1) + ((lane_id >> 2) & 0b1) * 8 + ((lane_id >> 4) & 0b1) * 4;
         const unsigned col_causal = ((lane_id >> 1) & 0b1) * 2 + ((lane_id >> 3) & 0b1) * 8;
        
@@ -477,8 +484,6 @@ flash_attention_backward_dq_kernel(
         __syncthreads();
         
         // Compute dS = exp(S - lse) * (dOV - row_dot) * scale → store directly as half
-        __half* sdS_base = reinterpret_cast<__half*>(dov_buffer);
-       
         const int total_elements = BLOCK_M * BLOCK_N;
         const int total_pairs = (total_elements + 1) / 2;
 
@@ -515,9 +520,8 @@ flash_attention_backward_dq_kernel(
             float ds0 = valid0 ? fmaf(p0, softmax_scale * diff0, 0.0f) : 0.0f;
             float ds1 = valid1 ? fmaf(p1, softmax_scale * diff1, 0.0f) : 0.0f;
 
-            // Convert to half and store in row-major layout (BLOCK_N columns, no padding)
             __half2 h2 = __float22half2_rn(make_float2(ds0, ds1));
-            __half* dst = sdS_base + row * BLOCK_N + col0;
+            __half* dst = sdS + row * BLOCK_N + col0;
             dst[0] = h2.x;
             if (col1 < BLOCK_N) { dst[1] = h2.y; }
         }
@@ -552,20 +556,20 @@ flash_attention_backward_dq_kernel(
                 const int k_offset = k_tile * WMMA_K;
                 if (k_offset >= valid_k_rows) break;
 
-                load_matrix_sync(a_frag, sdS_base + tile_m * BLOCK_N + k_offset, BLOCK_N);
+                load_matrix_sync(a_frag, sdS + tile_m * BLOCK_N + k_offset, BLOCK_N);
                 load_matrix_sync(b_frag, sK + k_offset * KV_STRIDE + tile_n, KV_STRIDE);
                 mma_sync(acc_frag, a_frag, b_frag, acc_frag);
             }
 
             fragment<accumulator, WMMA_M, WMMA_N, WMMA_K, float> curr_frag;
-            load_matrix_sync(curr_frag, sdQ_accum + tile_m * Q_STRIDE + tile_n, Q_STRIDE, mem_row_major);
+            load_matrix_sync(curr_frag, sdQ + tile_m * Q_STRIDE + tile_n, Q_STRIDE, mem_row_major);
 
             #pragma unroll
             for (int i = 0; i < curr_frag.num_elements; ++i) {
                 curr_frag.x[i] += acc_frag.x[i];
             }
 
-            store_matrix_sync(sdQ_accum + tile_m * Q_STRIDE + tile_n, curr_frag, Q_STRIDE, mem_row_major);
+            store_matrix_sync(sdQ + tile_m * Q_STRIDE + tile_n, curr_frag, Q_STRIDE, mem_row_major);
         }
         __syncthreads();
        
@@ -577,7 +581,7 @@ flash_attention_backward_dq_kernel(
         const int row = i / (D / 4);
         const int col = (i % (D / 4)) * 4;
 
-        const float* s_dQ_row = sdQ_accum + row * Q_STRIDE;
+        const float* s_dQ_row = sdQ + row * Q_STRIDE;
 
         const __half h0 = __float2half_rn(s_dQ_row[col + 0]);
         const __half h1 = __float2half_rn(s_dQ_row[col + 1]);
