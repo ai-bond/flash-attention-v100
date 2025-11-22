@@ -104,21 +104,21 @@ struct dQKernelConfig {
     
     struct alignas(128) SmemLayout {
         union {
-            alignas(16) __half k  [BLOCK_N * KV_STRIDE];
-            alignas(16) __half v  [BLOCK_N * KV_STRIDE];
+            alignas(16) __half k     [BLOCK_N * KV_STRIDE];
+            alignas(16) __half v     [BLOCK_N * KV_STRIDE];
         } reuse_kv;
         union { 
-            alignas(16) __half dO [BLOCK_M * Q_STRIDE];
-            alignas(16) __half q  [BLOCK_M * Q_STRIDE];
+            alignas(16) __half dO    [BLOCK_M * Q_STRIDE];
+            alignas(16) __half q     [BLOCK_M * Q_STRIDE];
         } reuse_qdO;
-            alignas(16) float  s  [BLOCK_M * S_STRIDE];
+            alignas(16) float  s     [BLOCK_M * S_STRIDE];
         union {
-            alignas(16) float  dOV[BLOCK_M * S_STRIDE];
-            alignas(16) __half dS [BLOCK_M * S_STRIDE];
+            alignas(16) float  dOV   [BLOCK_M * S_STRIDE];
+            alignas(16) __half dS    [BLOCK_M * S_STRIDE];
         } reuse_sdOVS;
             alignas(16) float row_dot[BLOCK_M];
             alignas(16) float lse    [BLOCK_M];
-            alignas(16) float dQ  [BLOCK_M * Q_STRIDE];
+            alignas(16) float dQ     [BLOCK_M * Q_STRIDE];
     };
     
     static constexpr size_t TOTAL_SMEM = ((sizeof(SmemLayout) + 127) & ~size_t(127));
@@ -145,15 +145,30 @@ struct dKVKernelConfig {
     static constexpr int VECTOR_Q          = BLOCK_N * VECTOR_D;
     static constexpr int VECTOR_KV         = BLOCK_M * VECTOR_D;
     
-    static constexpr size_t SMEM_Q_BUFFER   = (((size_t)BLOCK_N * Q_STRIDE * sizeof(__half) + 127) & ~static_cast<size_t>(127));
-    static constexpr size_t SMEM_KV_BUFFER = (((size_t)BLOCK_M * KV_STRIDE * sizeof(__half) + 127) & ~static_cast<size_t>(127));
-    static constexpr size_t SMEM_QKV_BUFFER = SMEM_KV_BUFFER + SMEM_Q_BUFFER;
-    static constexpr size_t SMEM_ACC_BUFFER = (((size_t)BLOCK_N * S_STRIDE * sizeof(float) + 127) & ~static_cast<size_t>(127));
-    static constexpr size_t SMEM_DOV_BUFFER = SMEM_ACC_BUFFER;
-    static constexpr size_t SMEM_STATS      = (((size_t)2 * BLOCK_N * sizeof(float) + 127) & ~static_cast<size_t>(127));
-    static constexpr size_t SMEM_DKV_SINGLE = (((size_t)BLOCK_M * KV_STRIDE * sizeof(float) + 127) & ~static_cast<size_t>(127));
-    static constexpr size_t SMEM_DKV_DUAL   = 2 * SMEM_DKV_SINGLE;
-    static constexpr size_t TOTAL_SMEM      = SMEM_QKV_BUFFER + 2 * SMEM_ACC_BUFFER + SMEM_STATS + SMEM_DKV_DUAL;
+    struct alignas(128) SmemLayout {
+        union {
+            alignas(16) __half k     [BLOCK_M * KV_STRIDE];
+            alignas(16) __half v     [BLOCK_M * KV_STRIDE];
+        } reuse_kv;
+        union { 
+            alignas(16) __half dO    [BLOCK_N * Q_STRIDE];
+            alignas(16) __half q     [BLOCK_N * Q_STRIDE];
+        } reuse_qdO;
+        union {
+            alignas(16) float  s     [BLOCK_N * S_STRIDE];
+            alignas(16) __half p     [BLOCK_N * BLOCK_M];
+        } reuse_sp;
+        union {
+            alignas(16) float  dOV   [BLOCK_N * S_STRIDE];
+            alignas(16) __half dS    [BLOCK_N * BLOCK_M];
+        } reuse_dOVS;
+            alignas(16) float row_dot[BLOCK_N];
+            alignas(16) float lse    [BLOCK_N];
+            alignas(16) float dK     [BLOCK_M * KV_STRIDE];
+            alignas(16) float dV     [BLOCK_M * KV_STRIDE];
+    };
+    
+    static constexpr size_t TOTAL_SMEM = ((sizeof(SmemLayout) + 127) & ~size_t(127));
 };
 
 // ============================================================================
@@ -663,27 +678,27 @@ flash_attention_backward_dkv_kernel(
           __half*  dV_ptr = dV          + (size_t)batch_head_id * N * D + start_kv * D;
 
     // Shared memory layout
-    extern __shared__ char smem[];
-    
-    __half* qkv_buffer  = reinterpret_cast<__half*>(smem);
-    __half* sK          = qkv_buffer;
-    __half* sV          = qkv_buffer;
-    __half* sdO         = reinterpret_cast<__half*>(reinterpret_cast<char*>(qkv_buffer) + Config::SMEM_KV_BUFFER);
-    __half* sQ          = sdO;
-    float* acc_buffer   = reinterpret_cast<float*>(smem + Config::SMEM_QKV_BUFFER);
-    float* dov_buffer   = acc_buffer + BLOCK_N * S_STRIDE;
-    float* stats_buffer = dov_buffer + BLOCK_N * S_STRIDE;
-    float* sRowDot      = stats_buffer;
-    float* sLse         = stats_buffer + BLOCK_N;
-    float* sdK_accum    = reinterpret_cast<float*>(smem + Config::SMEM_QKV_BUFFER + 2 * Config::SMEM_ACC_BUFFER + Config::SMEM_STATS);
-    float* sdV_accum    = sdK_accum + BLOCK_M * KV_STRIDE;
+    extern __shared__ char smem_raw[];
+    auto& smem = *reinterpret_cast<typename Config::SmemLayout*>(smem_raw);
+
+    __half* sK       = smem.reuse_kv.k;
+    __half* sV       = smem.reuse_kv.v;
+    __half* sdO      = smem.reuse_qdO.dO;
+    __half* sQ       = smem.reuse_qdO.q;
+     float* sS       = smem.reuse_sp.s;
+    __half* sP       = smem.reuse_sp.p;
+     float* sdOV     = smem.reuse_dOVS.dOV;
+    __half* sdS      = smem.reuse_dOVS.dS;
+     float* sRowDot  = smem.row_dot;
+     float* sLse     = smem.lse;
+     float* sdK      = smem.dK;
+     float* sdV      = smem.dV;
     
     // Init accum with zero
     for (int idx = tid; idx < BLOCK_M * KV_STRIDE; idx += THREADS) {
-        sdK_accum[idx] = 0.0f;
-        sdV_accum[idx] = 0.0f;
+        sdK[idx] = 0.0f;
+        sdV[idx] = 0.0f;
     }
-    __syncthreads();
 
     // ========================================================================
     // MAIN LOOP
@@ -702,7 +717,7 @@ flash_attention_backward_dkv_kernel(
         // Load K (into qkv_buffer) and Q (into sdO)
         const uint4* k_vec = reinterpret_cast<const uint4*>(k_ptr);
         const uint4* q_vec = reinterpret_cast<const uint4*>(q_ptr + start_col * D);
-        uint4* sK_vec = reinterpret_cast<uint4*>(qkv_buffer);
+        uint4* sK_vec = reinterpret_cast<uint4*>(sK);
         uint4* sQ_vec = reinterpret_cast<uint4*>(sdO);
 
         const int kv_stride_uint4 = (KV_STRIDE + PER_UINT4 - 1) / PER_UINT4;
@@ -737,8 +752,6 @@ flash_attention_backward_dkv_kernel(
         __syncthreads();
         
         // Compute dQ += dS @ K with 2D warp distribution
-        float* sS = acc_buffer;
-        
         constexpr int num_tiles_s_m = (BLOCK_N + WMMA_M - 1) / WMMA_M;
         constexpr int num_tiles_s_n = (BLOCK_M + WMMA_N - 1) / WMMA_N;
         constexpr int total_tiles_s = num_tiles_s_m * num_tiles_s_n;
@@ -862,7 +875,6 @@ flash_attention_backward_dkv_kernel(
         __syncthreads();
         
         // Load V (overwrite K in shared memory)
-        sV = qkv_buffer;
         const uint4* v_vec = reinterpret_cast<const uint4*>(v_ptr);
         uint4* sV_vec = reinterpret_cast<uint4*>(sV);
 
@@ -879,8 +891,6 @@ flash_attention_backward_dkv_kernel(
         __syncthreads();
 
         // Compute dOV = dO @ V^T with with 2D warp distribution
-        float* sdOV = dov_buffer;
-        
         for (int tile_local = 0; tile_local < tiles_per_warp_s; ++tile_local) {
             const int tile_idx = warp_id * tiles_per_warp_s + tile_local;
             if (tile_idx >= total_tiles_s) break;
@@ -910,11 +920,7 @@ flash_attention_backward_dkv_kernel(
         }
         __syncthreads();
 
-        // Compute P = exp(S - lse) AND dS = P * (dOV - row_dot) * scale → store P in half (in acc_buffer), dS in half (in dov_buffer)
-        float* sP = acc_buffer;
-        __half* sP_half = reinterpret_cast<__half*>(acc_buffer);
-        __half* sdS_base = reinterpret_cast<__half*>(dov_buffer);
-
+        // Compute P = exp(S - lse) AND dS = P * (dOV - row_dot) * scale → store P in half
         const int total_elements = BLOCK_N * BLOCK_M;
         const int total_pairs = (total_elements + 1) / 2;
 
@@ -946,6 +952,7 @@ flash_attention_backward_dkv_kernel(
             // Compute P0, P1 in float
             float shifted0 = s0 - lse0;
             float shifted1 = s1 - lse1;
+
             float p0 = (shifted0 < -80.0f) ? 0.0f : __expf(shifted0);
             float p1 = (shifted1 < -80.0f) ? 0.0f : __expf(shifted1);
 
@@ -961,13 +968,13 @@ flash_attention_backward_dkv_kernel(
 
             // Store P and dS in half (row-major, BLOCK_M stride)
             if (col1 < BLOCK_M && row1 == row0) {
-                __half* p_dst  = sP_half  + row0 * BLOCK_M + col0;
-                __half* ds_dst = sdS_base + row0 * BLOCK_M + col0;
+                __half* p_dst  = sP  + row0 * BLOCK_M + col0;
+                __half* ds_dst = sdS + row0 * BLOCK_M + col0;
                 p_dst[0]  = p_h2.x;  p_dst[1]  = p_h2.y;
                 ds_dst[0] = ds_h2.x; ds_dst[1] = ds_h2.y;
             } else {
-                if (valid0) { sP_half[row0 * BLOCK_M + col0] = p_h2.x; sdS_base[row0 * BLOCK_M + col0] = ds_h2.x; }
-                if (valid1) { sP_half[row1 * BLOCK_M + col1] = p_h2.y; sdS_base[row1 * BLOCK_M + col1] = ds_h2.y; }
+                if (valid0) { sP[row0 * BLOCK_M + col0] = p_h2.x; sdS[row0 * BLOCK_M + col0] = ds_h2.x; }
+                if (valid1) { sP[row1 * BLOCK_M + col1] = p_h2.y; sdS[row1 * BLOCK_M + col1] = ds_h2.y; }
             }
         }
         __syncthreads();
@@ -992,7 +999,7 @@ flash_attention_backward_dkv_kernel(
             fragment<matrix_a, WMMA_M, WMMA_N, WMMA_K, half, col_major> a_frag;
             fragment<matrix_b, WMMA_M, WMMA_N, WMMA_K, half, row_major> b_frag;
             fragment<accumulator, WMMA_M, WMMA_N, WMMA_K, float> acc_frag;
-            load_matrix_sync(acc_frag, sdV_accum + tile_m * KV_STRIDE + tile_n, KV_STRIDE, mem_row_major);
+            load_matrix_sync(acc_frag, sdV + tile_m * KV_STRIDE + tile_n, KV_STRIDE, mem_row_major);
 
             const int num_k_tiles = (valid_q_rows + WMMA_K - 1) / WMMA_K;
             #pragma unroll
@@ -1000,12 +1007,12 @@ flash_attention_backward_dkv_kernel(
                 const int k_offset = k_tile * WMMA_K;
                 if (k_offset >= valid_q_rows) break;
                 
-                load_matrix_sync(a_frag, sP_half + k_offset * BLOCK_M + tile_m, BLOCK_M);
+                load_matrix_sync(a_frag, sP + k_offset * BLOCK_M + tile_m, BLOCK_M);
                 load_matrix_sync(b_frag, sdO + k_offset * Q_STRIDE + tile_n, Q_STRIDE);
                 mma_sync(acc_frag, a_frag, b_frag, acc_frag);
             }
 
-            store_matrix_sync(sdV_accum + tile_m * KV_STRIDE + tile_n, acc_frag, KV_STRIDE, mem_row_major);
+            store_matrix_sync(sdV + tile_m * KV_STRIDE + tile_n, acc_frag, KV_STRIDE, mem_row_major);
         }
         __syncthreads();
 
@@ -1043,7 +1050,7 @@ flash_attention_backward_dkv_kernel(
             fragment<matrix_a, WMMA_M, WMMA_N, WMMA_K, half, col_major> a_frag;
             fragment<matrix_b, WMMA_M, WMMA_N, WMMA_K, half, row_major> b_frag;
             fragment<accumulator, WMMA_M, WMMA_N, WMMA_K, float> acc_frag;
-            load_matrix_sync(acc_frag, sdK_accum + tile_m * KV_STRIDE + tile_n, KV_STRIDE, mem_row_major);
+            load_matrix_sync(acc_frag, sdK + tile_m * KV_STRIDE + tile_n, KV_STRIDE, mem_row_major);
 
             const int num_k_tiles = (valid_q_rows + WMMA_K - 1) / WMMA_K;
             #pragma unroll
@@ -1051,12 +1058,12 @@ flash_attention_backward_dkv_kernel(
                 const int k_offset = k_tile * WMMA_K;
                 if (k_offset >= valid_q_rows) break;
                 
-                load_matrix_sync(a_frag, sdS_base + k_offset * BLOCK_M + tile_m, BLOCK_M);
+                load_matrix_sync(a_frag, sdS + k_offset * BLOCK_M + tile_m, BLOCK_M);
                 load_matrix_sync(b_frag, sQ + k_offset * Q_STRIDE + tile_n, Q_STRIDE);
                 mma_sync(acc_frag, a_frag, b_frag, acc_frag);
             }
             
-            store_matrix_sync(sdK_accum + tile_m * KV_STRIDE + tile_n, acc_frag, KV_STRIDE, mem_row_major);
+            store_matrix_sync(sdK + tile_m * KV_STRIDE + tile_n, acc_frag, KV_STRIDE, mem_row_major);
         }
         __syncthreads();
     }
@@ -1067,8 +1074,8 @@ flash_attention_backward_dkv_kernel(
         const int row = i / (D / 4);
         const int col = (i % (D / 4)) * 4;
 
-        const float* s_dK_row = sdK_accum + row * KV_STRIDE;
-        const float* s_dV_row = sdV_accum + row * KV_STRIDE;
+        const float* s_dK_row = sdK + row * KV_STRIDE;
+        const float* s_dV_row = sdV + row * KV_STRIDE;
 
         const __half hk0 = __float2half_rn(s_dK_row[col + 0]);
         const __half hk1 = __float2half_rn(s_dK_row[col + 1]);
