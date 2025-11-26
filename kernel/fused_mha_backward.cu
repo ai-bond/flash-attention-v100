@@ -270,6 +270,7 @@ flash_attention_backward_dq_kernel(
         const int thread_in_row = tid % THREADS_PER_ROW;
         const int fp16_x4_per_row = D / 4;
         const int work_per_thread = (fp16_x4_per_row + THREADS_PER_ROW - 1) / THREADS_PER_ROW;
+        const unsigned mask = ((valid_q_rows == BLOCK_N) - 1U) & __activemask() | -(valid_q_rows == BLOCK_N);
 
         float thread_dot = 0.0f;
 
@@ -315,7 +316,7 @@ flash_attention_backward_dq_kernel(
 
         #pragma unroll
         for (int offset = 1; offset < THREADS_PER_ROW; offset <<= 1) {
-            thread_dot += __shfl_xor_sync(0xffffffff, thread_dot, offset);
+            thread_dot += __shfl_xor_sync(mask, thread_dot, offset);
         }
 
         if (thread_in_row == 0) {
@@ -862,6 +863,7 @@ flash_attention_backward_dkv_kernel(
             const int thread_in_row = tid % THREADS_PER_ROW;
             const int fp16_x4_per_row = D / 4;
             const int work_per_thread = (fp16_x4_per_row + THREADS_PER_ROW - 1) / THREADS_PER_ROW;
+            const unsigned mask = ((valid_q_rows == BLOCK_N) - 1U) & __activemask() | -(valid_q_rows == BLOCK_N);
     
             float thread_dot = 0.0f;
     
@@ -897,7 +899,7 @@ flash_attention_backward_dkv_kernel(
     
             #pragma unroll
             for (int offset = 1; offset < THREADS_PER_ROW; offset <<= 1) {
-                thread_dot += __shfl_xor_sync(0xffffffff, thread_dot, offset);
+                thread_dot += __shfl_xor_sync(mask, thread_dot, offset);
             }
     
             if (thread_in_row == 0) { sRowDot[row] = thread_dot; }

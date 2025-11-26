@@ -302,6 +302,8 @@ flash_attention_forward_kernel(
         if (tid < valid_q_rows * THREADS_PER_ROW) {
             const int row = tid / THREADS_PER_ROW;
             const int thread_in_row = tid % THREADS_PER_ROW;
+            const unsigned mask = ((valid_q_rows == BLOCK_M) - 1U) & __activemask() | -(valid_q_rows == BLOCK_M);
+
             float*  sS_row_f = sS + row * S_STRIDE;
             __half* sP_row_h = reinterpret_cast<__half*>(sS) + row * S_STRIDE;
     
@@ -326,10 +328,10 @@ flash_attention_forward_kernel(
             #pragma unroll
             for (int o = THREADS_PER_ROW / 2; o > 0; o >>= 1)
 
-            thread_max = fmaxf(thread_max, __shfl_down_sync(0xffffffff, thread_max, o));
+            thread_max = fmaxf(thread_max, __shfl_down_sync(mask, thread_max, o));
     
             const float old_max = sRowMax[row];
-            const float row_max = __shfl_sync(0xffffffff, thread_max, 0);
+            const float row_max = __shfl_sync(mask, thread_max, 0);
             const float new_max = fmaxf(old_max, row_max);
             const float exp_diff = __expf(old_max - new_max);
     
@@ -366,7 +368,7 @@ flash_attention_forward_kernel(
     
             #pragma unroll
             for (int o = THREADS_PER_ROW / 2; o > 0; o >>= 1)
-            thread_sum += __shfl_down_sync(0xffffffff, thread_sum, o);
+            thread_sum += __shfl_down_sync(mask, thread_sum, o);
     
             float bcast_diff = exp_diff;
             if (thread_in_row == 0) {
@@ -374,7 +376,7 @@ flash_attention_forward_kernel(
                 sRowMax[row] = new_max;
                 sOldMax[row] = exp_diff;
             }
-            bcast_diff = __shfl_sync(0xffffffff, bcast_diff, 0);
+            bcast_diff = __shfl_sync(mask, bcast_diff, 0);
     
             // Phase 3: Vectorized writes
             h2_idx = 0;
