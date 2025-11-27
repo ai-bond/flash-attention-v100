@@ -302,7 +302,7 @@ flash_attention_forward_kernel(
             const unsigned mask = ((valid_q_rows == BLOCK_M) - 1U) & __activemask() | -(valid_q_rows == BLOCK_M);
 
             float*  sS_row_f = sS + row * S_STRIDE;
-            __half* sP_row_h = reinterpret_cast<__half*>(sS) + row * S_STRIDE;
+            __half* sP_row_h = sP + row * S_STRIDE;
     
             const int vec_cols = valid_k_rows / 4;
             const int vecs_per_thread = (vec_cols + THREADS_PER_ROW - 1) / THREADS_PER_ROW;
@@ -465,7 +465,7 @@ flash_attention_forward_kernel(
         const int row = i / (D / 4);
         const int col = (i % (D / 4)) * 4;
 
-        const float inv_sum = (sRowSum[row] > 1e-6f) ? (1.0f / sRowSum[row]) : 1.0f;
+        const float inv_sum = 1.0f / sRowSum[row];
         const float* sO_row = sO + row * O_STRIDE;
 
         const __half h0 = __float2half_rn(sO_row[col + 0] * inv_sum);
