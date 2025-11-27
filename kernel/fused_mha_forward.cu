@@ -90,7 +90,6 @@ struct KernelConfig {
         alignas(16) float  o      [BLOCK_M * O_STRIDE];
         alignas(16) float  row_max[BLOCK_M];
         alignas(16) float  row_sum[BLOCK_M];
-        alignas(16) float  old_max[BLOCK_M];
     };
 
     static constexpr size_t TOTAL_SMEM = ((sizeof(SmemLayout) + 127) & ~size_t(127)); 
@@ -193,7 +192,6 @@ flash_attention_forward_kernel(
     float*  sO      = smem.o;           // ← phase 3: write to global
     float*  sRowMax = smem.row_max;
     float*  sRowSum = smem.row_sum;
-    float*  sOldMax = smem.old_max;
 
     // Vector strides
     const int  d_stride_uint4 = (D + PER_UINT4 - 1) / PER_UINT4;
@@ -214,7 +212,6 @@ flash_attention_forward_kernel(
     if (tid < BLOCK_M) {
         sRowMax[tid] = NEG_INF;
         sRowSum[tid] = 0.0f;
-        sOldMax[tid] = 1.0f;
     }
     __syncthreads();
 
@@ -374,7 +371,6 @@ flash_attention_forward_kernel(
             if (thread_in_row == 0) {
                 sRowSum[row] = exp_diff * sRowSum[row] + thread_sum;
                 sRowMax[row] = new_max;
-                sOldMax[row] = exp_diff;
             }
             bcast_diff = __shfl_sync(mask, bcast_diff, 0);
     
