@@ -285,8 +285,13 @@ flash_attention_forward_kernel(
             
                     const int global_m = start_row + tile_m + row;
                     const int global_n = start_col + tile_n + col;
+                    
+                    const bool is_valid = (global_m < start_row + valid_q_rows) &&
+                                          (global_n < start_col + valid_k_rows);
             
-                    acc_frag.x[i] = (global_n > global_m) ? NEG_INF : (acc_frag.x[i] * softmax_scale);
+                    acc_frag.x[i] = is_valid
+                        ? ((global_n > global_m) ? NEG_INF : acc_frag.x[i] * softmax_scale)
+                        : NEG_INF;
                 }
             } else {
                 #pragma unroll
