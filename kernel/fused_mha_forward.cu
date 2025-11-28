@@ -359,11 +359,11 @@ flash_attention_forward_kernel(
                 }
             }
     
-            #pragma unroll
-            for (int c = tail_start + thread_in_row; c < valid_k_rows; c += THREADS_PER_ROW) {
-                float v = sS_row_f[c];
+            #pragma unroll 4
+            for (int c = tail_start + thread_in_row; c < BLOCK_N; c += THREADS_PER_ROW) {
+                float v = (c < valid_k_rows) ? sS_row_f[c] : NEG_INF;
                 float e = __expf(fmaxf(v - new_max, -80.0f));
-                thread_sum += e;
+                thread_sum += (c < valid_k_rows) ? e : 0.0f;
                 sP_row_h[c] = __float2half_rn(e);
             }
     
