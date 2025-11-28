@@ -113,7 +113,11 @@ __device__ __forceinline__ void store_u4_swizzle(
             if (c_eff >= cg) continue;
 
             int col = col0 + c_eff;
-            s_vec[row * stride_u4 + col] = __ldg(&g_vec[row * vec_per_row + col]);
+            uint4 val = make_uint4(0, 0, 0, 0);
+            if (row < rows && col < vec_per_row) {
+                val = __ldg(&g_vec[row * vec_per_row + col]);
+            }
+            s_vec[row * stride_u4 + col] = val;
         }
     }
 }
