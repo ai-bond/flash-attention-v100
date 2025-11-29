@@ -8,7 +8,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "flash_attn_v100"
-version = "1.4.0"
+version = "25.11"
 description = "Flash Attention 2 for Tesla v100"
 readme = "README.md"
 requires-python = ">=3.10"

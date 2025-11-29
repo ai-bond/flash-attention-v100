@@ -90,7 +90,6 @@ struct KernelConfig {
         alignas(16) float  o      [BLOCK_M * O_STRIDE];
         alignas(16) float  row_max[BLOCK_M];
         alignas(16) float  row_sum[BLOCK_M];
-        alignas(16) float  old_max[BLOCK_M];
     };
 
     static constexpr size_t TOTAL_SMEM = ((sizeof(SmemLayout) + 127) & ~size_t(127)); 
@@ -114,7 +113,11 @@ __device__ __forceinline__ void store_u4_swizzle(
             if (c_eff >= cg) continue;
 
             int col = col0 + c_eff;
-            s_vec[row * stride_u4 + col] = __ldg(&g_vec[row * vec_per_row + col]);
+            uint4 val = make_uint4(0, 0, 0, 0);
+            if (row < rows && col < vec_per_row) {
+                val = __ldg(&g_vec[row * vec_per_row + col]);
+            }
+            s_vec[row * stride_u4 + col] = val;
         }
     }
 }
@@ -193,7 +196,6 @@ flash_attention_forward_kernel(
     float*  sO      = smem.o;           // ← phase 3: write to global
     float*  sRowMax = smem.row_max;
     float*  sRowSum = smem.row_sum;
-    float*  sOldMax = smem.old_max;
 
     // Vector strides
     const int  d_stride_uint4 = (D + PER_UINT4 - 1) / PER_UINT4;
@@ -214,7 +216,6 @@ flash_attention_forward_kernel(
     if (tid < BLOCK_M) {
         sRowMax[tid] = NEG_INF;
         sRowSum[tid] = 0.0f;
-        sOldMax[tid] = 1.0f;
     }
     __syncthreads();
 
@@ -284,8 +285,13 @@ flash_attention_forward_kernel(
             
                     const int global_m = start_row + tile_m + row;
                     const int global_n = start_col + tile_n + col;
+                    
+                    const bool is_valid = (global_m < start_row + valid_q_rows) &&
+                                          (global_n < start_col + valid_k_rows);
             
-                    acc_frag.x[i] = (global_n > global_m) ? NEG_INF : (acc_frag.x[i] * softmax_scale);
+                    acc_frag.x[i] = is_valid
+                        ? ((global_n > global_m) ? NEG_INF : acc_frag.x[i] * softmax_scale)
+                        : NEG_INF;
                 }
             } else {
                 #pragma unroll
@@ -302,8 +308,10 @@ flash_attention_forward_kernel(
         if (tid < valid_q_rows * THREADS_PER_ROW) {
             const int row = tid / THREADS_PER_ROW;
             const int thread_in_row = tid % THREADS_PER_ROW;
+            const unsigned mask = ((valid_q_rows == BLOCK_M) - 1U) & __activemask() | -(valid_q_rows == BLOCK_M);
+
             float*  sS_row_f = sS + row * S_STRIDE;
-            __half* sP_row_h = reinterpret_cast<__half*>(sS) + row * S_STRIDE;
+            __half* sP_row_h = sP + row * S_STRIDE;
     
             const int vec_cols = valid_k_rows / 4;
             const int vecs_per_thread = (vec_cols + THREADS_PER_ROW - 1) / THREADS_PER_ROW;
@@ -326,10 +334,10 @@ flash_attention_forward_kernel(
             #pragma unroll
             for (int o = THREADS_PER_ROW / 2; o > 0; o >>= 1)
 
-            thread_max = fmaxf(thread_max, __shfl_down_sync(0xffffffff, thread_max, o));
+            thread_max = fmaxf(thread_max, __shfl_down_sync(mask, thread_max, o));
     
             const float old_max = sRowMax[row];
-            const float row_max = __shfl_sync(0xffffffff, thread_max, 0);
+            const float row_max = __shfl_sync(mask, thread_max, 0);
             const float new_max = fmaxf(old_max, row_max);
             const float exp_diff = __expf(old_max - new_max);
     
@@ -356,25 +364,24 @@ flash_attention_forward_kernel(
                 }
             }
     
-            #pragma unroll
-            for (int c = tail_start + thread_in_row; c < valid_k_rows; c += THREADS_PER_ROW) {
-                float v = sS_row_f[c];
+            #pragma unroll 4
+            for (int c = tail_start + thread_in_row; c < BLOCK_N; c += THREADS_PER_ROW) {
+                float v = (c < valid_k_rows) ? sS_row_f[c] : NEG_INF;
                 float e = __expf(fmaxf(v - new_max, -80.0f));
-                thread_sum += e;
+                thread_sum += (c < valid_k_rows) ? e : 0.0f;
                 sP_row_h[c] = __float2half_rn(e);
             }
     
             #pragma unroll
             for (int o = THREADS_PER_ROW / 2; o > 0; o >>= 1)
-            thread_sum += __shfl_down_sync(0xffffffff, thread_sum, o);
+            thread_sum += __shfl_down_sync(mask, thread_sum, o);
     
             float bcast_diff = exp_diff;
             if (thread_in_row == 0) {
                 sRowSum[row] = exp_diff * sRowSum[row] + thread_sum;
                 sRowMax[row] = new_max;
-                sOldMax[row] = exp_diff;
             }
-            bcast_diff = __shfl_sync(0xffffffff, bcast_diff, 0);
+            bcast_diff = __shfl_sync(mask, bcast_diff, 0);
     
             // Phase 3: Vectorized writes
             h2_idx = 0;
@@ -467,7 +474,7 @@ flash_attention_forward_kernel(
         const int row = i / (D / 4);
         const int col = (i % (D / 4)) * 4;
 
-        const float inv_sum = (sRowSum[row] > 1e-6f) ? (1.0f / sRowSum[row]) : 1.0f;
+        const float inv_sum = 1.0f / sRowSum[row];
         const float* sO_row = sO + row * O_STRIDE;
 
         const __half h0 = __float2half_rn(sO_row[col + 0] * inv_sum);
