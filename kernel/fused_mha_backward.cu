@@ -556,13 +556,13 @@ flash_attention_backward_dq_kernel(
             }
 
             // Phase 2: tail — only if needed
-            if (tail_start < valid_k_rows) {
-                #pragma unroll
-                for (int c = tail_start + thread_in_row; c < valid_k_rows; c += THREADS_PER_ROW) {
-                    float s = sS_row[c], dov = sdOV_row[c];
-                    float p = (s - lse_val < -80.0f) ? 0.0f : __expf(s - lse_val);
-                    sdS_row[c] = __float2half_rn(p * softmax_scale * (dov - row_dot_val));
-                }
+            #pragma unroll
+            for (int c = tail_start + thread_in_row; c < BLOCK_N; c += THREADS_PER_ROW) {
+                float s = (c < valid_k_rows) ? sS_row[c] : NEG_INF;
+                float dov = (c < valid_k_rows) ? sdOV_row[c] : 0.0f;
+                float p = (s - lse_val < -80.0f) ? 0.0f : __expf(s - lse_val);
+                float ds = p * softmax_scale * ((c < valid_k_rows) ? (dov - row_dot_val) : 0.0f);
+                sdS_row[c] = __float2half_rn(ds);
             }
 
             // Phase 3: write buffered uint4s
@@ -751,7 +751,7 @@ flash_attention_backward_dkv_kernel(
             if (start_kv >= start_col + valid_q_rows) { continue; }
         }
         
-        // Load K (into qkv_buffer) and Q (into sdO)
+        // Load K (into sK) and Q (into sdO)
         const uint4* k_vec = reinterpret_cast<const uint4*>(k_ptr);
         const uint4* q_vec = reinterpret_cast<const uint4*>(q_ptr + start_col * D);
         uint4* sK_vec = reinterpret_cast<uint4*>(sK);
@@ -1010,6 +1010,18 @@ flash_attention_backward_dkv_kernel(
             } else {
                 if (valid0) { sP[row0 * BLOCK_M + col0] = p_h2.x; sdS[row0 * BLOCK_M + col0] = ds_h2.x; }
                 if (valid1) { sP[row1 * BLOCK_M + col1] = p_h2.y; sdS[row1 * BLOCK_M + col1] = ds_h2.y; }
+            }
+        }
+        __syncthreads();
+
+        if (tid < (BLOCK_N - valid_q_rows)) {
+            const int row = valid_q_rows + tid;
+            __half* sP_row = sP + row * BLOCK_M;
+            __half* sdS_row = sdS + row * BLOCK_M;
+            #pragma unroll
+            for (int c = 0; c < BLOCK_M; c++) {
+                sP_row[c] = __float2half(0.0f);
+                sdS_row[c] = __float2half(0.0f);
             }
         }
         __syncthreads();
