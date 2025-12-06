@@ -123,7 +123,25 @@ __device__ __forceinline__ void store_u4_swizzle(
 }
 
 // ============================================================================
-// OPTIMIZED KERNEL
+// INIT SMEM LAYOUT
+// ============================================================================
+template<typename Config>
+__device__ __forceinline__ void init_smem(char* smem_raw) {
+    constexpr int N_U4 = Config::TOTAL_SMEM / 16;
+    const int lane_id = threadIdx.x & 31;
+
+    uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_raw));
+    #pragma unroll 1
+    for (int i = lane_id; i < N_U4; i += 32) {
+        asm volatile("st.shared.v4.u32 [%0], {%1,%1,%1,%1};"
+                     :: "r"(addr + (i << 4)), "r"(0) : "memory");
+    }
+    __syncwarp();
+}
+
+
+// ============================================================================
+// FORWARD KERNEL
 // ============================================================================
 template<int D, bool IS_CAUSAL>
 __global__ void __launch_bounds__(KernelConfig<D>::THREADS_PER_BLOCK, 2)
@@ -186,6 +204,7 @@ flash_attention_forward_kernel(
     
     // Shared memory layout
     extern __shared__ char smem_raw[];
+    init_smem<Config>(smem_raw);
     auto& smem = *reinterpret_cast<typename Config::SmemLayout*>(smem_raw);
    
     __half* sQ      = smem.q;           // ← phase 0: load Q
@@ -202,20 +221,16 @@ flash_attention_forward_kernel(
     const int  q_stride_uint4 = (Q_STRIDE  + PER_UINT4 - 1) / PER_UINT4;
     const int kv_stride_uint4 = (KV_STRIDE + PER_UINT4 - 1) / PER_UINT4;
 
-    // Unified initialization: Q load + O zeroing + state buffers
+    // Unified initialization: Q load + state buffers
     const uint4* q_vec = reinterpret_cast<const uint4*>(q_ptr);
     uint4*      sQ_vec = reinterpret_cast<uint4*>(sQ);
-    float4*     sO_vec = reinterpret_cast<float4*>(sO);
 
     // Load sQ from global to smem
     store_u4_swizzle(q_vec, sQ_vec, valid_q_rows, d_stride_uint4, q_stride_uint4, lane_id, warp_id, WARPS_PER_BLOCK);
 
-    // Init sO with zero + stats
-    #pragma unroll
-    for (int i = tid; i < ((BLOCK_M * O_STRIDE) / 4); i += THREADS_PER_BLOCK) sO_vec[i] = make_float4(0.f, 0.f, 0.f, 0.f);
+    // Init state buffers
     if (tid < BLOCK_M) {
         sRowMax[tid] = NEG_INF;
-        sRowSum[tid] = 0.0f;
     }
     __syncthreads();
 

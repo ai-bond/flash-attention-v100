@@ -124,6 +124,23 @@ struct dQKernelConfig {
 };
 
 // ============================================================================
+// INIT SMEM LAYOUT
+// ============================================================================
+template<typename Config>
+__device__ __forceinline__ void init_smem(char* smem_raw) {
+    constexpr int N_U4 = Config::TOTAL_SMEM / 16;
+    const int lane_id = threadIdx.x & 31;
+
+    uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_raw));
+    #pragma unroll 1
+    for (int i = lane_id; i < N_U4; i += 32) {
+        asm volatile("st.shared.v4.u32 [%0], {%1,%1,%1,%1};"
+                     :: "r"(addr + (i << 4)), "r"(0) : "memory");
+    }
+    __syncwarp();
+}
+
+// ============================================================================
 // COMPILE-TIME CONFIG DKV
 // ============================================================================
 template<int D>
@@ -241,6 +258,7 @@ flash_attention_backward_dq_kernel(
 
     // Shared memory layout
     extern __shared__ char smem_raw[];
+    init_smem<Config>(smem_raw);
     auto& smem = *reinterpret_cast<typename Config::SmemLayout*>(smem_raw);
 
     __half* sK      = smem.reuse_kv.k;
@@ -258,11 +276,6 @@ flash_attention_backward_dq_kernel(
     const int  d_stride_uint4 = (D + PER_UINT4 - 1) / PER_UINT4;
     const int  q_stride_uint4 = (Q_STRIDE  + PER_UINT4 - 1) / PER_UINT4;
     const int kv_stride_uint4 = (KV_STRIDE + PER_UINT4 - 1) / PER_UINT4;
-
-    // Zero dQ accumulator
-    for (int i = tid; i < BLOCK_M * Q_STRIDE; i += THREADS_PER_BLOCK) {
-        sdQ[i] = 0.0f;
-    }
 
     // Compute row_dot = sum(O ⊙ dO) using global memory
     if (tid < valid_q_rows * THREADS_PER_ROW) {
@@ -711,6 +724,7 @@ flash_attention_backward_dkv_kernel(
 
     // Shared memory layout
     extern __shared__ char smem_raw[];
+    init_smem<Config>(smem_raw);
     auto& smem = *reinterpret_cast<typename Config::SmemLayout*>(smem_raw);
 
     __half* sK       = smem.reuse_kv.k;
@@ -731,12 +745,6 @@ flash_attention_backward_dkv_kernel(
     const int  q_stride_uint4 = (Q_STRIDE  + PER_UINT4 - 1) / PER_UINT4;
     const int kv_stride_uint4 = (KV_STRIDE + PER_UINT4 - 1) / PER_UINT4;
     
-    // Init accum with zero
-    for (int idx = tid; idx < BLOCK_M * KV_STRIDE; idx += THREADS_PER_BLOCK) {
-        sdK[idx] = 0.0f;
-        sdV[idx] = 0.0f;
-    }
-
     // ========================================================================
     // MAIN LOOP
     // ========================================================================
@@ -1010,18 +1018,6 @@ flash_attention_backward_dkv_kernel(
             } else {
                 if (valid0) { sP[row0 * BLOCK_M + col0] = p_h2.x; sdS[row0 * BLOCK_M + col0] = ds_h2.x; }
                 if (valid1) { sP[row1 * BLOCK_M + col1] = p_h2.y; sdS[row1 * BLOCK_M + col1] = ds_h2.y; }
-            }
-        }
-        __syncthreads();
-
-        if (tid < (BLOCK_N - valid_q_rows)) {
-            const int row = valid_q_rows + tid;
-            __half* sP_row = sP + row * BLOCK_M;
-            __half* sdS_row = sdS + row * BLOCK_M;
-            #pragma unroll
-            for (int c = 0; c < BLOCK_M; c++) {
-                sP_row[c] = __float2half(0.0f);
-                sdS_row[c] = __float2half(0.0f);
             }
         }
         __syncthreads();
