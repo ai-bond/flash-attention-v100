@@ -323,14 +323,15 @@ flash_attention_forward_kernel(
         if (tid < valid_q_rows * THREADS_PER_ROW) {
             const int row = tid / THREADS_PER_ROW;
             const int thread_in_row = tid % THREADS_PER_ROW;
-            const unsigned mask = ((valid_q_rows == BLOCK_M) - 1U) & __activemask() | -(valid_q_rows == BLOCK_M);
+            const unsigned mask = (valid_q_rows == BLOCK_M) ? 0xFFFFFFFFU : __activemask();
+            const int row_leader = __ffs(mask) - 1;
 
             float*  sS_row_f = sS + row * S_STRIDE;
             __half* sP_row_h = sP + row * S_STRIDE;
     
-            const int vec_cols = valid_k_rows / 4;
+            const int vec_cols = valid_k_rows >> 2;
             const int vecs_per_thread = (vec_cols + THREADS_PER_ROW - 1) / THREADS_PER_ROW;
-            const int tail_start = vec_cols * 4;
+            const int tail_start = vec_cols << 2;
     
             // Phase 1: Max reduction with prefetch
             float thread_max = NEG_INF;
@@ -348,12 +349,11 @@ flash_attention_forward_kernel(
             // 1.1 warp reduction
             #pragma unroll
             for (int o = THREADS_PER_ROW / 2; o > 0; o >>= 1)
+                thread_max = fmaxf(thread_max, __shfl_down_sync(mask, thread_max, o, THREADS_PER_ROW));
 
-            thread_max = fmaxf(thread_max, __shfl_down_sync(mask, thread_max, o));
-    
-            const float old_max = sRowMax[row];
-            const float row_max = __shfl_sync(mask, thread_max, 0);
-            const float new_max = fmaxf(old_max, row_max);
+            const float row_max  = __shfl_sync(mask, thread_max, row_leader, THREADS_PER_ROW);    
+            const float old_max  = sRowMax[row];
+            const float new_max  = fmaxf(old_max, row_max);
             const float exp_diff = __expf(old_max - new_max);
     
             // Phase 2: Unified vectorized + tail processing
@@ -384,19 +384,19 @@ flash_attention_forward_kernel(
                 float v = (c < valid_k_rows) ? sS_row_f[c] : NEG_INF;
                 float e = __expf(fmaxf(v - new_max, -80.0f));
                 thread_sum += (c < valid_k_rows) ? e : 0.0f;
-                sP_row_h[c] = __float2half_rn(e);
+                sP_row_h[c] = (c < valid_k_rows) ? __float2half_rn(e) : __float2half(0.f);
             }
     
             #pragma unroll
             for (int o = THREADS_PER_ROW / 2; o > 0; o >>= 1)
-            thread_sum += __shfl_down_sync(mask, thread_sum, o);
+                thread_sum += __shfl_down_sync(mask, thread_sum, o, THREADS_PER_ROW);
     
-            float bcast_diff = exp_diff;
+            float row_sum = __shfl_sync(mask, thread_sum, row_leader, THREADS_PER_ROW);
+            
             if (thread_in_row == 0) {
-                sRowSum[row] = exp_diff * sRowSum[row] + thread_sum;
+                sRowSum[row] = exp_diff * sRowSum[row] + row_sum;
                 sRowMax[row] = new_max;
             }
-            bcast_diff = __shfl_sync(mask, bcast_diff, 0);
     
             // Phase 3: Vectorized writes
             h2_idx = 0;
@@ -415,20 +415,18 @@ flash_attention_forward_kernel(
     
             // Fused sO scaling
             if (block_n > 0) {
-                float* sO_row = sO + row * O_STRIDE;
+                float*  sO_row = sO + row * O_STRIDE;
                 float4* sO_vec = reinterpret_cast<float4*>(sO_row);
-        
                 const int o_vec_count = (O_STRIDE + 3) >> 2;
-                const int o_base = thread_in_row;
-                const int o_stride = THREADS_PER_ROW;
+                float scale = exp_diff;
         
                 #pragma unroll 4
-                for (int ov = o_base; ov < o_vec_count; ov += o_stride) {
+                for (int ov = thread_in_row; ov < o_vec_count; ov += THREADS_PER_ROW) {
                     float4 v = sO_vec[ov];
-                    v.x *= bcast_diff;
-                    v.y *= bcast_diff;
-                    v.z *= bcast_diff;
-                    v.w *= bcast_diff;
+                    v.x *= scale;
+                    v.y *= scale;
+                    v.z *= scale;
+                    v.w *= scale;
                    
                     sO_vec[ov] = v;
                 }
