@@ -68,7 +68,6 @@ struct KernelConfig {
     static constexpr int WARPS_PER_BLOCK = (D == 16) ? WARPS_16 : (D == 32) ? WARPS_32 : (D == 64) ? WARPS_64 : (D == 128) ? WARPS_128 : WARPS_256;
     
     static constexpr int THREADS_PER_BLOCK = WARPS_PER_BLOCK * MAX_THREADS_PER_WARP;
-    static constexpr int NUM_K_TILES       = (D + WMMA_K - 1) / WMMA_K;
     static constexpr int THREADS_PER_ROW   = THREADS_PER_BLOCK / BLOCK_M;
     static constexpr int PAD               = (8 - (D % 32) + 32) % 32;
     static constexpr int Q_STRIDE          = D + PAD;
@@ -123,7 +122,24 @@ __device__ __forceinline__ void store_u4_swizzle(
 }
 
 // ============================================================================
-// OPTIMIZED KERNEL
+// INIT SMEM LAYOUT
+// ============================================================================
+template<typename Config>
+__device__ __forceinline__ void init_smem(char* smem_raw) {
+    constexpr int N_U4 = Config::TOTAL_SMEM / 16;
+    const int lane_id = threadIdx.x & 31;
+
+    uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_raw));
+    #pragma unroll 1
+    for (int i = lane_id; i < N_U4; i += 32) {
+        asm volatile("st.shared.v4.u32 [%0], {%1,%1,%1,%1};"
+                     :: "r"(addr + (i << 4)), "r"(0) : "memory");
+    }
+    __syncwarp();
+}
+
+// ============================================================================
+// FORWARD KERNEL
 // ============================================================================
 template<int D, bool IS_CAUSAL>
 __global__ void __launch_bounds__(KernelConfig<D>::THREADS_PER_BLOCK, 2)
@@ -142,7 +158,6 @@ flash_attention_forward_kernel(
     using Config = KernelConfig<D>;
     constexpr int BLOCK_M           = Config::BLOCK_M;
     constexpr int BLOCK_N           = Config::BLOCK_N;
-    constexpr int NUM_K_TILES       = Config::NUM_K_TILES;
     constexpr int THREADS_PER_BLOCK = Config::THREADS_PER_BLOCK;
     constexpr int THREADS_PER_ROW   = Config::THREADS_PER_ROW;
     constexpr int WARPS_PER_BLOCK   = Config::WARPS_PER_BLOCK;
@@ -160,16 +175,16 @@ flash_attention_forward_kernel(
     const int start_row = block_m * BLOCK_M;
     if (start_row >= M) return;
 
-    int num_n_blocks = (N + BLOCK_N - 1) / BLOCK_N;
+    int num_n_tiles = (N + BLOCK_N - 1) / BLOCK_N;
     const int valid_q_rows = min(BLOCK_M, M - start_row);
 
     // Early loop limit n_blocks for causal
     if constexpr (IS_CAUSAL) {
         const int max_key_pos = start_row + valid_q_rows - 1;
         if (max_key_pos < 0) {
-            num_n_blocks = 0;
+            num_n_tiles = 0;
         } else {
-            num_n_blocks = min(num_n_blocks, (max_key_pos + BLOCK_N + 0) / BLOCK_N);
+            num_n_tiles = min(num_n_tiles, (max_key_pos + BLOCK_N + 0) / BLOCK_N);
         }
     }
     
@@ -186,13 +201,14 @@ flash_attention_forward_kernel(
     
     // Shared memory layout
     extern __shared__ char smem_raw[];
+    init_smem<Config>(smem_raw);
     auto& smem = *reinterpret_cast<typename Config::SmemLayout*>(smem_raw);
    
     __half* sQ      = smem.q;           // ← phase 0: load Q
     __half* sK      = smem.reuse_kv.k;  // ← phase 1: load K
-    __half* sV      = smem.reuse_kv.v;  // ← phase 2: load V (same address as sK!)
+    __half* sV      = smem.reuse_kv.v;  // ← phase 2: load V
     float*  sS      = smem.reuse_sp.s;  // ← phase 1: QK^T
-    __half* sP      = smem.reuse_sp.p;  // ← phase 2: softmax(P) (same addr as sS!)
+    __half* sP      = smem.reuse_sp.p;  // ← phase 2: softmax(P)
     float*  sO      = smem.o;           // ← phase 3: write to global
     float*  sRowMax = smem.row_max;
     float*  sRowSum = smem.row_sum;
@@ -202,20 +218,16 @@ flash_attention_forward_kernel(
     const int  q_stride_uint4 = (Q_STRIDE  + PER_UINT4 - 1) / PER_UINT4;
     const int kv_stride_uint4 = (KV_STRIDE + PER_UINT4 - 1) / PER_UINT4;
 
-    // Unified initialization: Q load + O zeroing + state buffers
+    // Unified initialization: Q load + state buffers
     const uint4* q_vec = reinterpret_cast<const uint4*>(q_ptr);
     uint4*      sQ_vec = reinterpret_cast<uint4*>(sQ);
-    float4*     sO_vec = reinterpret_cast<float4*>(sO);
 
     // Load sQ from global to smem
     store_u4_swizzle(q_vec, sQ_vec, valid_q_rows, d_stride_uint4, q_stride_uint4, lane_id, warp_id, WARPS_PER_BLOCK);
 
-    // Init sO with zero + stats
-    #pragma unroll
-    for (int i = tid; i < ((BLOCK_M * O_STRIDE) / 4); i += THREADS_PER_BLOCK) sO_vec[i] = make_float4(0.f, 0.f, 0.f, 0.f);
+    // Init state buffers
     if (tid < BLOCK_M) {
         sRowMax[tid] = NEG_INF;
-        sRowSum[tid] = 0.0f;
     }
     __syncthreads();
 
@@ -223,7 +235,7 @@ flash_attention_forward_kernel(
     // MAIN LOOP
     // ========================================================================
 
-    for (int block_n = 0; block_n < num_n_blocks; ++block_n) {
+    for (int block_n = 0; block_n < num_n_tiles; ++block_n) {
         const int start_col = block_n * BLOCK_N;
         if (start_col >= N) break;
         const int valid_k_rows = min(BLOCK_N, N - start_col);
@@ -240,21 +252,23 @@ flash_attention_forward_kernel(
         store_u4_swizzle(k_vec, sK_vec, valid_k_rows, d_stride_uint4, kv_stride_uint4, lane_id, warp_id, WARPS_PER_BLOCK);
         __syncthreads();
         
+        // ========================================================================
         // Compute S = Q @ K^T
-        const int num_tiles_m = (BLOCK_M + WMMA_M - 1) / WMMA_M;
-        const int num_tiles_n_actual = (valid_k_rows + WMMA_N - 1) / WMMA_N;
-        const int total_tiles = num_tiles_m * num_tiles_n_actual;
-        const int tiles_per_warp = (total_tiles + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
-
-        const unsigned row_causal = (lane_id & 0b1) + ((lane_id >> 2) & 0b1) * 8 + ((lane_id >> 4) & 0b1) * 4;
-        const unsigned col_causal = ((lane_id >> 1) & 0b1) * 2 + ((lane_id >> 3) & 0b1) * 8;
+        // ========================================================================
+        const int num_tiles_m_qk    = (BLOCK_M + WMMA_M - 1) / WMMA_M;   // ← Q @ K^T: along M
+        const int num_tiles_n_qk    = (BLOCK_N + WMMA_N - 1) / WMMA_N;   // ← Q @ K^T: along N
+        const int num_tiles_k_qk    = (D + WMMA_K - 1) / WMMA_K;         // ← Q @ K^T: inner along D
+        const int total_tiles_qk    = num_tiles_m_qk * num_tiles_n_qk;
+        const int tiles_per_warp_qk = (total_tiles_qk + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
+        const unsigned row_causal   = (lane_id & 0b1) + ((lane_id >> 2) & 0b1) * 8 + ((lane_id >> 4) & 0b1) * 4;
+        const unsigned col_causal   = ((lane_id >> 1) & 0b1) * 2 + ((lane_id >> 3) & 0b1) * 8;
         
-        for (int tile_idx = 0; tile_idx < tiles_per_warp; ++tile_idx) {
-            const int global_tile_idx = warp_id * tiles_per_warp + tile_idx;
-            if (global_tile_idx >= total_tiles) break;
+        for (int tile_idx = 0; tile_idx < tiles_per_warp_qk; ++tile_idx) {
+            const int global_tile_idx = warp_id * tiles_per_warp_qk + tile_idx;
+            if (global_tile_idx >= total_tiles_qk) break;
             
-            const int tile_m_idx = global_tile_idx / num_tiles_n_actual;
-            const int tile_n_idx = global_tile_idx % num_tiles_n_actual;
+            const int tile_m_idx = global_tile_idx / num_tiles_n_qk;
+            const int tile_n_idx = global_tile_idx % num_tiles_n_qk;
             
             const int tile_m = tile_m_idx * WMMA_M;
             const int tile_n = tile_n_idx * WMMA_N;
@@ -267,7 +281,7 @@ flash_attention_forward_kernel(
             fill_fragment(acc_frag, 0.0f);
             
             #pragma unroll
-            for (int k_tile = 0; k_tile < NUM_K_TILES; ++k_tile) {
+            for (int k_tile = 0; k_tile < num_tiles_k_qk; ++k_tile) {
                 const int k_offset = k_tile * WMMA_K;
                 if (k_offset >= D) break;
                 
@@ -299,23 +313,25 @@ flash_attention_forward_kernel(
                     acc_frag.x[i] *= softmax_scale;
                 }
             }
-            
             store_matrix_sync(sS + tile_m * S_STRIDE + tile_n, acc_frag, S_STRIDE, mem_row_major);
         }
         __syncthreads();
         
-        // Online Softmax + Scale output + Convert dS to half precision
+        // ========================================================================
+        // Compute Online Softmax + Scale
+        // ========================================================================        
         if (tid < valid_q_rows * THREADS_PER_ROW) {
             const int row = tid / THREADS_PER_ROW;
             const int thread_in_row = tid % THREADS_PER_ROW;
-            const unsigned mask = ((valid_q_rows == BLOCK_M) - 1U) & __activemask() | -(valid_q_rows == BLOCK_M);
+            const unsigned mask = (valid_q_rows == BLOCK_M) ? 0xFFFFFFFFU : __activemask();
+            const int row_leader = __ffs(mask) - 1;
 
             float*  sS_row_f = sS + row * S_STRIDE;
             __half* sP_row_h = sP + row * S_STRIDE;
     
-            const int vec_cols = valid_k_rows / 4;
+            const int vec_cols = valid_k_rows >> 2;
             const int vecs_per_thread = (vec_cols + THREADS_PER_ROW - 1) / THREADS_PER_ROW;
-            const int tail_start = vec_cols * 4;
+            const int tail_start = vec_cols << 2;
     
             // Phase 1: Max reduction with prefetch
             float thread_max = NEG_INF;
@@ -333,12 +349,11 @@ flash_attention_forward_kernel(
             // 1.1 warp reduction
             #pragma unroll
             for (int o = THREADS_PER_ROW / 2; o > 0; o >>= 1)
+                thread_max = fmaxf(thread_max, __shfl_down_sync(mask, thread_max, o, THREADS_PER_ROW));
 
-            thread_max = fmaxf(thread_max, __shfl_down_sync(mask, thread_max, o));
-    
-            const float old_max = sRowMax[row];
-            const float row_max = __shfl_sync(mask, thread_max, 0);
-            const float new_max = fmaxf(old_max, row_max);
+            const float row_max  = __shfl_sync(mask, thread_max, row_leader, THREADS_PER_ROW);    
+            const float old_max  = sRowMax[row];
+            const float new_max  = fmaxf(old_max, row_max);
             const float exp_diff = __expf(old_max - new_max);
     
             // Phase 2: Unified vectorized + tail processing
@@ -369,19 +384,19 @@ flash_attention_forward_kernel(
                 float v = (c < valid_k_rows) ? sS_row_f[c] : NEG_INF;
                 float e = __expf(fmaxf(v - new_max, -80.0f));
                 thread_sum += (c < valid_k_rows) ? e : 0.0f;
-                sP_row_h[c] = __float2half_rn(e);
+                sP_row_h[c] = (c < valid_k_rows) ? __float2half_rn(e) : __float2half(0.f);
             }
     
             #pragma unroll
             for (int o = THREADS_PER_ROW / 2; o > 0; o >>= 1)
-            thread_sum += __shfl_down_sync(mask, thread_sum, o);
+                thread_sum += __shfl_down_sync(mask, thread_sum, o, THREADS_PER_ROW);
     
-            float bcast_diff = exp_diff;
+            float row_sum = __shfl_sync(mask, thread_sum, row_leader, THREADS_PER_ROW);
+            
             if (thread_in_row == 0) {
-                sRowSum[row] = exp_diff * sRowSum[row] + thread_sum;
+                sRowSum[row] = exp_diff * sRowSum[row] + row_sum;
                 sRowMax[row] = new_max;
             }
-            bcast_diff = __shfl_sync(mask, bcast_diff, 0);
     
             // Phase 3: Vectorized writes
             h2_idx = 0;
@@ -400,20 +415,18 @@ flash_attention_forward_kernel(
     
             // Fused sO scaling
             if (block_n > 0) {
-                float* sO_row = sO + row * O_STRIDE;
+                float*  sO_row = sO + row * O_STRIDE;
                 float4* sO_vec = reinterpret_cast<float4*>(sO_row);
-        
                 const int o_vec_count = (O_STRIDE + 3) >> 2;
-                const int o_base = thread_in_row;
-                const int o_stride = THREADS_PER_ROW;
+                float scale = exp_diff;
         
                 #pragma unroll 4
-                for (int ov = o_base; ov < o_vec_count; ov += o_stride) {
+                for (int ov = thread_in_row; ov < o_vec_count; ov += THREADS_PER_ROW) {
                     float4 v = sO_vec[ov];
-                    v.x *= bcast_diff;
-                    v.y *= bcast_diff;
-                    v.z *= bcast_diff;
-                    v.w *= bcast_diff;
+                    v.x *= scale;
+                    v.y *= scale;
+                    v.z *= scale;
+                    v.w *= scale;
                    
                     sO_vec[ov] = v;
                 }
@@ -428,41 +441,43 @@ flash_attention_forward_kernel(
         store_u4_swizzle(v_vec, sV_vec, valid_k_rows, d_stride_uint4, kv_stride_uint4, lane_id, warp_id, WARPS_PER_BLOCK);
         __syncthreads();
 
+        // ========================================================================
         // Compute P @ V
-        const int num_tiles_m_pv = (BLOCK_M + WMMA_M - 1) / WMMA_M;
-        const int num_tiles_d = (D + WMMA_N - 1) / WMMA_N;
-        const int total_tiles_pv = num_tiles_m_pv * num_tiles_d;
-        const int tiles_per_warp_pv = (total_tiles_pv + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
+        // ========================================================================
+        const int num_tiles_m_pv    = (BLOCK_M + WMMA_M - 1) / WMMA_M;   // ← P @ V: along M
+        const int num_tiles_n_pv    = (D + WMMA_N - 1) / WMMA_N;         // ← P @ V: along D
+        const int num_tiles_k_pv    = (BLOCK_N + WMMA_K - 1) / WMMA_K;   // ← P @ V: inner along N
+        const int total_tiles_pv    = num_tiles_m_pv * num_tiles_n_pv;
+        const int tiles_per_warp_pv = (total_tiles_pv + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;      
         
         for (int tile_idx = 0; tile_idx < tiles_per_warp_pv; ++tile_idx) {
             const int global_tile_idx = warp_id * tiles_per_warp_pv + tile_idx;
             if (global_tile_idx >= total_tiles_pv) break;
             
-            const int tile_m_idx = global_tile_idx / num_tiles_d;
-            const int tile_d_idx = global_tile_idx % num_tiles_d;
+            const int tile_m_idx = global_tile_idx / num_tiles_n_pv;
+            const int tile_d_idx = global_tile_idx % num_tiles_n_pv;
             
             const int tile_m = tile_m_idx * WMMA_M;
             const int tile_d = tile_d_idx * WMMA_N;
             
             if (tile_m >= valid_q_rows) continue;
             
-            fragment<matrix_a, WMMA_M, WMMA_N, WMMA_K, half, row_major> p_frag;
-            fragment<matrix_b, WMMA_M, WMMA_N, WMMA_K, half, row_major> v_frag;
-            fragment<accumulator, WMMA_M, WMMA_N, WMMA_K, float> o_frag;
+            fragment<matrix_a, WMMA_M, WMMA_N, WMMA_K, half, row_major> a_frag;
+            fragment<matrix_b, WMMA_M, WMMA_N, WMMA_K, half, row_major> b_frag;
+            fragment<accumulator, WMMA_M, WMMA_N, WMMA_K, float> acc_frag;
             
-            load_matrix_sync(o_frag, sO + tile_m * O_STRIDE + tile_d, O_STRIDE, mem_row_major);
+            load_matrix_sync(acc_frag, sO + tile_m * O_STRIDE + tile_d, O_STRIDE, mem_row_major);
             
             #pragma unroll
-            for (int tile_k = 0; tile_k < (valid_k_rows + WMMA_K - 1) / WMMA_K; ++tile_k) {
+            for (int tile_k = 0; tile_k < num_tiles_k_pv; ++tile_k) {
                 const int k_offset = tile_k * WMMA_K;
                 if (k_offset >= valid_k_rows) break;
                 
-                load_matrix_sync(p_frag, sP + tile_m * S_STRIDE + k_offset, S_STRIDE);
-                load_matrix_sync(v_frag, sV + k_offset * KV_STRIDE + tile_d, KV_STRIDE);
-                mma_sync(o_frag, p_frag, v_frag, o_frag);
+                load_matrix_sync(a_frag, sP + tile_m * S_STRIDE + k_offset, S_STRIDE);
+                load_matrix_sync(b_frag, sV + k_offset * KV_STRIDE + tile_d, KV_STRIDE);
+                mma_sync(acc_frag, a_frag, b_frag, acc_frag);
             }
-            
-            store_matrix_sync(sO + tile_m * O_STRIDE + tile_d, o_frag, O_STRIDE, mem_row_major);
+            store_matrix_sync(sO + tile_m * O_STRIDE + tile_d, acc_frag, O_STRIDE, mem_row_major);
         }
         __syncthreads();
     }
@@ -474,7 +489,8 @@ flash_attention_forward_kernel(
         const int row = i / (D / 4);
         const int col = (i % (D / 4)) * 4;
 
-        const float inv_sum = 1.0f / sRowSum[row];
+        const float sum_clamped = fmaxf(sRowSum[row], 1e-24f);
+        const float inv_sum = 1.0f / sum_clamped;
         const float* sO_row = sO + row * O_STRIDE;
 
         const __half h0 = __float2half_rn(sO_row[col + 0] * inv_sum);
@@ -495,7 +511,7 @@ flash_attention_forward_kernel(
     }
     
     if (tid < valid_q_rows) {
-        float sum = fmaxf(sRowSum[tid], 1e-24f);
+        const float sum = fmaxf(sRowSum[tid], 1e-24f);
         softmax_lse_ptr[tid] = sRowMax[tid] + logf(sum);
     }
 }
