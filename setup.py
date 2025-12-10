@@ -93,7 +93,6 @@ setup(
     url="https://github.com/ai-bond/flash-attention-v100",
     classifiers=[
         "Programming Language :: Python :: 3",
-        "License :: OSI Approved :: BSD License",
         "Operating System :: Unix",
     ],
 )
