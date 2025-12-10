@@ -56,7 +56,7 @@ def _flash_attn_backward(
     rng_state: torch.Tensor = None,
 ) -> torch.Tensor:
     dout, q, k, v, out = map(maybe_contiguous, (dout, q, k, v, out))
-    grads = flash_attn_v100.bwd(
+    grads = flash_attn_v100_cuda.bwd(
         dout, q, k, v, out, softmax_lse,
         dq, dk, dv,
         alibi_slopes,

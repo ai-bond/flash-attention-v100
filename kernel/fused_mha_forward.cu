@@ -218,17 +218,20 @@ flash_attention_forward_kernel(
     const int  q_stride_uint4 = (Q_STRIDE  + PER_UINT4 - 1) / PER_UINT4;
     const int kv_stride_uint4 = (KV_STRIDE + PER_UINT4 - 1) / PER_UINT4;
 
-    // Unified initialization: Q load + state buffers
+    // Init state buffers
+    if (tid < BLOCK_M) {
+        sRowMax[tid] = NEG_INF;
+    }
+
+    // ========================================================================
+    // Load Q (into sQ)
+    // ========================================================================     
     const uint4* q_vec = reinterpret_cast<const uint4*>(q_ptr);
     uint4*      sQ_vec = reinterpret_cast<uint4*>(sQ);
 
     // Load sQ from global to smem
     store_u4_swizzle(q_vec, sQ_vec, valid_q_rows, d_stride_uint4, q_stride_uint4, lane_id, warp_id, WARPS_PER_BLOCK);
-
-    // Init state buffers
-    if (tid < BLOCK_M) {
-        sRowMax[tid] = NEG_INF;
-    }
+        
     __syncthreads();
 
     // ========================================================================
@@ -245,7 +248,9 @@ flash_attention_forward_kernel(
             if (start_col >= start_row + valid_q_rows) { continue; }
         }
 
-        // Load K from gobal into smem
+        // ========================================================================
+        // Load K (into reuse_kv.k)
+        // ========================================================================
         const uint4* k_vec  = reinterpret_cast<const uint4*>(k_ptr + start_col * D);
               uint4* sK_vec = reinterpret_cast<uint4*>(sK);
 
@@ -434,7 +439,9 @@ flash_attention_forward_kernel(
         }
         __syncthreads();
         
-        // Load V from global to smem
+        // ========================================================================
+        // Load V (into reuse_kv.v)
+        // ========================================================================
         const uint4* v_vec  = reinterpret_cast<const uint4*>(v_ptr + start_col * D);
               uint4* sV_vec = reinterpret_cast<uint4*>(sV);
 
@@ -482,7 +489,9 @@ flash_attention_forward_kernel(
         __syncthreads();
     }
     
-    // Store final Sum to global memory
+    // ========================================================================
+    // Store final sO to global memory
+    // ======================================================================== 
     const int total_fp16_x4 = (valid_q_rows * D) / 4;
     
     for (int i = tid; i < total_fp16_x4; i += THREADS_PER_BLOCK) {

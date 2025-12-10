@@ -1,6 +1,6 @@
 [build-system]
 requires = [
-    "setuptools>=61",
+    "setuptools>=77.0.3",
     "wheel",
     "packaging"
 ]
@@ -18,6 +18,11 @@ dependencies = [
     "packaging",
     "ninja"
 ]
+
+license = "BSD-3-Clause"
+license-files = ["LICENSE", "AUTHORS"]
+
+dynamic = ["authors", "classifiers", "urls"]
 
 [tool.setuptools]
 packages = ["flash_attn_v100"]
