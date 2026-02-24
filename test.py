@@ -122,7 +122,6 @@ def measure_gpu_memory(kernel_func):
     return peak_mem_bytes / (1024 * 1024)  # MB
 
 def test_combined():
-    # Реалистичные конфигурации из LLM (совместимые с ядром)
     test_cases = [
         # GPT-2 / OPT / Falcon style (D=64)
         (1, 1, 16, 16, 16),
@@ -316,7 +315,6 @@ def test_combined():
             else:
                 print("  ✅ Backward gradients match OK")
 
-            # --- Вывод производительности ---
             print("Performance:")
 
             # Total memory comparison with delta and %
