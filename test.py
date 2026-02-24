@@ -73,11 +73,11 @@ def report_tensor_stats(name, tensor):
 def format_performance_comparison(custom_time, ref_time):
     if custom_time <= 0 or ref_time <= 0:
         return "N/A", "N/A", "N/A"
-    
+
     speedup = ref_time / custom_time
     slowdown = custom_time / ref_time
     time_diff_percent = (custom_time - ref_time) / ref_time * 100
-    
+
     return speedup, slowdown, time_diff_percent
 
 def benchmark_kernel(kernel_func, num_warmup=0, num_runs=10):
@@ -150,7 +150,7 @@ def test_combined():
 
             print(f"\n{'='*70}")
             print(f"Test: B={B}, H={H}, M={M}, N={N}, D={D}, causal={causal}")
-            
+
             # For represent
             torch.manual_seed(421)
 
@@ -164,30 +164,32 @@ def test_combined():
 
             # Check for contiguous
             q, k, v, dO = map(ensure_contiguous, (q, k, v, dO))
-            
+
             # Unique buffers for ref/cuda forward+backward
             o_ref = torch.empty(B, H, M, D, device='cuda', dtype=torch.float16)
             o_custom = torch.empty(B, H, M, D, device='cuda', dtype=torch.float16)
-            
+
             softmax_lse_ref = torch.empty(B, H, M, device='cuda', dtype=torch.float32)
             softmax_lse_custom = torch.empty(B, H, M, device='cuda', dtype=torch.float32)
-            
+
             dQ_ref = torch.empty(B, H, M, D, device='cuda', dtype=torch.float16)
             dK_ref = torch.empty(B, H, N, D, device='cuda', dtype=torch.float16)
             dV_ref = torch.empty(B, H, N, D, device='cuda', dtype=torch.float16)
-            
+
             dQ_custom = torch.empty(B, H, M, D, device='cuda', dtype=torch.float16)
             dK_custom = torch.empty(B, H, N, D, device='cuda', dtype=torch.float16)
-            dV_custom = torch.empty(B, H, N, D, device='cuda', dtype=torch.float16)      
-            
+            dV_custom = torch.empty(B, H, N, D, device='cuda', dtype=torch.float16)
+
             # Check for contiguous
             buffers = [o_ref, o_custom, softmax_lse_ref, softmax_lse_custom, dQ_ref, dK_ref, dV_ref, dQ_custom, dK_custom, dV_custom]
             o_ref, o_custom, softmax_lse_ref, softmax_lse_custom, dQ_ref, dK_ref, dV_ref, dQ_custom, dK_custom, dV_custom = map(ensure_contiguous, buffers)
 
             # Clean cache before PyTorch
             torch.cuda.empty_cache()
+            torch.cuda.synchronize()
             gc.collect()
             time.sleep(0.5)
+            torch.cuda.reset_peak_memory_stats()
 
             # Run PyTorch forward+backward
             def run_ref_fwd():
@@ -209,8 +211,10 @@ def test_combined():
 
             # Clean cache before Cuda
             torch.cuda.empty_cache()
+            torch.cuda.synchronize()
             gc.collect()
             time.sleep(0.5)
+            torch.cuda.reset_peak_memory_stats()
 
             # Run Cuda forward+backward
             def run_custom_fwd():
@@ -305,8 +309,8 @@ def test_combined():
                         mean_diff = diff.mean().item()
                         rel_err = (diff / (ref.abs() + 1e-12)).max().item()
                         print(f"  {name}: ❌ max_diff={max_diff:.6e}, mean_diff={mean_diff:.6e}, max_rel_err={rel_err:.6e}")
-                        print(f"     [PyTorch] sample: {o_ref[0,0,0,:7].cpu().numpy()}")
-                        print(f"     [ CUDA  ] sample: {o_custom[0,0,0,:7].cpu().numpy()}")
+                        print(f"     [PyTorch] sample: {ref[0,0,0,:7].cpu().numpy()}")
+                        print(f"     [ CUDA  ] sample: {custom[0,0,0,:7].cpu().numpy()}")
                         print(f"     [ Error ] Max diff at idx={idx}: PyTorch={ref.flatten()[idx].item():.6e}, CUDA={custom.flatten()[idx].item():.6e}")
                     else:
                         print(f"  {name}: ✅ OK")
@@ -348,11 +352,11 @@ if __name__ == "__main__":
     if not torch.cuda.is_available():
         print("CUDA not available")
         exit(1)
-    
+
     cap = torch.cuda.get_device_capability()
     if cap < (7, 0):
         print(f"⚠️  Warning: device capability {cap} < (7,0). Volta (e.g., V100) required.")
-    
+
     print(f"Running on {torch.cuda.get_device_name()} (capability {cap})")
 
     success = test_combined()

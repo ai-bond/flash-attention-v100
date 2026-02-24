@@ -408,17 +408,17 @@ flash_attention_backward_dq_kernel(
 
         for (int tile_idx = 0; tile_idx < tiles_per_warp_dov; ++tile_idx) {
             const int global_tile_idx = warp_id * tiles_per_warp_dov + tile_idx;
-            
+
             if (global_tile_idx >= total_tiles_dov) break;
-            
+
             const int tile_m_idx = global_tile_idx / num_tiles_n_dov;
             const int tile_n_idx = global_tile_idx % num_tiles_n_dov;
-            
+
             const int tile_m = tile_m_idx * WMMA_M;
             const int tile_n = tile_n_idx * WMMA_N;
-            
+
             if (tile_m >= valid_q_rows || tile_n >= valid_k_rows) continue;
-            
+
             fragment<matrix_a, WMMA_M, WMMA_N, WMMA_K, __half, row_major> a_frag;
             fragment<matrix_b, WMMA_M, WMMA_N, WMMA_K, __half, col_major> b_frag;
             fragment<accumulator, WMMA_M, WMMA_N, WMMA_K, float> acc_frag;
@@ -466,20 +466,20 @@ flash_attention_backward_dq_kernel(
         const int tiles_per_warp_qk = (total_tiles_qk + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
         const unsigned row_causal   = (lane_id & 0b1) + ((lane_id >> 2) & 0b1) * 8 + ((lane_id >> 4) & 0b1) * 4;
         const unsigned col_causal   = ((lane_id >> 1) & 0b1) * 2 + ((lane_id >> 3) & 0b1) * 8;
-       
+
         for (int tile_idx = 0; tile_idx < tiles_per_warp_qk; ++tile_idx) {
             const int global_tile_idx = warp_id * tiles_per_warp_qk + tile_idx;
-            
+
             if (global_tile_idx >= total_tiles_qk) break;
-            
+
             const int tile_m_idx = global_tile_idx / num_tiles_n_qk;
             const int tile_n_idx = global_tile_idx % num_tiles_n_qk;
-            
+
             const int tile_m = tile_m_idx * WMMA_M;
             const int tile_n = tile_n_idx * WMMA_N;
-            
+
             if (tile_m >= valid_q_rows || tile_n >= valid_k_rows) continue;
-            
+
             fragment<matrix_a, WMMA_M, WMMA_N, WMMA_K, __half, row_major> a_frag;
             fragment<matrix_b, WMMA_M, WMMA_N, WMMA_K, __half, col_major> b_frag;
             fragment<accumulator, WMMA_M, WMMA_N, WMMA_K, float> acc_frag;
@@ -501,13 +501,13 @@ flash_attention_backward_dq_kernel(
                 for (int i = 0; i < acc_frag.num_elements; ++i) {
                     const unsigned col = col_causal + (i & 0b1) + ((i >> 2) & 0b1) * 4;
                     const unsigned row = row_causal + ((i >> 1) & 0b1) * 2;
-            
+
                     const int global_m = start_row + tile_m + row;
                     const int global_n = start_col + tile_n + col;
-                    
+
                     const bool is_valid = (global_m < start_row + valid_q_rows) &&
                                           (global_n < start_col + valid_k_rows);
-            
+
                     acc_frag.x[i] = is_valid
                         ? ((global_n > global_m) ? NEG_INF : acc_frag.x[i] * softmax_scale)
                         : NEG_INF;
@@ -609,7 +609,7 @@ flash_attention_backward_dq_kernel(
         const int num_tiles_k_dq    = (BLOCK_N + WMMA_K - 1) / WMMA_K;   // ← dS @ K: inner along N
         const int total_tiles_dq    = num_tiles_m_dq * num_tiles_n_dq;
         const int tiles_per_warp_dq = (total_tiles_dq + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
-        
+
         for (int tile_local = 0; tile_local < tiles_per_warp_dq; ++tile_local) {
             const int global_tile_idx = warp_id * tiles_per_warp_dq + tile_local;
             if (global_tile_idx >= total_tiles_dq) break;
@@ -647,7 +647,6 @@ flash_attention_backward_dq_kernel(
             store_matrix_sync(sdQ + tile_m * Q_STRIDE + tile_n, curr_frag, Q_STRIDE, mem_row_major);
         }
         __syncthreads();
-       
     }
 
     // ========================================================================
@@ -829,9 +828,9 @@ flash_attention_backward_dkv_kernel(
 
             const int tile_m = tile_m_idx * WMMA_M;
             const int tile_n = tile_n_idx * WMMA_N;
-            
+
             if (tile_m >= valid_q_rows || tile_n >= valid_kv_rows) continue;
-            
+
             fragment<matrix_a, WMMA_M, WMMA_N, WMMA_K, half, row_major> a_frag;
             fragment<matrix_b, WMMA_M, WMMA_N, WMMA_K, half, col_major> b_frag;
             fragment<accumulator, WMMA_M, WMMA_N, WMMA_K, float> acc_frag;
