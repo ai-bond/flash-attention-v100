@@ -11,7 +11,6 @@ from setuptools import setup
 this_dir = Path(__file__).parent.resolve()
 
 def get_ext_modules():
-    # Импортируем torch и CUDAExtension ТОЛЬКО при необходимости
     try:
         from torch.utils.cpp_extension import CUDAExtension
     except ImportError as e:
@@ -78,7 +77,7 @@ except FileNotFoundError:
 
 setup(
     name="flash_attn_v100",
-    version="25.11",
+    version="26.02",
     packages=["flash_attn_v100"],
     ext_modules=get_ext_modules(),
     cmdclass=get_cmdclass(),
