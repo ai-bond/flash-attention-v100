@@ -61,24 +61,24 @@ using namespace nvcuda::wmma;
 // ============================================================================
 // CONFIGURATIONS DKV
 // ============================================================================
-#define BLOCK_KV_16  64
-#define BLOCK_Q_16   64
-#define WARPS_DKV_16 8
+#define BLOCK_KV_16  32
+#define BLOCK_Q_16   224
+#define WARPS_DKV_16 14
 
 #define BLOCK_KV_32  32
-#define BLOCK_Q_32   64
-#define WARPS_DKV_32 16
+#define BLOCK_Q_32   192
+#define WARPS_DKV_32 12
 
 #define BLOCK_KV_64  32
-#define BLOCK_Q_64   96
-#define WARPS_DKV_64 12
+#define BLOCK_Q_64   128
+#define WARPS_DKV_64  8
 
 #define BLOCK_KV_128  16
-#define BLOCK_Q_128   96
+#define BLOCK_Q_128   144
 #define WARPS_DKV_128 12
 
 #define BLOCK_KV_256  16
-#define BLOCK_Q_256   32
+#define BLOCK_Q_256   64
 #define WARPS_DKV_256 16
 
 // ============================================================================
