@@ -66,7 +66,7 @@ struct KernelConfig {
     static constexpr int BLOCK_M = (D == 16) ? BLOCK_M_16 : (D == 32) ? BLOCK_M_32 : (D == 64) ? BLOCK_M_64 : (D == 128) ? BLOCK_M_128 : BLOCK_M_256;
     static constexpr int BLOCK_N = (D == 16) ? BLOCK_N_16 : (D == 32) ? BLOCK_N_32 : (D == 64) ? BLOCK_N_64 : (D == 128) ? BLOCK_N_128 : BLOCK_N_256;
     static constexpr int WARPS_PER_BLOCK = (D == 16) ? WARPS_16 : (D == 32) ? WARPS_32 : (D == 64) ? WARPS_64 : (D == 128) ? WARPS_128 : WARPS_256;
-    
+
     static constexpr int THREADS_PER_BLOCK = WARPS_PER_BLOCK * MAX_THREADS_PER_WARP;
     static constexpr int THREADS_PER_ROW   = THREADS_PER_BLOCK / BLOCK_M;
     static constexpr int PAD               = (8 - (D % 32) + 32) % 32;
@@ -93,33 +93,6 @@ struct KernelConfig {
 
     static constexpr size_t TOTAL_SMEM = ((sizeof(SmemLayout) + 127) & ~size_t(127)); 
 };
-
-// ============================================================================
-// LANE SWIZZLE (layout-preserving 8×4)
-// ============================================================================
-__device__ __forceinline__ void store_u4_swizzle(
-    const uint4* g_vec, uint4* s_vec, int rows, int vec_per_row, int stride_u4, int lane_id, int warp_id, int total_warps) {
-    const int ROW_GROUP = 8;
-    for (int base_row = warp_id * ROW_GROUP; base_row < rows; base_row += total_warps * ROW_GROUP) {
-        const int r = lane_id % ROW_GROUP;
-        const int c = lane_id / ROW_GROUP;
-        const int row = base_row + r;
-        if (row >= rows) continue;
-
-        for (int col0 = 0; col0 < vec_per_row; col0 += 4) {
-            int cg = min(4, vec_per_row - col0);
-            int c_eff = (cg == 4) ? (c ^ (r & 3)) : ((c + r) % cg);
-            if (c_eff >= cg) continue;
-
-            int col = col0 + c_eff;
-            uint4 val = make_uint4(0, 0, 0, 0);
-            if (row < rows && col < vec_per_row) {
-                val = __ldg(&g_vec[row * vec_per_row + col]);
-            }
-            s_vec[row * stride_u4 + col] = val;
-        }
-    }
-}
 
 // ============================================================================
 // INIT SMEM LAYOUT
@@ -167,10 +140,10 @@ flash_attention_forward_kernel(
     constexpr int O_STRIDE          = Config::O_STRIDE;
     constexpr int PER_UINT4         = Config::PER_UINT4;
     const float NEG_INF = -1e30f;
-    
+
     const int batch_head_id = blockIdx.z;
     if (batch_head_id >= B * H) return;
-    
+
     const int block_m = blockIdx.x;
     const int start_row = block_m * BLOCK_M;
     if (start_row >= M) return;
@@ -225,13 +198,20 @@ flash_attention_forward_kernel(
 
     // ========================================================================
     // Load Q (into sQ)
-    // ========================================================================     
-    const uint4* q_vec = reinterpret_cast<const uint4*>(q_ptr);
-    uint4*      sQ_vec = reinterpret_cast<uint4*>(sQ);
+    // ========================================================================
+    const uint4*      q_vec = reinterpret_cast<const uint4*>(q_ptr);
+    uint4*           sQ_vec = reinterpret_cast<uint4*>(sQ);
 
-    // Load sQ from global to smem
-    store_u4_swizzle(q_vec, sQ_vec, valid_q_rows, d_stride_uint4, q_stride_uint4, lane_id, warp_id, WARPS_PER_BLOCK);
-
+    #pragma unroll 4
+    for (int idx = tid; idx < (valid_q_rows * d_stride_uint4); idx += THREADS_PER_BLOCK) {
+        const int row = idx / d_stride_uint4;
+        const int vec_col = idx % d_stride_uint4;
+        uint4 q_val = make_uint4(0, 0, 0, 0);
+        if (row < valid_q_rows && vec_col < d_stride_uint4) {
+            q_val = __ldg(&q_vec[row * d_stride_uint4 + vec_col]);
+        }
+        sQ_vec[row * q_stride_uint4 + vec_col] = q_val;
+    }
     __syncthreads();
 
     // ========================================================================
@@ -249,12 +229,22 @@ flash_attention_forward_kernel(
         }
 
         // ========================================================================
-        // Load K (into reuse_kv.k)
+        // Load K (into sK)
         // ========================================================================
-        const uint4* k_vec  = reinterpret_cast<const uint4*>(k_ptr + start_col * D);
-              uint4* sK_vec = reinterpret_cast<uint4*>(sK);
+        const uint4* k_vec     = reinterpret_cast<const uint4*>(k_ptr + start_col * D);
+        uint4*       sK_vec    = reinterpret_cast<uint4*>(sK);
 
-        store_u4_swizzle(k_vec, sK_vec, valid_k_rows, d_stride_uint4, kv_stride_uint4, lane_id, warp_id, WARPS_PER_BLOCK);
+        #pragma unroll 2
+        for (int idx = tid; idx < (valid_k_rows * d_stride_uint4); idx += THREADS_PER_BLOCK) {
+            const int row = idx / d_stride_uint4;
+            const int vec_col = idx % d_stride_uint4;
+
+            uint4 k_val = make_uint4(0, 0, 0, 0);
+            if (row < valid_k_rows && vec_col < d_stride_uint4) {
+                k_val = __ldg(&k_vec[row * d_stride_uint4 + vec_col]);
+            }
+            sK_vec[row * kv_stride_uint4 + vec_col] = k_val;
+        }
         __syncthreads();
 
         // ========================================================================
@@ -440,12 +430,22 @@ flash_attention_forward_kernel(
         __syncthreads();
 
         // ========================================================================
-        // Load V (into reuse_kv.v)
+        // Load V (into sV)
         // ========================================================================
-        const uint4* v_vec  = reinterpret_cast<const uint4*>(v_ptr + start_col * D);
-              uint4* sV_vec = reinterpret_cast<uint4*>(sV);
+        const uint4* v_vec     = reinterpret_cast<const uint4*>(v_ptr + start_col * D);
+        uint4*       sV_vec    = reinterpret_cast<uint4*>(sV);
 
-        store_u4_swizzle(v_vec, sV_vec, valid_k_rows, d_stride_uint4, kv_stride_uint4, lane_id, warp_id, WARPS_PER_BLOCK);
+        #pragma unroll 2
+        for (int idx = tid; idx < (valid_k_rows * d_stride_uint4); idx += THREADS_PER_BLOCK) {
+            const int row = idx / d_stride_uint4;
+            const int vec_col = idx % d_stride_uint4;
+
+            uint4 v_val = make_uint4(0, 0, 0, 0);
+            if (row < valid_k_rows && vec_col < d_stride_uint4) {
+                v_val = __ldg(&v_vec[row * d_stride_uint4 + vec_col]);
+            }
+            sV_vec[row * kv_stride_uint4 + vec_col] = v_val;
+        }
         __syncthreads();
 
         // ========================================================================
