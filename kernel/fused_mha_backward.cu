@@ -325,12 +325,13 @@ flash_attention_backward_dq_kernel(
                 : "memory"
             );
 
-            const __half* dO_addr = dO_ptr + row * D + col;
+            const __half* dO_addr = sdO + row * Q_STRIDE + col;
             ushort d_h0, d_h1, d_h2, d_h3;
+            const uint32_t ptr_dO = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(__cvta_generic_to_shared(dO_addr)));
             asm volatile(
-                "ld.global.v4.u16 {%0, %1, %2, %3}, [%4];"
+                "ld.shared.v4.u16 {%0, %1, %2, %3}, [%4];"
                 : "=h"(d_h0), "=h"(d_h1), "=h"(d_h2), "=h"(d_h3)
-                : "l"(dO_addr)
+                : "r"(ptr_dO)
                 : "memory"
             );
 
@@ -910,7 +911,7 @@ flash_attention_backward_dkv_kernel(
 
         // ========================================================================
         // Compute row_dot = O ⊙ dO
-        // ========================================================================        
+        // ========================================================================
         const __half* current_o_ptr = o_ptr + start_col * D;
 
         if (tid < valid_q_rows * THREADS_PER_ROW) {
@@ -926,22 +927,41 @@ flash_attention_backward_dkv_kernel(
             for (int j = 0; j < work_per_thread; ++j) {
                 const int chunk_idx = thread_in_row + j * THREADS_PER_ROW;
                 if (chunk_idx >= fp16_x4_per_row) break;
-
                 const int col = chunk_idx * 4;
 
                 const half* o_addr = current_o_ptr + row * D + col;
+                ushort o_h0, o_h1, o_h2, o_h3;
+                asm volatile(
+                    "ld.global.v4.u16 {%0, %1, %2, %3}, [%4];"
+                    : "=h"(o_h0), "=h"(o_h1), "=h"(o_h2), "=h"(o_h3)
+                    : "l"(o_addr)
+                    : "memory"
+                );
+
                 const half* dO_addr = sdO + row * Q_STRIDE + col;
+                ushort d_h0, d_h1, d_h2, d_h3;
+                const uint32_t ptr_dO = static_cast<uint32_t>(__cvta_generic_to_shared(dO_addr));
+                asm volatile(
+                    "ld.shared.v4.u16 {%0, %1, %2, %3}, [%4];"
+                    : "=h"(d_h0), "=h"(d_h1), "=h"(d_h2), "=h"(d_h3)
+                    : "r"(ptr_dO)
+                    : "memory"
+                );
 
-                ushort o0, o1, o2, o3;
-                asm volatile("ld.global.v4.u16 {%0, %1, %2, %3}, [%4];"
-                    : "=h"(o0), "=h"(o1), "=h"(o2), "=h"(o3) : "l"(o_addr) : "memory");
+                const float fo_0 = __half2float(__ushort_as_half(o_h0));
+                const float fo_1 = __half2float(__ushort_as_half(o_h1));
+                const float fo_2 = __half2float(__ushort_as_half(o_h2));
+                const float fo_3 = __half2float(__ushort_as_half(o_h3));
 
-                const __half d0 = dO_addr[0], d1 = dO_addr[1], d2 = dO_addr[2], d3 = dO_addr[3];
+                const float fd_0 = __half2float(__ushort_as_half(d_h0));
+                const float fd_1 = __half2float(__ushort_as_half(d_h1));
+                const float fd_2 = __half2float(__ushort_as_half(d_h2));
+                const float fd_3 = __half2float(__ushort_as_half(d_h3));
 
-                thread_dot = __fmaf_rn(__half2float(__ushort_as_half(o0)), __half2float(d0), thread_dot);
-                thread_dot = __fmaf_rn(__half2float(__ushort_as_half(o1)), __half2float(d1), thread_dot);
-                thread_dot = __fmaf_rn(__half2float(__ushort_as_half(o2)), __half2float(d2), thread_dot);
-                thread_dot = __fmaf_rn(__half2float(__ushort_as_half(o3)), __half2float(d3), thread_dot);
+                thread_dot = __fmaf_rn(fo_0, fd_0, thread_dot);
+                thread_dot = __fmaf_rn(fo_1, fd_1, thread_dot);
+                thread_dot = __fmaf_rn(fo_2, fd_2, thread_dot);
+                thread_dot = __fmaf_rn(fo_3, fd_3, thread_dot);
             }
 
             #pragma unroll
