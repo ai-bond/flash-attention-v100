@@ -1012,18 +1012,27 @@ flash_attention_backward_dkv_kernel(
 
             const int row0 = linear_idx0 / BLOCK_M;
             const int col0 = linear_idx0 % BLOCK_M;
-            const int row1 = (linear_idx1 < total_elements) ? linear_idx1 / BLOCK_M : row0;
-            const int col1 = (linear_idx1 < total_elements) ? linear_idx1 % BLOCK_M : col0 + 1;
+            const bool has_pair = (linear_idx1 < total_elements);
+            const int row1 = has_pair ? linear_idx1 / BLOCK_M : row0;
+            const int col1 = has_pair ? linear_idx1 % BLOCK_M : col0 + 1;
 
             // Load S and dOV
             float s0 = 0.0f, s1 = 0.0f;
             float dov0 = 0.0f, dov1 = 0.0f;
 
-            bool valid0 = (row0 < valid_q_rows && col0 < valid_kv_rows);
-            bool valid1 = (linear_idx1 < total_elements && row1 < valid_q_rows && col1 < valid_kv_rows);
+            const bool in_bounds0 = (row0 < valid_q_rows) && (col0 < valid_kv_rows);
+            const bool causal_ok0 = !IS_CAUSAL || ((start_kv + col0) <= (start_col + row0));
+            const bool valid0 = in_bounds0 && causal_ok0;
 
-            if (valid0) { s0 = sS[row0 * S_STRIDE + col0]; dov0 = sdOV[row0 * S_STRIDE + col0]; }
-            if (valid1) { s1 = sS[row1 * S_STRIDE + col1]; dov1 = sdOV[row1 * S_STRIDE + col1]; }
+            bool valid1 = false;
+            if (has_pair) {
+                const bool in_bounds1 = (row1 < valid_q_rows) && (col1 < valid_kv_rows);
+                const bool causal_ok1 = !IS_CAUSAL || ((start_kv + col1) <= (start_col + row1));
+                valid1 = in_bounds1 && causal_ok1;
+            }
+
+            if (valid0) { s0 = sS[row0 * S_STRIDE + col0]; dov0 = sdOV[row0 * S_STRIDE + col0]; } else { s0 = NEG_INF; }
+            if (valid1) { s1 = sS[row1 * S_STRIDE + col1]; dov1 = sdOV[row1 * S_STRIDE + col1]; } else { s1 = NEG_INF; }
 
             float lse0 = sLse[row0];
             float lse1 = (valid1 && row1 != row0) ? sLse[row1] : lse0;
