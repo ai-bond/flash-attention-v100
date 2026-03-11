@@ -126,15 +126,18 @@ struct dQKernelConfig {
 template<typename Config>
 __device__ __forceinline__ void init_smem(char* smem_raw) {
     constexpr int N_U4 = Config::TOTAL_SMEM / 16;
-    const int lane_id = threadIdx.x & 31;
+    const int tid = threadIdx.x;
+    const int stride = blockDim.x;
 
     uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_raw));
-    #pragma unroll 1
-    for (int i = lane_id; i < N_U4; i += 32) {
-        asm volatile("st.shared.v4.u32 [%0], {%1,%1,%1,%1};"
-                     :: "r"(addr + (i << 4)), "r"(0) : "memory");
+
+    #pragma unroll 4
+    for (int i = tid; i < N_U4; i += stride) {
+        asm volatile("st.shared.v4.u32 [%0], {0x0, 0x0, 0x0, 0x0};"
+                     :: "r"(addr + (i << 4))
+                     : "memory");
     }
-    __syncwarp();
+    __syncthreads();
 }
 
 // ============================================================================
