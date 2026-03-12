@@ -20,6 +20,8 @@ using namespace nvcuda::wmma;
 #define WMMA_N 16
 #define WMMA_K 16
 
+#define NEG_INF                 (-1e30f)
+
 #define MAX_THREADS_PER_WARP    32
 #define MAX_THREADS_PER_SM      2048
 #define MAX_THREAD_BLOCK_SIZE   1024
@@ -98,7 +100,7 @@ struct dQKernelConfig {
     static constexpr int S_STRIDE           = BLOCK_N + PAD;
     static constexpr int PER_UINT4          = 8;
     static constexpr int NUM_UINT4_Q_BLOCK  = BLOCK_M * ((D + PER_UINT4 - 1) / PER_UINT4);
-    static constexpr int NUM_UINT4_KV_BLOCK = BLOCK_N * ((D + PER_UINT4 - 1) / PER_UINT4); 
+    static constexpr int NUM_UINT4_KV_BLOCK = BLOCK_N * ((D + PER_UINT4 - 1) / PER_UINT4);
 
     struct alignas(128) SmemLayout {
         union {
@@ -162,7 +164,7 @@ struct dKVKernelConfig {
     struct alignas(128) SmemLayout {
             alignas(16) __half k     [BLOCK_M * KV_STRIDE];
             alignas(16) __half v     [BLOCK_M * KV_STRIDE];
-        union { 
+        union {
             alignas(16) __half dO    [BLOCK_N * Q_STRIDE];
             alignas(16) __half q     [BLOCK_N * Q_STRIDE];
         } reuse_qdO;
@@ -216,22 +218,20 @@ flash_attention_backward_dq_kernel(
     constexpr int NUM_UINT4_Q_BLOCK  = Config::NUM_UINT4_Q_BLOCK;
     constexpr int NUM_UINT4_KV_BLOCK = Config::NUM_UINT4_KV_BLOCK;
 
-    const float NEG_INF = -1e30f;
-
-    // Thread and block indices
+    // head index (batch * num_heads + head)
     const int batch_head_id = blockIdx.z;
     if (batch_head_id >= B * H) return;
 
-    const int block_m   = blockIdx.x;
-    const int start_row = block_m * BLOCK_M;
-    if (start_row >= M) return;
+    const int block_idx = blockIdx.x;
+    const int start_q = block_idx * BLOCK_M;
+    if (start_q >= M) return;
 
     int num_n_tiles = (N + BLOCK_N - 1) / BLOCK_N;
-    const int valid_q_rows = min(BLOCK_M, M - start_row);
+    const int valid_q_rows = min(BLOCK_M, M - start_q);
 
     // Early loop limit n_blocks for causal
     if constexpr (IS_CAUSAL) {
-        const int max_key_pos = start_row + valid_q_rows - 1;
+        const int max_key_pos = start_q + valid_q_rows - 1;
         if (max_key_pos < 0) {
             num_n_tiles = 0;
         } else {
@@ -244,13 +244,13 @@ flash_attention_backward_dq_kernel(
     const int lane_id      = tid % MAX_THREADS_PER_WARP;
 
     // Global pointers
-    const __half* q_ptr   = Q           + (size_t)batch_head_id * M * D + start_row * D;
+    const __half* q_ptr   = Q           + (size_t)batch_head_id * M * D + start_q * D;
     const __half* k_ptr   = K           + (size_t)batch_head_id * N * D;
     const __half* v_ptr   = V           + (size_t)batch_head_id * N * D;
-    const __half* o_ptr   = O           + (size_t)batch_head_id * M * D + start_row * D;
-    const __half* dO_ptr  = dO          + (size_t)batch_head_id * M * D + start_row * D;
-          __half* dQ_ptr  = dQ          + (size_t)batch_head_id * M * D + start_row * D;
-    const float*  lse_ptr = softmax_lse + (size_t)batch_head_id * M + start_row;
+    const __half* o_ptr   = O           + (size_t)batch_head_id * M * D + start_q * D;
+    const __half* dO_ptr  = dO          + (size_t)batch_head_id * M * D + start_q * D;
+          __half* dQ_ptr  = dQ          + (size_t)batch_head_id * M * D + start_q * D;
+    const float*  lse_ptr = softmax_lse + (size_t)batch_head_id * M + start_q;
 
     // Shared memory layout
     extern __shared__ char smem_raw[];
@@ -366,24 +366,22 @@ flash_attention_backward_dq_kernel(
     __syncthreads();
 
     // ========================================================================
-    // MAIN LOOP
+    // MAIN LOOP (iterates over K/V blocks for current Q block)
     // ========================================================================
-
-    // Iterate over K/V blocks
-    for (int block_n = 0; block_n < num_n_tiles; ++block_n) {
-        const int start_col = block_n * BLOCK_N;
-        if (start_col >= N) break;
-        const int valid_k_rows = min(BLOCK_N, N - start_col);
+    for (int block = 0; block < num_n_tiles; ++block) {
+        const int start_kv = block * BLOCK_N;
+        if (start_kv >= N) break;
+        const int valid_kv_rows = min(BLOCK_N, N - start_kv);
 
         // Early skip per tile
         if constexpr (IS_CAUSAL) {
-            if (start_col >= start_row + valid_q_rows) { continue; }
+            if (start_kv >= start_q + valid_q_rows) { continue; }
         }
 
         // ========================================================================
         // Load V (into sK alias)
         // ========================================================================
-        const uint4* v_vec        = reinterpret_cast<const uint4*>(v_ptr + start_col * D);
+        const uint4* v_vec        = reinterpret_cast<const uint4*>(v_ptr + start_kv * D);
         uint4*       sV_vec       = reinterpret_cast<uint4*>(sV);
 
         #pragma unroll 2
@@ -391,7 +389,7 @@ flash_attention_backward_dq_kernel(
             const int row = idx / d_stride_uint4;
             const int vec_col = idx % d_stride_uint4;
             uint4 v_val = make_uint4(0, 0, 0, 0);
-            if (row < valid_k_rows && vec_col < d_stride_uint4) {
+            if (row < valid_kv_rows && vec_col < d_stride_uint4) {
                 v_val = __ldg(&v_vec[row * d_stride_uint4 + vec_col]);
             }
             sV_vec[row * kv_stride_uint4 + vec_col] = v_val;
@@ -418,7 +416,7 @@ flash_attention_backward_dq_kernel(
             const int tile_m = tile_m_idx * WMMA_M;
             const int tile_n = tile_n_idx * WMMA_N;
 
-            if (tile_m >= valid_q_rows || tile_n >= valid_k_rows) continue;
+            if (tile_m >= valid_q_rows || tile_n >= valid_kv_rows) continue;
 
             fragment<matrix_a, WMMA_M, WMMA_N, WMMA_K, __half, row_major> a_frag;
             fragment<matrix_b, WMMA_M, WMMA_N, WMMA_K, __half, col_major> b_frag;
@@ -442,7 +440,7 @@ flash_attention_backward_dq_kernel(
         // ========================================================================
         // Load K (into sK)
         // ========================================================================
-        const uint4* k_vec     = reinterpret_cast<const uint4*>(k_ptr + start_col * D);
+        const uint4* k_vec     = reinterpret_cast<const uint4*>(k_ptr + start_kv * D);
         uint4*       sK_vec    = reinterpret_cast<uint4*>(sK);
 
         #pragma unroll 2
@@ -450,7 +448,7 @@ flash_attention_backward_dq_kernel(
             const int row = idx / d_stride_uint4;
             const int vec_col = idx % d_stride_uint4;
             uint4 k_val = make_uint4(0, 0, 0, 0);
-            if (row < valid_k_rows && vec_col < d_stride_uint4) {
+            if (row < valid_kv_rows && vec_col < d_stride_uint4) {
                 k_val = __ldg(&k_vec[row * d_stride_uint4 + vec_col]);
             }
             sK_vec[row * kv_stride_uint4 + vec_col] = k_val;
@@ -479,7 +477,7 @@ flash_attention_backward_dq_kernel(
             const int tile_m = tile_m_idx * WMMA_M;
             const int tile_n = tile_n_idx * WMMA_N;
 
-            if (tile_m >= valid_q_rows || tile_n >= valid_k_rows) continue;
+            if (tile_m >= valid_q_rows || tile_n >= valid_kv_rows) continue;
 
             fragment<matrix_a, WMMA_M, WMMA_N, WMMA_K, __half, row_major> a_frag;
             fragment<matrix_b, WMMA_M, WMMA_N, WMMA_K, __half, col_major> b_frag;
@@ -503,11 +501,11 @@ flash_attention_backward_dq_kernel(
                     const unsigned col = col_causal + (i & 0b1) + ((i >> 2) & 0b1) * 4;
                     const unsigned row = row_causal + ((i >> 1) & 0b1) * 2;
 
-                    const int global_m = start_row + tile_m + row;
-                    const int global_n = start_col + tile_n + col;
+                    const int global_m = start_q + tile_m + row;
+                    const int global_n = start_kv + tile_n + col;
 
-                    const bool is_valid = (global_m < start_row + valid_q_rows) &&
-                                          (global_n < start_col + valid_k_rows);
+                    const bool is_valid = (global_m < start_q + valid_q_rows) &&
+                                          (global_n < start_kv + valid_kv_rows);
 
                     acc_frag.x[i] = is_valid
                         ? ((global_n > global_m) ? NEG_INF : acc_frag.x[i] * softmax_scale)
@@ -537,7 +535,7 @@ flash_attention_backward_dq_kernel(
             const float lse_val     = sLse[row];
             const float row_dot_val = sRowDot[row];
 
-            const int vec8_cols = valid_k_rows / 8;
+            const int vec8_cols = valid_kv_rows / 8;
             const int vec8_per_thread = (vec8_cols + THREADS_PER_ROW - 1) / THREADS_PER_ROW;
             const int tail_start = vec8_cols * 8;
 
@@ -584,10 +582,10 @@ flash_attention_backward_dq_kernel(
             // Phase 2: tail — only if needed
             #pragma unroll
             for (int c = tail_start + thread_in_row; c < BLOCK_N; c += THREADS_PER_ROW) {
-                float s = (c < valid_k_rows) ? sS_row[c] : NEG_INF;
-                float dov = (c < valid_k_rows) ? sdOV_row[c] : 0.0f;
+                float s = (c < valid_kv_rows) ? sS_row[c] : NEG_INF;
+                float dov = (c < valid_kv_rows) ? sdOV_row[c] : 0.0f;
                 float p = (s - lse_val < -80.0f) ? 0.0f : __expf(s - lse_val);
-                float ds = p * softmax_scale * ((c < valid_k_rows) ? (dov - row_dot_val) : 0.0f);
+                float ds = p * softmax_scale * ((c < valid_kv_rows) ? (dov - row_dot_val) : 0.0f);
                 sdS_row[c] = __float2half_rn(ds);
             }
 
@@ -631,7 +629,7 @@ flash_attention_backward_dq_kernel(
             #pragma unroll
             for (int k_tile = 0; k_tile < num_tiles_k_dq; ++k_tile) {
                 const int k_offset = k_tile * WMMA_K;
-                if (k_offset >= valid_k_rows) break;
+                if (k_offset >= valid_kv_rows) break;
 
                 load_matrix_sync(a_frag, sdS + tile_m * S_STRIDE + k_offset, S_STRIDE);
                 load_matrix_sync(b_frag, sK + k_offset * KV_STRIDE + tile_n, KV_STRIDE);
@@ -711,7 +709,7 @@ flash_attention_backward_dkv_kernel(
     constexpr int NUM_UINT4_Q_BLOCK  = Config::NUM_UINT4_Q_BLOCK;
     constexpr int NUM_UINT4_KV_BLOCK = Config::NUM_UINT4_KV_BLOCK;
 
-    const float NEG_INF = -1e30f;
+    // head index (batch * num_heads + head)
     const int batch_head_id = blockIdx.z;
     if (batch_head_id >= B * H) return;
 
@@ -785,23 +783,22 @@ flash_attention_backward_dkv_kernel(
     __syncthreads();
 
     // ========================================================================
-    // MAIN LOOP
+    // MAIN LOOP (iterates over Q blocks for current K/V block)
     // ========================================================================
+    for (int block = 0; block < num_q_tiles; ++block) {
+        const int start_q = block * BLOCK_N;
+        if (start_q >= M) break;
+        const int valid_q_rows = min(BLOCK_N, M - start_q);
 
-    for (int block_n = 0; block_n < num_q_tiles; ++block_n) {
-        const int start_col = block_n * BLOCK_N;
-        if (start_col >= M) break;
-        const int valid_q_rows = min(BLOCK_N, M - start_col);
-
-        // Skip per tile
+        // Early skip per tile
         if constexpr (IS_CAUSAL) {
-            if (start_kv >= start_col + valid_q_rows) { continue; }
+            if (start_kv >= start_q + valid_q_rows) { continue; }
         }
 
         // ========================================================================
         // Load Q (into sdO alias)
         // ========================================================================
-        const uint4* q_vec = reinterpret_cast<const uint4*>(q_ptr + start_col * D);
+        const uint4* q_vec = reinterpret_cast<const uint4*>(q_ptr + start_q * D);
         uint4*      sQ_vec = reinterpret_cast<uint4*>(sdO);
 
         #pragma unroll 2
@@ -860,10 +857,10 @@ flash_attention_backward_dkv_kernel(
                     const unsigned col = col_causal + (i & 0b1) + ((i >> 2) & 0b1) * 4;
                     const unsigned row = row_causal + ((i >> 1) & 0b1) * 2;
 
-                    const int global_m = start_col + tile_m + row;
+                    const int global_m = start_q + tile_m + row;
                     const int global_n = start_kv  + tile_n + col;
 
-                    const bool is_valid = (global_m < start_col + valid_q_rows) &&
+                    const bool is_valid = (global_m < start_q + valid_q_rows) &&
                                           (global_n < start_kv  + valid_kv_rows);
 
                     acc_frag.x[i] = is_valid
@@ -883,7 +880,7 @@ flash_attention_backward_dkv_kernel(
         // ========================================================================
         // Load dO (into sdO alias)
         // ========================================================================
-        const uint4* do_vec = reinterpret_cast<const uint4*>(dO_ptr + start_col * D);
+        const uint4* do_vec = reinterpret_cast<const uint4*>(dO_ptr + start_q * D);
         uint4*      sdO_vec = reinterpret_cast<uint4*>(sdO);
 
         #pragma unroll 2
@@ -901,7 +898,7 @@ flash_attention_backward_dkv_kernel(
         // ========================================================================
         // Compute row_dot = O ⊙ dO
         // ========================================================================
-        const __half* current_o_ptr = o_ptr + start_col * D;
+        const __half* current_o_ptr = o_ptr + start_q * D;
 
         if (tid < valid_q_rows * THREADS_PER_ROW) {
             const int row = tid / THREADS_PER_ROW;
@@ -961,7 +958,7 @@ flash_attention_backward_dkv_kernel(
         }
 
         // Load LSE
-        if (tid < valid_q_rows) { sLse[tid] = lse_ptr[start_col + tid]; }
+        if (tid < valid_q_rows) { sLse[tid] = lse_ptr[start_q + tid]; }
         __syncthreads();
 
         // ========================================================================
@@ -1024,13 +1021,13 @@ flash_attention_backward_dkv_kernel(
             float dov0 = 0.0f, dov1 = 0.0f;
 
             const bool in_bounds0 = (row0 < valid_q_rows) && (col0 < valid_kv_rows);
-            const bool causal_ok0 = !IS_CAUSAL || ((start_kv + col0) <= (start_col + row0));
+            const bool causal_ok0 = !IS_CAUSAL || ((start_kv + col0) <= (start_q + row0));
             const bool valid0 = in_bounds0 && causal_ok0;
 
             bool valid1 = false;
             if (has_pair) {
                 const bool in_bounds1 = (row1 < valid_q_rows) && (col1 < valid_kv_rows);
-                const bool causal_ok1 = !IS_CAUSAL || ((start_kv + col1) <= (start_col + row1));
+                const bool causal_ok1 = !IS_CAUSAL || ((start_kv + col1) <= (start_q + row1));
                 valid1 = in_bounds1 && causal_ok1;
             }
 
@@ -1113,7 +1110,7 @@ flash_attention_backward_dkv_kernel(
 
         // ========================================================================
         // Load Q (into sdO alias)
-        // ========================================================================  
+        // ========================================================================
         __half* sQ = sdO;
         #pragma unroll 2
         for (int idx = tid; idx < NUM_UINT4_Q_BLOCK; idx += THREADS_PER_BLOCK) {
@@ -1242,7 +1239,7 @@ void launcher_flash_attention_backward_dq(
 
     TORCH_CHECK(smem <= MAX_SMEM_PER_SM, "Shared memory exceeds 96KB for dQ: ", smem, " bytes");
 
-    auto kernel = is_causal ? 
+    auto kernel = is_causal ?
         (void*)flash_attention_backward_dq_kernel<D, true> :
         (void*)flash_attention_backward_dq_kernel<D, false>;
 
