@@ -1,10 +1,11 @@
 [build-system]
+build-backend = "setuptools.build_meta"
 requires = [
     "setuptools>=77.0.3",
     "wheel",
-    "packaging"
+    "packaging",
+    "torch>=2.5",
 ]
-build-backend = "setuptools.build_meta"
 
 [project]
 name = "flash_attn_v100"
@@ -12,17 +13,15 @@ version = "26.02"
 description = "Flash Attention 2 for Tesla v100"
 readme = "README.md"
 requires-python = ">=3.10"
+license = "BSD-3-Clause"
+license-files = ["LICENSE", "AUTHORS"]
+dynamic = ["authors", "classifiers", "urls"]
 dependencies = [
     "torch",
     "einops",
     "packaging",
     "ninja"
 ]
-
-license = "BSD-3-Clause"
-license-files = ["LICENSE", "AUTHORS"]
-
-dynamic = ["authors", "classifiers", "urls"]
 
 [tool.setuptools]
 packages = ["flash_attn_v100"]

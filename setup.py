@@ -40,6 +40,7 @@ def get_ext_modules():
                     "--expt-relaxed-constexpr",
                     "--expt-extended-lambda",
                     "--use_fast_math",
+                    "-Wno-deprecated-gpu-targets",
                 ],
             },
         )
@@ -54,21 +55,54 @@ def get_cmdclass():
             "Please install torch >= 2.5 first."
         ) from e
 
+def get_cmdclass():
+    try:
+        from torch.utils.cpp_extension import BuildExtension
+    except ImportError as e:
+        raise RuntimeError(
+            "torch is required to build flash_attn_v100. "
+            "Please install torch >= 2.5 first."
+        ) from e
+
     class CustomBuildExtension(BuildExtension):
         def build_extensions(self):
             import torch
+
+            if not os.environ.get("MAX_JOBS"):
+                try:
+                    import psutil
+
+                    nvcc_threads = int(os.environ.get("NVCC_THREADS", 3))
+                    cores = os.cpu_count() or 4
+                    free_mem_gb = psutil.virtual_memory().available / (1024**3)
+
+                    mem_per_job_gb = 2.5
+
+                    max_jobs_mem = max(1, int(free_mem_gb / mem_per_job_gb))
+                    max_jobs_cores = max(1, (cores - 2) // nvcc_threads)
+
+                    jobs = max(1, min(max_jobs_mem, max_jobs_cores, 6))
+
+                    if free_mem_gb >= 10 and cores >= 8:
+                        jobs = max(jobs, 4)
+
+                    os.environ["MAX_JOBS"] = str(jobs)
+                    os.environ["NVCC_THREADS"] = str(nvcc_threads)
+
+                    print(f"autoset max_jobs={jobs}, nvcc_threads={nvcc_threads} "
+                          f"(current {cores} cores, {free_mem_gb:.1f}GB free mem)")
+                except Exception as e:
+                    print(f"Warning: could not auto-tune build params: {e}")
+                    pass
+
             if not torch.cuda.is_available():
                 raise RuntimeError("CUDA is required but not available.")
             if parse(torch.version.cuda) < parse("11.6"):
-                raise RuntimeError(
-                    f"CUDA version {torch.version.cuda} < 11.6 is not supported. "
-                    "Please use CUDA ≥ 11.6 (e.g., PyTorch built with CUDA 11.8/12.x)."
-                )
+                raise RuntimeError(f"CUDA version {torch.version.cuda} < 11.6 is not supported. Please use CUDA ≥ 11.6 (e.g., PyTorch built with CUDA 11.8/12.x).")
             super().build_extensions()
 
     return {"build_ext": CustomBuildExtension}
 
-# Read README
 try:
     with open(this_dir / "README.md", encoding="utf-8") as f:
         long_description = f.read()
@@ -77,12 +111,11 @@ except FileNotFoundError:
 
 setup(
     name="flash_attn_v100",
-    version="26.02",
+    version="25.11",
     packages=["flash_attn_v100"],
     ext_modules=get_ext_modules(),
     cmdclass=get_cmdclass(),
     python_requires=">=3.10",
-    install_requires=["torch>=2.5", "einops", "packaging"],
     zip_safe=False,
     author="D.Skryabin",
     author_email="tg @ai_bond007",
