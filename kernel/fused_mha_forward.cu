@@ -20,6 +20,8 @@ using namespace nvcuda::wmma;
 #define WMMA_N 16
 #define WMMA_K 16
 
+#define NEG_INF                 (-1e30f)
+
 #define MAX_THREADS_PER_WARP    32
 #define MAX_THREADS_PER_SM      2048
 #define MAX_THREAD_BLOCK_SIZE   1024
@@ -82,7 +84,7 @@ struct KernelConfig {
         alignas(16) __half k      [BLOCK_N * KV_STRIDE];
         alignas(16) __half v      [BLOCK_N * KV_STRIDE];
     } reuse_kv;
-    union { 
+    union {
         alignas(16) float  s      [BLOCK_M * S_STRIDE];
         alignas(16) __half p      [BLOCK_M * S_STRIDE];
     } reuse_sp;
@@ -91,7 +93,7 @@ struct KernelConfig {
         alignas(16) float  row_sum[BLOCK_M];
     };
 
-    static constexpr size_t TOTAL_SMEM = ((sizeof(SmemLayout) + 127) & ~size_t(127)); 
+    static constexpr size_t TOTAL_SMEM = ((sizeof(SmemLayout) + 127) & ~size_t(127));
 };
 
 // ============================================================================
@@ -100,15 +102,18 @@ struct KernelConfig {
 template<typename Config>
 __device__ __forceinline__ void init_smem(char* smem_raw) {
     constexpr int N_U4 = Config::TOTAL_SMEM / 16;
-    const int lane_id = threadIdx.x & 31;
+    const int tid = threadIdx.x;
+    const int stride = blockDim.x;
 
     uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_raw));
-    #pragma unroll 1
-    for (int i = lane_id; i < N_U4; i += 32) {
-        asm volatile("st.shared.v4.u32 [%0], {%1,%1,%1,%1};"
-                     :: "r"(addr + (i << 4)), "r"(0) : "memory");
+
+    #pragma unroll 4
+    for (int i = tid; i < N_U4; i += stride) {
+        asm volatile("st.shared.v4.u32 [%0], {0x0, 0x0, 0x0, 0x0};"
+                     :: "r"(addr + (i << 4))
+                     : "memory");
     }
-    __syncwarp();
+    __syncthreads();
 }
 
 // ============================================================================
@@ -139,21 +144,21 @@ flash_attention_forward_kernel(
     constexpr int S_STRIDE          = Config::S_STRIDE;
     constexpr int O_STRIDE          = Config::O_STRIDE;
     constexpr int PER_UINT4         = Config::PER_UINT4;
-    const float NEG_INF = -1e30f;
 
+    // head index (batch * num_heads + head)
     const int batch_head_id = blockIdx.z;
     if (batch_head_id >= B * H) return;
 
-    const int block_m = blockIdx.x;
-    const int start_row = block_m * BLOCK_M;
-    if (start_row >= M) return;
+    const int block_idx = blockIdx.x;
+    const int start_q = block_idx * BLOCK_M;
+    if (start_q >= M) return;
 
     int num_n_tiles = (N + BLOCK_N - 1) / BLOCK_N;
-    const int valid_q_rows = min(BLOCK_M, M - start_row);
+    const int valid_q_rows = min(BLOCK_M, M - start_q);
 
     // Early loop limit n_blocks for causal
     if constexpr (IS_CAUSAL) {
-        const int max_key_pos = start_row + valid_q_rows - 1;
+        const int max_key_pos = start_q + valid_q_rows - 1;
         if (max_key_pos < 0) {
             num_n_tiles = 0;
         } else {
@@ -166,11 +171,11 @@ flash_attention_forward_kernel(
     const int lane_id = tid % MAX_THREADS_PER_WARP;
 
     // Global pointers
-    const __half* q_ptr    = Q +           (size_t)batch_head_id * M * D + start_row * D;
+    const __half* q_ptr    = Q +           (size_t)batch_head_id * M * D + start_q * D;
     const __half* k_ptr    = K +           (size_t)batch_head_id * N * D;
     const __half* v_ptr    = V +           (size_t)batch_head_id * N * D;
-          __half* out_ptr  = Out +         (size_t)batch_head_id * M * D + start_row * D;
-    float* softmax_lse_ptr = softmax_lse + (size_t)batch_head_id * M + start_row;
+          __half* out_ptr  = Out +         (size_t)batch_head_id * M * D + start_q * D;
+    float* softmax_lse_ptr = softmax_lse + (size_t)batch_head_id * M + start_q;
 
     // Shared memory layout
     extern __shared__ char smem_raw[];
@@ -215,32 +220,31 @@ flash_attention_forward_kernel(
     __syncthreads();
 
     // ========================================================================
-    // MAIN LOOP
+    // MAIN LOOP (iterates over K/V blocks for current Q block)
     // ========================================================================
+    for (int block = 0; block < num_n_tiles; ++block) {
+        const int start_kv = block * BLOCK_N;
+        if (start_kv >= N) break;
+        const int valid_kv_rows = min(BLOCK_N, N - start_kv);
 
-    for (int block_n = 0; block_n < num_n_tiles; ++block_n) {
-        const int start_col = block_n * BLOCK_N;
-        if (start_col >= N) break;
-        const int valid_k_rows = min(BLOCK_N, N - start_col);
-
-        // Skip per tile
+        // Early skip per tile
         if constexpr (IS_CAUSAL) {
-            if (start_col >= start_row + valid_q_rows) { continue; }
+            if (start_kv >= start_q + valid_q_rows) { continue; }
         }
 
         // ========================================================================
         // Load K (into sK)
         // ========================================================================
-        const uint4* k_vec     = reinterpret_cast<const uint4*>(k_ptr + start_col * D);
+        const uint4* k_vec     = reinterpret_cast<const uint4*>(k_ptr + start_kv * D);
         uint4*       sK_vec    = reinterpret_cast<uint4*>(sK);
 
         #pragma unroll 2
-        for (int idx = tid; idx < (valid_k_rows * d_stride_uint4); idx += THREADS_PER_BLOCK) {
+        for (int idx = tid; idx < (valid_kv_rows * d_stride_uint4); idx += THREADS_PER_BLOCK) {
             const int row = idx / d_stride_uint4;
             const int vec_col = idx % d_stride_uint4;
 
             uint4 k_val = make_uint4(0, 0, 0, 0);
-            if (row < valid_k_rows && vec_col < d_stride_uint4) {
+            if (row < valid_kv_rows && vec_col < d_stride_uint4) {
                 k_val = __ldg(&k_vec[row * d_stride_uint4 + vec_col]);
             }
             sK_vec[row * kv_stride_uint4 + vec_col] = k_val;
@@ -268,7 +272,7 @@ flash_attention_forward_kernel(
             const int tile_m = tile_m_idx * WMMA_M;
             const int tile_n = tile_n_idx * WMMA_N;
 
-            if (tile_m >= valid_q_rows || tile_n >= valid_k_rows) continue;
+            if (tile_m >= valid_q_rows || tile_n >= valid_kv_rows) continue;
 
             fragment<matrix_a, WMMA_M, WMMA_N, WMMA_K, half, row_major> a_frag;
             fragment<matrix_b, WMMA_M, WMMA_N, WMMA_K, half, col_major> b_frag;
@@ -292,11 +296,11 @@ flash_attention_forward_kernel(
                     const unsigned col = col_causal + (i & 0b1) + ((i >> 2) & 0b1) * 4;
                     const unsigned row = row_causal + ((i >> 1) & 0b1) * 2;
 
-                    const int global_m = start_row + tile_m + row;
-                    const int global_n = start_col + tile_n + col;
+                    const int global_m = start_q + tile_m + row;
+                    const int global_n = start_kv + tile_n + col;
 
-                    const bool is_valid = (global_m < start_row + valid_q_rows) &&
-                                          (global_n < start_col + valid_k_rows);
+                    const bool is_valid = (global_m < start_q + valid_q_rows) &&
+                                          (global_n < start_kv + valid_kv_rows);
 
                     acc_frag.x[i] = is_valid
                         ? ((global_n > global_m) ? NEG_INF : acc_frag.x[i] * softmax_scale)
@@ -324,7 +328,7 @@ flash_attention_forward_kernel(
             float*  sS_row_f = sS + row * S_STRIDE;
             __half* sP_row_h = sP + row * S_STRIDE;
 
-            const int vec_cols = valid_k_rows >> 2;
+            const int vec_cols = valid_kv_rows >> 2;
             const int vecs_per_thread = (vec_cols + THREADS_PER_ROW - 1) / THREADS_PER_ROW;
             const int tail_start = vec_cols << 2;
 
@@ -346,7 +350,7 @@ flash_attention_forward_kernel(
             for (int o = THREADS_PER_ROW / 2; o > 0; o >>= 1)
                 thread_max = fmaxf(thread_max, __shfl_down_sync(mask, thread_max, o, THREADS_PER_ROW));
 
-            const float row_max  = __shfl_sync(mask, thread_max, row_leader, THREADS_PER_ROW);    
+            const float row_max  = __shfl_sync(mask, thread_max, row_leader, THREADS_PER_ROW);
             const float old_max  = sRowMax[row];
             const float new_max  = fmaxf(old_max, row_max);
             const float exp_diff = __expf(old_max - new_max);
@@ -376,10 +380,10 @@ flash_attention_forward_kernel(
 
             #pragma unroll 4
             for (int c = tail_start + thread_in_row; c < BLOCK_N; c += THREADS_PER_ROW) {
-                float v = (c < valid_k_rows) ? sS_row_f[c] : NEG_INF;
+                float v = (c < valid_kv_rows) ? sS_row_f[c] : NEG_INF;
                 float e = __expf(fmaxf(v - new_max, -80.0f));
-                thread_sum += (c < valid_k_rows) ? e : 0.0f;
-                sP_row_h[c] = (c < valid_k_rows) ? __float2half_rn(e) : __float2half(0.f);
+                thread_sum += (c < valid_kv_rows) ? e : 0.0f;
+                sP_row_h[c] = (c < valid_kv_rows) ? __float2half_rn(e) : __float2half(0.f);
             }
 
             #pragma unroll
@@ -409,7 +413,7 @@ flash_attention_forward_kernel(
             }
 
             // Fused sO scaling
-            if (block_n > 0) {
+            if (block > 0) {
                 float*  sO_row = sO + row * O_STRIDE;
                 float4* sO_vec = reinterpret_cast<float4*>(sO_row);
                 const int o_vec_count = (O_STRIDE + 3) >> 2;
@@ -432,16 +436,16 @@ flash_attention_forward_kernel(
         // ========================================================================
         // Load V (into sV)
         // ========================================================================
-        const uint4* v_vec     = reinterpret_cast<const uint4*>(v_ptr + start_col * D);
+        const uint4* v_vec     = reinterpret_cast<const uint4*>(v_ptr + start_kv * D);
         uint4*       sV_vec    = reinterpret_cast<uint4*>(sV);
 
         #pragma unroll 2
-        for (int idx = tid; idx < (valid_k_rows * d_stride_uint4); idx += THREADS_PER_BLOCK) {
+        for (int idx = tid; idx < (valid_kv_rows * d_stride_uint4); idx += THREADS_PER_BLOCK) {
             const int row = idx / d_stride_uint4;
             const int vec_col = idx % d_stride_uint4;
 
             uint4 v_val = make_uint4(0, 0, 0, 0);
-            if (row < valid_k_rows && vec_col < d_stride_uint4) {
+            if (row < valid_kv_rows && vec_col < d_stride_uint4) {
                 v_val = __ldg(&v_vec[row * d_stride_uint4 + vec_col]);
             }
             sV_vec[row * kv_stride_uint4 + vec_col] = v_val;
@@ -478,7 +482,7 @@ flash_attention_forward_kernel(
             #pragma unroll
             for (int tile_k = 0; tile_k < num_tiles_k_pv; ++tile_k) {
                 const int k_offset = tile_k * WMMA_K;
-                if (k_offset >= valid_k_rows) break;
+                if (k_offset >= valid_kv_rows) break;
 
                 load_matrix_sync(a_frag, sP + tile_m * S_STRIDE + k_offset, S_STRIDE);
                 load_matrix_sync(b_frag, sV + k_offset * KV_STRIDE + tile_d, KV_STRIDE);
