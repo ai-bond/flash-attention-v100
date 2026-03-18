@@ -153,48 +153,48 @@ flash_attention_forward_kernel(
     const int start_q = block_idx * BLOCK_M;
     if (start_q >= M) return;
 
-    int num_n_tiles = (N + BLOCK_N - 1) / BLOCK_N;
+    int num_kv_tiles = (N + BLOCK_N - 1) / BLOCK_N;
     const int valid_q_rows = min(BLOCK_M, M - start_q);
 
     // Early loop limit n_blocks for causal
     if constexpr (IS_CAUSAL) {
         const int max_key_pos = start_q + valid_q_rows - 1;
         if (max_key_pos < 0) {
-            num_n_tiles = 0;
+            num_kv_tiles = 0;
         } else {
-            num_n_tiles = min(num_n_tiles, (max_key_pos + BLOCK_N + 0) / BLOCK_N);
+            num_kv_tiles = min(num_kv_tiles, (max_key_pos + BLOCK_N + 0) / BLOCK_N);
         }
     }
 
-    const int tid = threadIdx.x;
-    const int warp_id = tid / MAX_THREADS_PER_WARP;
-    const int lane_id = tid % MAX_THREADS_PER_WARP;
+    const int tid     = threadIdx.x;
+    const int warp_id = tid >> 5;
+    const int lane_id = tid & 31;
 
     // Global pointers
-    const __half* q_ptr    = Q +           (size_t)batch_head_id * M * D + start_q * D;
-    const __half* k_ptr    = K +           (size_t)batch_head_id * N * D;
-    const __half* v_ptr    = V +           (size_t)batch_head_id * N * D;
-          __half* out_ptr  = Out +         (size_t)batch_head_id * M * D + start_q * D;
-    float* softmax_lse_ptr = softmax_lse + (size_t)batch_head_id * M + start_q;
+    const __half* __restrict__ q_ptr           = Q +           (size_t)batch_head_id * M * D + start_q * D;
+    const __half* __restrict__ k_ptr           = K +           (size_t)batch_head_id * N * D;
+    const __half* __restrict__ v_ptr           = V +           (size_t)batch_head_id * N * D;
+          __half* __restrict__ out_ptr         = Out +         (size_t)batch_head_id * M * D + start_q * D;
+           float* __restrict__ softmax_lse_ptr = softmax_lse + (size_t)batch_head_id * M + start_q;
 
     // Shared memory layout
     extern __shared__ char smem_raw[];
     init_smem<Config>(smem_raw);
     auto& smem = *reinterpret_cast<typename Config::SmemLayout*>(smem_raw);
 
-    __half* sQ      = smem.q;           // ← phase 0: load Q
-    __half* sK      = smem.reuse_kv.k;  // ← phase 1: load K
-    __half* sV      = smem.reuse_kv.v;  // ← phase 2: load V
-    float*  sS      = smem.reuse_sp.s;  // ← phase 1: QK^T
-    __half* sP      = smem.reuse_sp.p;  // ← phase 2: softmax(P)
-    float*  sO      = smem.o;           // ← phase 3: write to global
-    float*  sRowMax = smem.row_max;
-    float*  sRowSum = smem.row_sum;
+    __half* __restrict__ sQ      = smem.q;           // phase 0: load Q
+    __half* __restrict__ sK      = smem.reuse_kv.k;  // phase 1: load K
+    __half* __restrict__ sV      = smem.reuse_kv.v;  // phase 2: load V
+    float*  __restrict__ sS      = smem.reuse_sp.s;  // phase 1: QK^T
+    __half* __restrict__ sP      = smem.reuse_sp.p;  // phase 2: softmax(P)
+    float*  __restrict__ sO      = smem.o;           // phase 3: write to global
+    float*  __restrict__ sRowMax = smem.row_max;
+    float*  __restrict__ sRowSum = smem.row_sum;
 
     // Vector strides
-    const int  d_stride_uint4 = (D + PER_UINT4 - 1) / PER_UINT4;
-    const int  q_stride_uint4 = (Q_STRIDE  + PER_UINT4 - 1) / PER_UINT4;
-    const int kv_stride_uint4 = (KV_STRIDE + PER_UINT4 - 1) / PER_UINT4;
+    constexpr int  d_stride_uint4  = (D + PER_UINT4 - 1) / PER_UINT4;
+    constexpr int  q_stride_uint4  = (Q_STRIDE  + PER_UINT4 - 1) / PER_UINT4;
+    constexpr int  kv_stride_uint4 = (KV_STRIDE + PER_UINT4 - 1) / PER_UINT4;
 
     // Init state buffers
     if (tid < BLOCK_M) {
@@ -212,7 +212,7 @@ flash_attention_forward_kernel(
         const int row = idx / d_stride_uint4;
         const int vec_col = idx % d_stride_uint4;
         uint4 q_val = make_uint4(0, 0, 0, 0);
-        if (row < valid_q_rows && vec_col < d_stride_uint4) {
+        if (row < valid_q_rows) {
             q_val = __ldg(&q_vec[row * d_stride_uint4 + vec_col]);
         }
         sQ_vec[row * q_stride_uint4 + vec_col] = q_val;
@@ -222,15 +222,13 @@ flash_attention_forward_kernel(
     // ========================================================================
     // MAIN LOOP (iterates over K/V blocks for current Q block)
     // ========================================================================
-    for (int block = 0; block < num_n_tiles; ++block) {
+    for (int block = 0; block < num_kv_tiles; ++block) {
         const int start_kv = block * BLOCK_N;
         if (start_kv >= N) break;
         const int valid_kv_rows = min(BLOCK_N, N - start_kv);
 
         // Early skip per tile
-        if constexpr (IS_CAUSAL) {
-            if (start_kv >= start_q + valid_q_rows) { continue; }
-        }
+        if constexpr (IS_CAUSAL) { if (start_kv >= start_q + valid_q_rows) continue; }
 
         // ========================================================================
         // Load K (into sK)
@@ -244,7 +242,7 @@ flash_attention_forward_kernel(
             const int vec_col = idx % d_stride_uint4;
 
             uint4 k_val = make_uint4(0, 0, 0, 0);
-            if (row < valid_kv_rows && vec_col < d_stride_uint4) {
+            if (row < valid_kv_rows) {
                 k_val = __ldg(&k_vec[row * d_stride_uint4 + vec_col]);
             }
             sK_vec[row * kv_stride_uint4 + vec_col] = k_val;
@@ -254,9 +252,9 @@ flash_attention_forward_kernel(
         // ========================================================================
         // Compute S = Q @ K^T
         // ========================================================================
-        const int num_tiles_m_qk    = (BLOCK_M + WMMA_M - 1) / WMMA_M;   // ← Q @ K^T: along M
-        const int num_tiles_n_qk    = (BLOCK_N + WMMA_N - 1) / WMMA_N;   // ← Q @ K^T: along N
-        const int num_tiles_k_qk    = (D + WMMA_K - 1) / WMMA_K;         // ← Q @ K^T: inner along D
+        const int num_tiles_m_qk    = (BLOCK_M + WMMA_M - 1) / WMMA_M;   // Q @ K^T: along M
+        const int num_tiles_n_qk    = (BLOCK_N + WMMA_N - 1) / WMMA_N;   // Q @ K^T: along N
+        const int num_tiles_k_qk    = (D + WMMA_K - 1) / WMMA_K;         // Q @ K^T: inner along D
         const int total_tiles_qk    = num_tiles_m_qk * num_tiles_n_qk;
         const int tiles_per_warp_qk = (total_tiles_qk + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
         const unsigned row_causal   = (lane_id & 0b1) + ((lane_id >> 2) & 0b1) * 8 + ((lane_id >> 4) & 0b1) * 4;
@@ -445,7 +443,7 @@ flash_attention_forward_kernel(
             const int vec_col = idx % d_stride_uint4;
 
             uint4 v_val = make_uint4(0, 0, 0, 0);
-            if (row < valid_kv_rows && vec_col < d_stride_uint4) {
+            if (row < valid_kv_rows) {
                 v_val = __ldg(&v_vec[row * d_stride_uint4 + vec_col]);
             }
             sV_vec[row * kv_stride_uint4 + vec_col] = v_val;
@@ -455,9 +453,9 @@ flash_attention_forward_kernel(
         // ========================================================================
         // Compute P @ V
         // ========================================================================
-        const int num_tiles_m_pv    = (BLOCK_M + WMMA_M - 1) / WMMA_M;   // ← P @ V: along M
-        const int num_tiles_n_pv    = (D + WMMA_N - 1) / WMMA_N;         // ← P @ V: along D
-        const int num_tiles_k_pv    = (BLOCK_N + WMMA_K - 1) / WMMA_K;   // ← P @ V: inner along N
+        const int num_tiles_m_pv    = (BLOCK_M + WMMA_M - 1) / WMMA_M;   // P @ V: along M
+        const int num_tiles_n_pv    = (D + WMMA_N - 1) / WMMA_N;         // P @ V: along D
+        const int num_tiles_k_pv    = (BLOCK_N + WMMA_K - 1) / WMMA_K;   // P @ V: inner along N
         const int total_tiles_pv    = num_tiles_m_pv * num_tiles_n_pv;
         const int tiles_per_warp_pv = (total_tiles_pv + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
 
@@ -555,7 +553,7 @@ void launcher_flash_attention_forward(
     const dim3 block(Config::THREADS_PER_BLOCK);
     const size_t smem = Config::TOTAL_SMEM;
 
-    TORCH_CHECK(smem <= MAX_SMEM_PER_SM, "Shared memory exceeds 96KB: ", smem, " bytes");
+    TORCH_CHECK(smem <= MAX_SMEM_PER_SM, "Shared memory exceeds 96KB for Forward kernel: ", smem, " bytes (", smem / 1024, " KB)");
 
     auto kernel = is_causal ?
         (void*)flash_attention_forward_kernel<D, true> :
