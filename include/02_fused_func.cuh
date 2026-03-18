@@ -23,3 +23,27 @@ __device__ __forceinline__ void init_smem(char* smem_raw) {
     }
     __syncthreads();
 }
+
+// ============================================================================
+// UINT4 TILE LOADER
+// ============================================================================
+__device__ __forceinline__ void load_tile_uint4(
+    const uint4* __restrict__ src_vec,
+          uint4* __restrict__ dst_vec,
+    int valid_rows,
+    int src_stride_uint4,
+    int dst_stride_uint4,
+    int tid,
+    int threads_per_block
+) {
+    #pragma unroll 2
+    for (int idx = tid; idx < (valid_rows * src_stride_uint4); idx += threads_per_block) {
+        const int row = idx / src_stride_uint4;
+        const int vec_col = idx % src_stride_uint4;
+        uint4 val = make_uint4(0, 0, 0, 0);
+        if (row < valid_rows) {
+            val = __ldg(&src_vec[row * src_stride_uint4 + vec_col]);
+        }
+        dst_vec[row * dst_stride_uint4 + vec_col] = val;
+    }
+}
