@@ -72,8 +72,6 @@ flash_attention_backward_kernel(
         constexpr int KV_STRIDE          = Config::DQ::KV_STRIDE;
         constexpr int S_STRIDE           = Config::DQ::S_STRIDE;
         constexpr int PER_UINT4          = Config::DQ::PER_UINT4;
-        constexpr int NUM_UINT4_Q_BLOCK  = Config::DQ::NUM_UINT4_Q_BLOCK;
-        constexpr int NUM_UINT4_KV_BLOCK = Config::DQ::NUM_UINT4_KV_BLOCK;
 
         const int block_idx = blockIdx.x;
         const int start_q   = block_idx * BLOCK_M;
@@ -126,21 +124,8 @@ flash_attention_backward_kernel(
               uint4* sQ_vec  = reinterpret_cast<uint4*>(sQ);
               uint4* sdO_vec = reinterpret_cast<uint4*>(sdO);
 
-        #pragma unroll 2
-        for (int idx = tid; idx < NUM_UINT4_Q_BLOCK; idx += THREADS_PER_BLOCK) {
-            const int row = idx / d_stride_uint4;
-            const int vec_col = idx % d_stride_uint4;
+        load_tile_uint4_dual(q_vec, do_vec, sQ_vec, sdO_vec, valid_q_rows, d_stride_uint4, q_stride_uint4, tid, THREADS_PER_BLOCK);
 
-            uint4 q_val  = make_uint4(0, 0, 0, 0);
-            uint4 do_val = make_uint4(0, 0, 0, 0);
-
-            if (row < valid_q_rows) {
-                q_val  = __ldg(&q_vec[row * d_stride_uint4 + vec_col]);
-                do_val = __ldg(&do_vec[row * d_stride_uint4 + vec_col]);
-            }
-            sQ_vec[row * q_stride_uint4 + vec_col] = q_val;
-            sdO_vec[row * q_stride_uint4 + vec_col] = do_val;
-        }
         __syncthreads();
 
         // ========================================================================
@@ -226,16 +211,8 @@ flash_attention_backward_kernel(
             const uint4* v_vec  = reinterpret_cast<const uint4*>(v_ptr + start_kv * D);
                   uint4* sV_vec = reinterpret_cast<uint4*>(sV);
 
-            #pragma unroll 2
-            for (int idx = tid; idx < NUM_UINT4_KV_BLOCK; idx += THREADS_PER_BLOCK) {
-                const int row = idx / d_stride_uint4;
-                const int vec_col = idx % d_stride_uint4;
-                uint4 v_val = make_uint4(0, 0, 0, 0);
-                if (row < valid_kv_rows) {
-                    v_val = __ldg(&v_vec[row * d_stride_uint4 + vec_col]);
-                }
-                sV_vec[row * kv_stride_uint4 + vec_col] = v_val;
-            }
+            load_tile_uint4(v_vec, sV_vec, valid_kv_rows, d_stride_uint4, kv_stride_uint4, tid, THREADS_PER_BLOCK);
+
             __syncthreads();
 
             // ========================================================================
@@ -284,16 +261,8 @@ flash_attention_backward_kernel(
             const uint4* k_vec  = reinterpret_cast<const uint4*>(k_ptr + start_kv * D);
                   uint4* sK_vec = reinterpret_cast<uint4*>(sK);
 
-            #pragma unroll 2
-            for (int idx = tid; idx < NUM_UINT4_KV_BLOCK; idx += THREADS_PER_BLOCK) {
-                const int row = idx / d_stride_uint4;
-                const int vec_col = idx % d_stride_uint4;
-                uint4 k_val = make_uint4(0, 0, 0, 0);
-                if (row < valid_kv_rows) {
-                    k_val = __ldg(&k_vec[row * d_stride_uint4 + vec_col]);
-                }
-                sK_vec[row * kv_stride_uint4 + vec_col] = k_val;
-            }
+            load_tile_uint4(k_vec, sK_vec, valid_kv_rows, d_stride_uint4, kv_stride_uint4, tid, THREADS_PER_BLOCK);
+
             __syncthreads();
 
             // ========================================================================
@@ -530,8 +499,6 @@ flash_attention_backward_kernel(
         constexpr int KV_STRIDE          = Config::DKV::KV_STRIDE;
         constexpr int S_STRIDE           = Config::DKV::S_STRIDE;
         constexpr int PER_UINT4          = Config::DKV::PER_UINT4;
-        constexpr int NUM_UINT4_Q_BLOCK  = Config::DKV::NUM_UINT4_Q_BLOCK;
-        constexpr int NUM_UINT4_KV_BLOCK = Config::DKV::NUM_UINT4_KV_BLOCK;
 
         const int block_idx = blockIdx.x;
         const int start_kv  = block_idx * BLOCK_M;
@@ -577,21 +544,8 @@ flash_attention_backward_kernel(
               uint4* sK_vec = reinterpret_cast<uint4*>(sK);
               uint4* sV_vec = reinterpret_cast<uint4*>(sV);
 
-        #pragma unroll 2
-        for (int idx = tid; idx < NUM_UINT4_KV_BLOCK; idx += THREADS_PER_BLOCK) {
-            const int row = idx / d_stride_uint4;
-            const int vec_col = idx % d_stride_uint4;
+        load_tile_uint4_dual(k_vec, v_vec, sK_vec, sV_vec, valid_kv_rows, d_stride_uint4, kv_stride_uint4, tid, THREADS_PER_BLOCK);
 
-            uint4 k_val = make_uint4(0, 0, 0, 0);
-            uint4 v_val = make_uint4(0, 0, 0, 0);
-
-            if (row < valid_kv_rows) {
-                k_val = __ldg(&k_vec[row * d_stride_uint4 + vec_col]);
-                v_val = __ldg(&v_vec[row * d_stride_uint4 + vec_col]);
-            }
-            sK_vec[row * kv_stride_uint4 + vec_col] = k_val;
-            sV_vec[row * kv_stride_uint4 + vec_col] = v_val;
-        }
         __syncthreads();
 
         // ========================================================================
@@ -611,16 +565,8 @@ flash_attention_backward_kernel(
             const uint4* q_vec  = reinterpret_cast<const uint4*>(q_ptr + start_q * D);
                   uint4* sQ_vec = reinterpret_cast<uint4*>(sdO);
 
-            #pragma unroll 2
-            for (int idx = tid; idx < NUM_UINT4_Q_BLOCK; idx += THREADS_PER_BLOCK) {
-                const int row = idx / d_stride_uint4;
-                const int vec_col = idx % d_stride_uint4;
-                uint4 q_val = make_uint4(0, 0, 0, 0);
-                if (row < valid_q_rows) {
-                    q_val = __ldg(&q_vec[row * d_stride_uint4 + vec_col]);
-                }
-                sQ_vec[row * q_stride_uint4 + vec_col] = q_val;
-            }
+            load_tile_uint4(q_vec, sQ_vec, valid_q_rows, d_stride_uint4, q_stride_uint4, tid, THREADS_PER_BLOCK);
+
             __syncthreads();
 
             // ========================================================================
@@ -692,16 +638,8 @@ flash_attention_backward_kernel(
             const uint4* do_vec  = reinterpret_cast<const uint4*>(dO_ptr + start_q * D);
                   uint4* sdO_vec = reinterpret_cast<uint4*>(sdO);
 
-            #pragma unroll 2
-            for (int idx = tid; idx < NUM_UINT4_Q_BLOCK; idx += THREADS_PER_BLOCK) {
-                const int row = idx / d_stride_uint4;
-                const int vec_col = idx % d_stride_uint4;
-                uint4 do_val = make_uint4(0, 0, 0, 0);
-                if (row < valid_q_rows) {
-                    do_val = __ldg(&do_vec[row * d_stride_uint4 + vec_col]);
-                }
-                sdO_vec[row * q_stride_uint4 + vec_col] = do_val;
-            }
+            load_tile_uint4(do_vec, sdO_vec, valid_q_rows, d_stride_uint4, q_stride_uint4, tid, THREADS_PER_BLOCK);
+
             __syncthreads();
 
             // ========================================================================
@@ -881,9 +819,9 @@ flash_attention_backward_kernel(
            // ========================================================================
            // Compute dV = P^T @ dO
            // ========================================================================
-            const int num_tiles_m_dv    = (BLOCK_M + WMMA_M - 1) / WMMA_M;    // ← P^T @ dO: along M (P^T rows = K rows)
-            const int num_tiles_n_dv    = (D + WMMA_N - 1) / WMMA_N;          // ← P^T @ dO: along N (dO cols = D)
-            const int num_tiles_k_dv    = (BLOCK_N + WMMA_K - 1) / WMMA_K;    // ← P^T @ dO: inner along N (cols of P = rows of dO)
+            const int num_tiles_m_dv    = (BLOCK_M + WMMA_M - 1) / WMMA_M;    // P^T @ dO: along M (P^T rows = K rows)
+            const int num_tiles_n_dv    = (D + WMMA_N - 1) / WMMA_N;          // P^T @ dO: along N (dO cols = D)
+            const int num_tiles_k_dv    = (BLOCK_N + WMMA_K - 1) / WMMA_K;    // P^T @ dO: inner along N (cols of P = rows of dO)
             const int total_tiles_dv    = num_tiles_m_dv * num_tiles_n_dv;
             const int tiles_per_warp_dv = (total_tiles_dv + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
 
@@ -921,16 +859,9 @@ flash_attention_backward_kernel(
             // Load Q (into sdO alias)
             // ========================================================================
             __half* sQ = sdO;
-            #pragma unroll 2
-            for (int idx = tid; idx < NUM_UINT4_Q_BLOCK; idx += THREADS_PER_BLOCK) {
-                const int row = idx / d_stride_uint4;
-                const int vec_col = idx % d_stride_uint4;
-                uint4 q_val = make_uint4(0, 0, 0, 0);
-                if (row < valid_q_rows) {
-                    q_val = __ldg(&q_vec[row * d_stride_uint4 + vec_col]);
-                }
-                sQ_vec[row * q_stride_uint4 + vec_col] = q_val;
-            }
+
+            load_tile_uint4(q_vec, sQ_vec, valid_q_rows, d_stride_uint4, q_stride_uint4, tid, THREADS_PER_BLOCK);
+
             __syncthreads();
 
             // ========================================================================

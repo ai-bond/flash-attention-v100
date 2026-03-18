@@ -59,8 +59,6 @@ struct KernelConfig {
         static constexpr int KV_STRIDE          = D + PAD;
         static constexpr int S_STRIDE           = BLOCK_N + PAD;
         static constexpr int PER_UINT4          = 8;
-        static constexpr int NUM_UINT4_Q_BLOCK  = BLOCK_M * ((D + PER_UINT4 - 1) / PER_UINT4);
-        static constexpr int NUM_UINT4_KV_BLOCK = BLOCK_N * ((D + PER_UINT4 - 1) / PER_UINT4);
     };
     struct DKV {
         static constexpr int BLOCK_M            = (D == 16) ? BLOCK_M_DKV_16 : (D == 32) ? BLOCK_M_DKV_32 : (D == 64) ? BLOCK_M_DKV_64 : (D == 128) ? BLOCK_M_DKV_128 : BLOCK_M_DKV_256;
@@ -73,8 +71,6 @@ struct KernelConfig {
         static constexpr int KV_STRIDE          = D + PAD;
         static constexpr int S_STRIDE           = BLOCK_M + PAD;
         static constexpr int PER_UINT4          = 8;
-        static constexpr int NUM_UINT4_Q_BLOCK  = BLOCK_N * ((D + PER_UINT4 - 1) / PER_UINT4);
-        static constexpr int NUM_UINT4_KV_BLOCK = BLOCK_M * ((D + PER_UINT4 - 1) / PER_UINT4);
     };
 
     static constexpr int MAX_THREADS = (DQ::THREADS_PER_BLOCK > DKV::THREADS_PER_BLOCK) ? DQ::THREADS_PER_BLOCK : DKV::THREADS_PER_BLOCK;
