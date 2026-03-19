@@ -21,7 +21,7 @@ using namespace nvcuda::wmma;
 // BACKWARD KERNEL
 // ============================================================================
 template<int D, bool IS_CAUSAL>
-__global__ void __launch_bounds__(KernelConfig<D>::MAX_THREADS, 2)
+__global__ void __launch_bounds__(KernelConfig<D>::THREADS_PER_BLOCK, 2)
 flash_attention_backward_kernel(
     const __half* __restrict__ Q,
     const __half* __restrict__ K,
@@ -40,21 +40,6 @@ flash_attention_backward_kernel(
     const int grid_dkv_limit,
     const float softmax_scale
 ) {
-    using Config = KernelConfig<D>;
-
-    // head index (batch * num_heads + head)
-    const int batch_head_id = blockIdx.z;
-    if (batch_head_id >= B * H) return;
-
-    const int tid          = threadIdx.x;
-    const int warp_id      = tid >> 5;
-    const int lane_id      = tid & 31;
-
-    // Shared memory init
-    extern __shared__ char smem_raw[];
-    init_smem<Config>(smem_raw);
-    auto& smem = *reinterpret_cast<typename Config::SmemLayout*>(smem_raw);
-
     // =========================================================================
     // PHASE 1: dQ
     // =========================================================================
@@ -65,13 +50,17 @@ flash_attention_backward_kernel(
 
         constexpr int BLOCK_M            = Config::DQ::BLOCK_M;
         constexpr int BLOCK_N            = Config::DQ::BLOCK_N;
-        constexpr int THREADS_PER_BLOCK  = Config::DQ::THREADS_PER_BLOCK;
+        constexpr int THREADS_PER_BLOCK  = Config::THREADS_PER_BLOCK;
         constexpr int THREADS_PER_ROW    = Config::DQ::THREADS_PER_ROW;
         constexpr int WARPS_PER_BLOCK    = Config::DQ::WARPS_PER_BLOCK;
         constexpr int Q_STRIDE           = Config::DQ::Q_STRIDE;
         constexpr int KV_STRIDE          = Config::DQ::KV_STRIDE;
         constexpr int S_STRIDE           = Config::DQ::S_STRIDE;
         constexpr int PER_UINT4          = Config::DQ::PER_UINT4;
+
+        // head index (batch * num_heads + head)
+        const int batch_head_id = blockIdx.z;
+        if (batch_head_id >= B * H) return;
 
         const int block_idx = blockIdx.x;
         const int start_q   = block_idx * BLOCK_M;
@@ -90,6 +79,10 @@ flash_attention_backward_kernel(
             }
         }
 
+        const int tid          = threadIdx.x;
+        const int warp_id      = tid >> 5;
+        const int lane_id      = tid & 31;
+
         // Global pointers
         const __half* __restrict__ q_ptr   = Q           + (size_t)batch_head_id * M * D + start_q * D;
         const __half* __restrict__ k_ptr   = K           + (size_t)batch_head_id * N * D;
@@ -100,6 +93,10 @@ flash_attention_backward_kernel(
         const float*  __restrict__ lse_ptr = softmax_lse + (size_t)batch_head_id * M + start_q;
 
         // Shared memory layout
+        extern __shared__ char smem_raw[];
+        init_smem<Config>(smem_raw);
+        auto& smem = *reinterpret_cast<typename Config::SmemLayout*>(smem_raw);
+
         __half* __restrict__ sK            = smem.phase.dq.reuse_kv.k;
         __half* __restrict__ sV            = smem.phase.dq.reuse_kv.v;
         __half* __restrict__ sdO           = smem.phase.dq.dO;
@@ -492,7 +489,7 @@ flash_attention_backward_kernel(
 
         constexpr int BLOCK_M            = Config::DKV::BLOCK_M;
         constexpr int BLOCK_N            = Config::DKV::BLOCK_N;
-        constexpr int THREADS_PER_BLOCK  = Config::DKV::THREADS_PER_BLOCK;
+        constexpr int THREADS_PER_BLOCK  = Config::THREADS_PER_BLOCK;
         constexpr int THREADS_PER_ROW    = Config::DKV::THREADS_PER_ROW;
         constexpr int WARPS_PER_BLOCK    = Config::DKV::WARPS_PER_BLOCK;
         constexpr int Q_STRIDE           = Config::DKV::Q_STRIDE;
@@ -500,12 +497,20 @@ flash_attention_backward_kernel(
         constexpr int S_STRIDE           = Config::DKV::S_STRIDE;
         constexpr int PER_UINT4          = Config::DKV::PER_UINT4;
 
+        // head index (batch * num_heads + head)
+        const int batch_head_id = blockIdx.z;
+        if (batch_head_id >= B * H) return;
+
         const int block_idx = blockIdx.x;
         const int start_kv  = block_idx * BLOCK_M;
         if (start_kv >= N) return;
 
         int num_q_tiles  = (M + BLOCK_N - 1) / BLOCK_N;
         const int valid_kv_rows = min(BLOCK_M, N - start_kv);
+
+        const int tid          = threadIdx.x;
+        const int warp_id      = tid >> 5;
+        const int lane_id      = tid & 31;
 
         // Global pointers
         const __half* __restrict__   q_ptr = Q           + (size_t)batch_head_id * M * D;
@@ -518,6 +523,10 @@ flash_attention_backward_kernel(
               __half* __restrict__  dV_ptr = dV          + (size_t)batch_head_id * N * D + start_kv * D;
 
         // Shared memory layout
+        extern __shared__ char smem_raw[];
+        init_smem<Config>(smem_raw);
+        auto& smem = *reinterpret_cast<typename Config::SmemLayout*>(smem_raw);
+
         __half* __restrict__ sK            = smem.phase.dkv.k;
         __half* __restrict__ sV            = smem.phase.dkv.v;
         __half* __restrict__ sdO           = smem.phase.dkv.reuse_qdO.dO;
@@ -980,7 +989,7 @@ void launcher_flash_attention_backward(
 
     const int grid_max = (grid_dq > grid_dkv) ? grid_dq : grid_dkv;
     const dim3 grid(grid_max, 2, B * H);
-    const dim3 block(Config::MAX_THREADS);
+    const dim3 block(Config::THREADS_PER_BLOCK);
     const size_t smem = Config::TOTAL_SMEM;
 
     TORCH_CHECK(smem <= MAX_SMEM_PER_SM, "Shared memory exceeds 96KB for Backward kernel: ", smem, " bytes (", smem / 1024, " KB)");

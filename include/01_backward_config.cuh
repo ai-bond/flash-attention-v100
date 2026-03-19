@@ -5,43 +5,35 @@
 // ============================================================================
 #define BLOCK_M_DQ_16   16
 #define BLOCK_N_DQ_16   256
-#define WARPS_DQ_16     16
 
 #define BLOCK_M_DQ_32   32
 #define BLOCK_N_DQ_32   128
-#define WARPS_DQ_32     16
 
 #define BLOCK_M_DQ_64   64
 #define BLOCK_N_DQ_64   80
-#define WARPS_DQ_64     16
 
 #define BLOCK_M_DQ_128  32
 #define BLOCK_N_DQ_128  112
-#define WARPS_DQ_128    16
 
 #define BLOCK_M_DQ_256  32
 #define BLOCK_N_DQ_256  32
-#define WARPS_DQ_256    16
 
 #define BLOCK_M_DKV_16  32
 #define BLOCK_N_DKV_16  224
-#define WARPS_DKV_16    14
 
 #define BLOCK_M_DKV_32  32
 #define BLOCK_N_DKV_32  192
-#define WARPS_DKV_32    12
 
 #define BLOCK_M_DKV_64  32
 #define BLOCK_N_DKV_64  128
-#define WARPS_DKV_64    8
 
 #define BLOCK_M_DKV_128 16
-#define BLOCK_N_DKV_128 144
-#define WARPS_DKV_128   12
+#define BLOCK_N_DKV_128 128
 
 #define BLOCK_M_DKV_256 16
 #define BLOCK_N_DKV_256 64
-#define WARPS_DKV_256   16
+
+#define WARPS 16
 
 // ============================================================================
 // COMPILE-TIME CONFIGURATION & SHARED MEMORY LAYOUT
@@ -51,30 +43,27 @@ struct KernelConfig {
     struct DQ {
         static constexpr int BLOCK_M            = (D == 16) ? BLOCK_M_DQ_16 : (D == 32) ? BLOCK_M_DQ_32 : (D == 64) ? BLOCK_M_DQ_64 : (D == 128) ? BLOCK_M_DQ_128 : BLOCK_M_DQ_256;
         static constexpr int BLOCK_N            = (D == 16) ? BLOCK_N_DQ_16 : (D == 32) ? BLOCK_N_DQ_32 : (D == 64) ? BLOCK_N_DQ_64 : (D == 128) ? BLOCK_N_DQ_128 : BLOCK_N_DQ_256;
-        static constexpr int WARPS_PER_BLOCK    = (D == 16) ? WARPS_DQ_16 : (D == 32) ? WARPS_DQ_32 : (D == 64) ? WARPS_DQ_64 : (D == 128) ? WARPS_DQ_128 : WARPS_DQ_256;
-        static constexpr int THREADS_PER_BLOCK  = WARPS_PER_BLOCK * MAX_THREADS_PER_WARP;
-        static constexpr int THREADS_PER_ROW    = THREADS_PER_BLOCK / BLOCK_M;
+        static constexpr int WARPS_PER_BLOCK    = WARPS;
+        static constexpr int THREADS_PER_ROW    = (WARPS_PER_BLOCK * MAX_THREADS_PER_WARP) / BLOCK_M;
         static constexpr int PAD                = (8 - (D % 32) + 32) % 32;
         static constexpr int Q_STRIDE           = D + PAD;
         static constexpr int KV_STRIDE          = D + PAD;
-        static constexpr int S_STRIDE           = BLOCK_N + PAD;
+        static constexpr int S_STRIDE           = BLOCK_N + PAD + (((BLOCK_N + PAD) % 32 == 0) ? 1 : 0);
         static constexpr int PER_UINT4          = 8;
     };
     struct DKV {
         static constexpr int BLOCK_M            = (D == 16) ? BLOCK_M_DKV_16 : (D == 32) ? BLOCK_M_DKV_32 : (D == 64) ? BLOCK_M_DKV_64 : (D == 128) ? BLOCK_M_DKV_128 : BLOCK_M_DKV_256;
         static constexpr int BLOCK_N            = (D == 16) ? BLOCK_N_DKV_16 : (D == 32) ? BLOCK_N_DKV_32 : (D == 64) ? BLOCK_N_DKV_64 : (D == 128) ? BLOCK_N_DKV_128 : BLOCK_N_DKV_256;
-        static constexpr int WARPS_PER_BLOCK    = (D == 16) ? WARPS_DKV_16 : (D == 32) ? WARPS_DKV_32 : (D == 64) ? WARPS_DKV_64 : (D == 128) ? WARPS_DKV_128 : WARPS_DKV_256;
-        static constexpr int THREADS_PER_BLOCK  = WARPS_PER_BLOCK * MAX_THREADS_PER_WARP;
-        static constexpr int THREADS_PER_ROW    = THREADS_PER_BLOCK / BLOCK_N;
+        static constexpr int WARPS_PER_BLOCK    = WARPS;
+        static constexpr int THREADS_PER_ROW    = (WARPS_PER_BLOCK * MAX_THREADS_PER_WARP) / BLOCK_N;
         static constexpr int PAD                = 8;
         static constexpr int Q_STRIDE           = D + PAD;
         static constexpr int KV_STRIDE          = D + PAD;
-        static constexpr int S_STRIDE           = BLOCK_M + PAD;
+        static constexpr int S_STRIDE           = BLOCK_M + PAD + (((BLOCK_M + PAD) % 32 == 0) ? 1 : 0);
         static constexpr int PER_UINT4          = 8;
     };
 
-    static constexpr int MAX_THREADS = (DQ::THREADS_PER_BLOCK > DKV::THREADS_PER_BLOCK) ? DQ::THREADS_PER_BLOCK : DKV::THREADS_PER_BLOCK;
-    static constexpr int MAX_LSE = (DQ::BLOCK_M > DKV::BLOCK_N) ? DQ::BLOCK_M : DKV::BLOCK_N;
+    static constexpr int THREADS_PER_BLOCK  = WARPS * MAX_THREADS_PER_WARP;
 
     struct alignas(128) SmemLayout {
         union PhaseMem {
@@ -112,8 +101,8 @@ struct KernelConfig {
                     alignas(16) float dV[ DKV::BLOCK_M * DKV::KV_STRIDE ];
                 } dkv;
         } phase;
-                    alignas(16) float lse     [MAX_LSE];
-                    alignas(16) float row_dot [MAX_LSE];
+                    alignas(16) float lse     [ (DQ::BLOCK_M > DKV::BLOCK_N) ? DQ::BLOCK_M : DKV::BLOCK_N ];
+                    alignas(16) float row_dot [ (DQ::BLOCK_M > DKV::BLOCK_N) ? DQ::BLOCK_M : DKV::BLOCK_N ];
     };
 
     static constexpr size_t TOTAL_SMEM = ((sizeof(SmemLayout) + 127) & ~size_t(127));
