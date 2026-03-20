@@ -36,7 +36,7 @@
 #define WARPS 16
 
 // ============================================================================
-// COMPILE-TIME CONFIGURATION & SHARED MEMORY LAYOUT
+// CONFIGURATION DQ/KV
 // ============================================================================
 template<int D>
 struct KernelConfig {
@@ -46,10 +46,8 @@ struct KernelConfig {
         static constexpr int WARPS_PER_BLOCK    = WARPS;
         static constexpr int THREADS_PER_ROW    = (WARPS_PER_BLOCK * MAX_THREADS_PER_WARP) / BLOCK_M;
         static constexpr int PAD                = (8 - (D % 32) + 32) % 32;
-        static constexpr int Q_STRIDE           = D + PAD;
-        static constexpr int KV_STRIDE          = D + PAD;
-        static constexpr int S_STRIDE           = BLOCK_N + PAD + (((BLOCK_N + PAD) % 32 == 0) ? 1 : 0);
-        static constexpr int PER_UINT4          = 8;
+        static constexpr int D_STRIDE           = D + PAD + (((D + PAD) % 64 == 0) ? 1 : 0);
+        static constexpr int N_STRIDE           = BLOCK_N + PAD + (((BLOCK_N + PAD) % 32 == 0) ? 1 : 0);
     };
     struct DKV {
         static constexpr int BLOCK_M            = (D == 16) ? BLOCK_M_DKV_16 : (D == 32) ? BLOCK_M_DKV_32 : (D == 64) ? BLOCK_M_DKV_64 : (D == 128) ? BLOCK_M_DKV_128 : BLOCK_M_DKV_256;
@@ -57,10 +55,8 @@ struct KernelConfig {
         static constexpr int WARPS_PER_BLOCK    = WARPS;
         static constexpr int THREADS_PER_ROW    = (WARPS_PER_BLOCK * MAX_THREADS_PER_WARP) / BLOCK_N;
         static constexpr int PAD                = 8;
-        static constexpr int Q_STRIDE           = D + PAD;
-        static constexpr int KV_STRIDE          = D + PAD;
-        static constexpr int S_STRIDE           = BLOCK_M + PAD + (((BLOCK_M + PAD) % 32 == 0) ? 1 : 0);
-        static constexpr int PER_UINT4          = 8;
+        static constexpr int D_STRIDE           = D + PAD + (((D + PAD) % 64 == 0) ? 1 : 0);
+        static constexpr int M_STRIDE           = BLOCK_M + PAD + (((BLOCK_M + PAD) % 32 == 0) ? 1 : 0);
     };
 
     static constexpr int THREADS_PER_BLOCK  = WARPS * MAX_THREADS_PER_WARP;
@@ -69,36 +65,36 @@ struct KernelConfig {
         union PhaseMem {
             struct DQ_Phase {
                 union {
-                    alignas(16) __half k  [ DQ::BLOCK_N * DQ::KV_STRIDE ];
-                    alignas(16) __half v  [ DQ::BLOCK_N * DQ::KV_STRIDE ];
+                    alignas(16) __half k  [ DQ::BLOCK_N * DQ::D_STRIDE ];
+                    alignas(16) __half v  [ DQ::BLOCK_N * DQ::D_STRIDE ];
                 } reuse_kv;
-                    alignas(16) __half dO [ DQ::BLOCK_M * DQ::Q_STRIDE ];
-                    alignas(16) __half q  [ DQ::BLOCK_M * DQ::Q_STRIDE ];
-                    alignas(16) float  s  [ DQ::BLOCK_M * DQ::S_STRIDE ];
+                    alignas(16) __half dO [ DQ::BLOCK_M * DQ::D_STRIDE ];
+                    alignas(16) __half q  [ DQ::BLOCK_M * DQ::D_STRIDE ];
+                    alignas(16) float  s  [ DQ::BLOCK_M * DQ::N_STRIDE ];
                 union {
-                    alignas(16) float  dOV[ DQ::BLOCK_M * DQ::S_STRIDE ];
-                    alignas(16) __half dS [ DQ::BLOCK_M * DQ::S_STRIDE ];
+                    alignas(16) float  dOV[ DQ::BLOCK_M * DQ::N_STRIDE ];
+                    alignas(16) __half dS [ DQ::BLOCK_M * DQ::N_STRIDE ];
                 } reuse_sdOVS;
-                    alignas(16) float  dQ [ DQ::BLOCK_M * DQ::Q_STRIDE ];
+                    alignas(16) float  dQ [ DQ::BLOCK_M * DQ::D_STRIDE ];
             } dq;
 
             struct DKV_Phase {
-                    alignas(16) __half k [ DKV::BLOCK_M * DKV::KV_STRIDE ];
-                    alignas(16) __half v [ DKV::BLOCK_M * DKV::KV_STRIDE ];
+                    alignas(16) __half k [ DKV::BLOCK_M * DKV::D_STRIDE ];
+                    alignas(16) __half v [ DKV::BLOCK_M * DKV::D_STRIDE ];
                 union {
-                    alignas(16) __half dO[ DKV::BLOCK_N * DKV::Q_STRIDE ];
-                    alignas(16) __half q [ DKV::BLOCK_N * DKV::Q_STRIDE ];
+                    alignas(16) __half dO[ DKV::BLOCK_N * DKV::D_STRIDE ];
+                    alignas(16) __half q [ DKV::BLOCK_N * DKV::D_STRIDE ];
                 } reuse_qdO;
                 union {
-                    alignas(16) float  s [ DKV::BLOCK_N * DKV::S_STRIDE ];
+                    alignas(16) float  s [ DKV::BLOCK_N * DKV::M_STRIDE ];
                     alignas(16) __half p [ DKV::BLOCK_N * DKV::BLOCK_M ];
                 } reuse_sp;
                 union {
-                    alignas(16) float  dOV[ DKV::BLOCK_N * DKV::S_STRIDE ];
+                    alignas(16) float  dOV[ DKV::BLOCK_N * DKV::M_STRIDE ];
                     alignas(16) __half dS [ DKV::BLOCK_N * DKV::BLOCK_M ];
                 } reuse_dOVS;
-                    alignas(16) float dK[ DKV::BLOCK_M * DKV::KV_STRIDE ];
-                    alignas(16) float dV[ DKV::BLOCK_M * DKV::KV_STRIDE ];
+                    alignas(16) float dK[ DKV::BLOCK_M * DKV::D_STRIDE ];
+                    alignas(16) float dV[ DKV::BLOCK_M * DKV::D_STRIDE ];
                 } dkv;
         } phase;
                     alignas(16) float lse     [ (DQ::BLOCK_M > DKV::BLOCK_N) ? DQ::BLOCK_M : DKV::BLOCK_N ];

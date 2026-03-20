@@ -53,10 +53,8 @@ flash_attention_backward_kernel(
         constexpr int THREADS_PER_BLOCK  = Config::THREADS_PER_BLOCK;
         constexpr int THREADS_PER_ROW    = Config::DQ::THREADS_PER_ROW;
         constexpr int WARPS_PER_BLOCK    = Config::DQ::WARPS_PER_BLOCK;
-        constexpr int Q_STRIDE           = Config::DQ::Q_STRIDE;
-        constexpr int KV_STRIDE          = Config::DQ::KV_STRIDE;
-        constexpr int S_STRIDE           = Config::DQ::S_STRIDE;
-        constexpr int PER_UINT4          = Config::DQ::PER_UINT4;
+        constexpr int D_STRIDE           = Config::DQ::D_STRIDE;
+        constexpr int N_STRIDE           = Config::DQ::N_STRIDE;
 
         // head index (batch * num_heads + head)
         const int batch_head_id = blockIdx.z;
@@ -109,9 +107,8 @@ flash_attention_backward_kernel(
          float* __restrict__ sdQ           = smem.phase.dq.dQ;
 
         // Vector strides
-        constexpr int  d_stride_uint4  = (D + PER_UINT4 - 1) / PER_UINT4;
-        constexpr int  q_stride_uint4  = (Q_STRIDE  + PER_UINT4 - 1) / PER_UINT4;
-        constexpr int  kv_stride_uint4 = (KV_STRIDE + PER_UINT4 - 1) / PER_UINT4;
+        constexpr int  d_stride_uint4  = (D + 8 - 1) / 8;
+        constexpr int  n_stride_uint4  = (D_STRIDE  + 8 - 1) / 8;
 
         // ========================================================================
         // Load Q (into sQ) and dO (into sdO)
@@ -121,7 +118,7 @@ flash_attention_backward_kernel(
               uint4* sQ_vec  = reinterpret_cast<uint4*>(sQ);
               uint4* sdO_vec = reinterpret_cast<uint4*>(sdO);
 
-        load_tile_uint4_dual(q_vec, do_vec, sQ_vec, sdO_vec, valid_q_rows, d_stride_uint4, q_stride_uint4, tid, THREADS_PER_BLOCK);
+        load_tile_uint4_dual(q_vec, do_vec, sQ_vec, sdO_vec, valid_q_rows, d_stride_uint4, n_stride_uint4, tid, THREADS_PER_BLOCK);
 
         __syncthreads();
 
@@ -152,7 +149,7 @@ flash_attention_backward_kernel(
                     : "memory"
                 );
 
-                const __half* dO_addr = sdO + row * Q_STRIDE + col;
+                const __half* dO_addr = sdO + row * D_STRIDE + col;
                 ushort d_h0, d_h1, d_h2, d_h3;
                 const uint32_t ptr_dO = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(__cvta_generic_to_shared(dO_addr)));
                 asm volatile(
@@ -208,7 +205,7 @@ flash_attention_backward_kernel(
             const uint4* v_vec  = reinterpret_cast<const uint4*>(v_ptr + start_kv * D);
                   uint4* sV_vec = reinterpret_cast<uint4*>(sV);
 
-            load_tile_uint4(v_vec, sV_vec, valid_kv_rows, d_stride_uint4, kv_stride_uint4, tid, THREADS_PER_BLOCK);
+            load_tile_uint4(v_vec, sV_vec, valid_kv_rows, d_stride_uint4, n_stride_uint4, tid, THREADS_PER_BLOCK);
 
             __syncthreads();
 
@@ -244,11 +241,11 @@ flash_attention_backward_kernel(
                 for (int k_tile = 0; k_tile < num_tiles_k_dov; ++k_tile) {
                     const int k_offset = k_tile * WMMA_K;
                     if (k_offset >= D) break;
-                    load_matrix_sync(a_frag, sdO + tile_m * Q_STRIDE + k_offset, Q_STRIDE);
-                    load_matrix_sync(b_frag, sV + tile_n * KV_STRIDE + k_offset, KV_STRIDE);
+                    load_matrix_sync(a_frag, sdO + tile_m * D_STRIDE + k_offset, D_STRIDE);
+                    load_matrix_sync(b_frag, sV + tile_n * D_STRIDE + k_offset, D_STRIDE);
                     mma_sync(acc_frag, a_frag, b_frag, acc_frag);
                 }
-                store_matrix_sync(sdOV + tile_m * S_STRIDE + tile_n, acc_frag, S_STRIDE, mem_row_major);
+                store_matrix_sync(sdOV + tile_m * N_STRIDE + tile_n, acc_frag, N_STRIDE, mem_row_major);
             }
             __syncthreads();
 
@@ -258,7 +255,7 @@ flash_attention_backward_kernel(
             const uint4* k_vec  = reinterpret_cast<const uint4*>(k_ptr + start_kv * D);
                   uint4* sK_vec = reinterpret_cast<uint4*>(sK);
 
-            load_tile_uint4(k_vec, sK_vec, valid_kv_rows, d_stride_uint4, kv_stride_uint4, tid, THREADS_PER_BLOCK);
+            load_tile_uint4(k_vec, sK_vec, valid_kv_rows, d_stride_uint4, n_stride_uint4, tid, THREADS_PER_BLOCK);
 
             __syncthreads();
 
@@ -296,8 +293,8 @@ flash_attention_backward_kernel(
                 for (int k_tile = 0; k_tile < num_tiles_k_qk; ++k_tile) {
                     const int k_offset = k_tile * WMMA_K;
                     if (k_offset >= D) break;
-                    load_matrix_sync(a_frag, sQ + tile_m * Q_STRIDE + k_offset, Q_STRIDE);
-                    load_matrix_sync(b_frag, sK + tile_n * KV_STRIDE + k_offset, KV_STRIDE);
+                    load_matrix_sync(a_frag, sQ + tile_m * D_STRIDE + k_offset, D_STRIDE);
+                    load_matrix_sync(b_frag, sK + tile_n * D_STRIDE + k_offset, D_STRIDE);
                     mma_sync(acc_frag, a_frag, b_frag, acc_frag);
                 }
                 // Fused scaling + causal mask
@@ -323,7 +320,7 @@ flash_attention_backward_kernel(
                         acc_frag.x[i] *= softmax_scale;
                     }
                 }
-                store_matrix_sync(sS + tile_m * S_STRIDE + tile_n, acc_frag, S_STRIDE, mem_row_major);
+                store_matrix_sync(sS + tile_m * N_STRIDE + tile_n, acc_frag, N_STRIDE, mem_row_major);
             }
             __syncthreads();
 
@@ -334,9 +331,9 @@ flash_attention_backward_kernel(
                 const int row = tid / THREADS_PER_ROW;
                 const int thread_in_row = tid % THREADS_PER_ROW;
 
-                 float* sS_row   = sS   + row * S_STRIDE;
-                 float* sdOV_row = sdOV + row * S_STRIDE;
-                __half* sdS_row  = sdS  + row * S_STRIDE;
+                 float* sS_row   = sS   + row * N_STRIDE;
+                 float* sdOV_row = sdOV + row * N_STRIDE;
+                __half* sdS_row  = sdS  + row * N_STRIDE;
 
                 const float lse_val     = sLse[row];
                 const float row_dot_val = sRowDot[row];
@@ -435,19 +432,19 @@ flash_attention_backward_kernel(
                     const int k_offset = k_tile * WMMA_K;
                     if (k_offset >= valid_kv_rows) break;
 
-                    load_matrix_sync(a_frag, sdS + tile_m * S_STRIDE + k_offset, S_STRIDE);
-                    load_matrix_sync(b_frag, sK + k_offset * KV_STRIDE + tile_n, KV_STRIDE);
+                    load_matrix_sync(a_frag, sdS + tile_m * N_STRIDE + k_offset, N_STRIDE);
+                    load_matrix_sync(b_frag, sK + k_offset * D_STRIDE + tile_n, D_STRIDE);
                     mma_sync(acc_frag, a_frag, b_frag, acc_frag);
                 }
 
                 fragment<accumulator, WMMA_M, WMMA_N, WMMA_K, float> curr_frag;
-                load_matrix_sync(curr_frag, sdQ + tile_m * Q_STRIDE + tile_n, Q_STRIDE, mem_row_major);
+                load_matrix_sync(curr_frag, sdQ + tile_m * D_STRIDE + tile_n, D_STRIDE, mem_row_major);
 
                 #pragma unroll
                 for (int i = 0; i < curr_frag.num_elements; ++i) {
                     curr_frag.x[i] += acc_frag.x[i];
                 }
-                store_matrix_sync(sdQ + tile_m * Q_STRIDE + tile_n, curr_frag, Q_STRIDE, mem_row_major);
+                store_matrix_sync(sdQ + tile_m * D_STRIDE + tile_n, curr_frag, D_STRIDE, mem_row_major);
             }
             __syncthreads();
         } // END MAIN LOOP
@@ -460,7 +457,7 @@ flash_attention_backward_kernel(
             const int row = i / (D / 4);
             const int col = (i % (D / 4)) * 4;
 
-            const float* s_dQ_row = sdQ + row * Q_STRIDE;
+            const float* s_dQ_row = sdQ + row * D_STRIDE;
 
             const __half h0 = __float2half_rn(s_dQ_row[col + 0]);
             const __half h1 = __float2half_rn(s_dQ_row[col + 1]);
@@ -492,10 +489,8 @@ flash_attention_backward_kernel(
         constexpr int THREADS_PER_BLOCK  = Config::THREADS_PER_BLOCK;
         constexpr int THREADS_PER_ROW    = Config::DKV::THREADS_PER_ROW;
         constexpr int WARPS_PER_BLOCK    = Config::DKV::WARPS_PER_BLOCK;
-        constexpr int Q_STRIDE           = Config::DKV::Q_STRIDE;
-        constexpr int KV_STRIDE          = Config::DKV::KV_STRIDE;
-        constexpr int S_STRIDE           = Config::DKV::S_STRIDE;
-        constexpr int PER_UINT4          = Config::DKV::PER_UINT4;
+        constexpr int D_STRIDE           = Config::DKV::D_STRIDE;
+        constexpr int M_STRIDE           = Config::DKV::M_STRIDE;
 
         // head index (batch * num_heads + head)
         const int batch_head_id = blockIdx.z;
@@ -541,9 +536,8 @@ flash_attention_backward_kernel(
          float* __restrict__ sdV           = smem.phase.dkv.dV;
 
         // Vector strides
-        constexpr int  d_stride_uint4  = (D + PER_UINT4 - 1) / PER_UINT4;
-        constexpr int  q_stride_uint4  = (Q_STRIDE  + PER_UINT4 - 1) / PER_UINT4;
-        constexpr int  kv_stride_uint4 = (KV_STRIDE + PER_UINT4 - 1) / PER_UINT4;
+        constexpr int  d_stride_uint4  = (D + 8 - 1) / 8;
+        constexpr int  n_stride_uint4  = (D_STRIDE  + 8 - 1) / 8;
 
         // ========================================================================
         // Load K (into sK) and V (into sV)
@@ -553,7 +547,7 @@ flash_attention_backward_kernel(
               uint4* sK_vec = reinterpret_cast<uint4*>(sK);
               uint4* sV_vec = reinterpret_cast<uint4*>(sV);
 
-        load_tile_uint4_dual(k_vec, v_vec, sK_vec, sV_vec, valid_kv_rows, d_stride_uint4, kv_stride_uint4, tid, THREADS_PER_BLOCK);
+        load_tile_uint4_dual(k_vec, v_vec, sK_vec, sV_vec, valid_kv_rows, d_stride_uint4, n_stride_uint4, tid, THREADS_PER_BLOCK);
 
         __syncthreads();
 
@@ -574,7 +568,7 @@ flash_attention_backward_kernel(
             const uint4* q_vec  = reinterpret_cast<const uint4*>(q_ptr + start_q * D);
                   uint4* sQ_vec = reinterpret_cast<uint4*>(sdO);
 
-            load_tile_uint4(q_vec, sQ_vec, valid_q_rows, d_stride_uint4, q_stride_uint4, tid, THREADS_PER_BLOCK);
+            load_tile_uint4(q_vec, sQ_vec, valid_q_rows, d_stride_uint4, n_stride_uint4, tid, THREADS_PER_BLOCK);
 
             __syncthreads();
 
@@ -610,8 +604,8 @@ flash_attention_backward_kernel(
                 for (int k_tile = 0; k_tile < num_tiles_k_qk; ++k_tile) {
                     const int k_offset = k_tile * WMMA_K;
                     if (k_offset >= D) break;
-                    load_matrix_sync(a_frag, sQ + tile_m * Q_STRIDE + k_offset, Q_STRIDE);
-                    load_matrix_sync(b_frag, sK + tile_n * KV_STRIDE + k_offset, KV_STRIDE);
+                    load_matrix_sync(a_frag, sQ + tile_m * D_STRIDE + k_offset, D_STRIDE);
+                    load_matrix_sync(b_frag, sK + tile_n * D_STRIDE + k_offset, D_STRIDE);
                     mma_sync(acc_frag, a_frag, b_frag, acc_frag);
                 }
                 // Fused scaling + causal mask
@@ -637,7 +631,7 @@ flash_attention_backward_kernel(
                         acc_frag.x[i] *= softmax_scale;
                     }
                 }
-                store_matrix_sync(sS + tile_m * S_STRIDE + tile_n, acc_frag, S_STRIDE, mem_row_major);
+                store_matrix_sync(sS + tile_m * M_STRIDE + tile_n, acc_frag, M_STRIDE, mem_row_major);
             }
             __syncthreads();
 
@@ -647,7 +641,7 @@ flash_attention_backward_kernel(
             const uint4* do_vec  = reinterpret_cast<const uint4*>(dO_ptr + start_q * D);
                   uint4* sdO_vec = reinterpret_cast<uint4*>(sdO);
 
-            load_tile_uint4(do_vec, sdO_vec, valid_q_rows, d_stride_uint4, q_stride_uint4, tid, THREADS_PER_BLOCK);
+            load_tile_uint4(do_vec, sdO_vec, valid_q_rows, d_stride_uint4, n_stride_uint4, tid, THREADS_PER_BLOCK);
 
             __syncthreads();
 
@@ -680,7 +674,7 @@ flash_attention_backward_kernel(
                         : "memory"
                     );
 
-                    const half* dO_addr = sdO + row * Q_STRIDE + col;
+                    const half* dO_addr = sdO + row * D_STRIDE + col;
                     ushort d_h0, d_h1, d_h2, d_h3;
                     const uint32_t ptr_dO = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(__cvta_generic_to_shared(dO_addr)));
                     asm volatile(
@@ -747,11 +741,11 @@ flash_attention_backward_kernel(
                 for (int k_tile = 0; k_tile < num_tiles_k_dov; ++k_tile) {
                     const int k_offset = k_tile * WMMA_K;
                     if (k_offset >= D) break;
-                    load_matrix_sync(a_frag, sdO + tile_m * Q_STRIDE + k_offset, Q_STRIDE);
-                    load_matrix_sync(b_frag, sV + tile_n * KV_STRIDE + k_offset, KV_STRIDE);
+                    load_matrix_sync(a_frag, sdO + tile_m * D_STRIDE + k_offset, D_STRIDE);
+                    load_matrix_sync(b_frag, sV + tile_n * D_STRIDE + k_offset, D_STRIDE);
                     mma_sync(acc_frag, a_frag, b_frag, acc_frag);
                 }
-                store_matrix_sync(sdOV + tile_m * S_STRIDE + tile_n, acc_frag, S_STRIDE, mem_row_major);
+                store_matrix_sync(sdOV + tile_m * M_STRIDE + tile_n, acc_frag, M_STRIDE, mem_row_major);
             }
             __syncthreads();
 
@@ -787,8 +781,8 @@ flash_attention_backward_kernel(
                     valid1 = in_bounds1 && causal_ok1;
                 }
 
-                if (valid0) { s0 = sS[row0 * S_STRIDE + col0]; dov0 = sdOV[row0 * S_STRIDE + col0]; } else { s0 = NEG_INF; }
-                if (valid1) { s1 = sS[row1 * S_STRIDE + col1]; dov1 = sdOV[row1 * S_STRIDE + col1]; } else { s1 = NEG_INF; }
+                if (valid0) { s0 = sS[row0 * M_STRIDE + col0]; dov0 = sdOV[row0 * M_STRIDE + col0]; } else { s0 = NEG_INF; }
+                if (valid1) { s1 = sS[row1 * M_STRIDE + col1]; dov1 = sdOV[row1 * M_STRIDE + col1]; } else { s1 = NEG_INF; }
 
                 float lse0 = sLse[row0];
                 float lse1 = (valid1 && row1 != row0) ? sLse[row1] : lse0;
@@ -849,7 +843,7 @@ flash_attention_backward_kernel(
                 fragment<matrix_a, WMMA_M, WMMA_N, WMMA_K, __half, col_major> a_frag;
                 fragment<matrix_b, WMMA_M, WMMA_N, WMMA_K, __half, row_major> b_frag;
                 fragment<accumulator, WMMA_M, WMMA_N, WMMA_K, float> acc_frag;
-                load_matrix_sync(acc_frag, sdV + tile_m * KV_STRIDE + tile_n, KV_STRIDE, mem_row_major);
+                load_matrix_sync(acc_frag, sdV + tile_m * D_STRIDE + tile_n, D_STRIDE, mem_row_major);
 
                 #pragma unroll
                 for (int k_tile = 0; k_tile < num_tiles_k_dv; ++k_tile) {
@@ -857,10 +851,10 @@ flash_attention_backward_kernel(
                     if (k_offset >= valid_q_rows) break;
 
                     load_matrix_sync(a_frag, sP + k_offset * BLOCK_M + tile_m, BLOCK_M);
-                    load_matrix_sync(b_frag, sdO + k_offset * Q_STRIDE + tile_n, Q_STRIDE);
+                    load_matrix_sync(b_frag, sdO + k_offset * D_STRIDE + tile_n, D_STRIDE);
                     mma_sync(acc_frag, a_frag, b_frag, acc_frag);
                 }
-                store_matrix_sync(sdV + tile_m * KV_STRIDE + tile_n, acc_frag, KV_STRIDE, mem_row_major);
+                store_matrix_sync(sdV + tile_m * D_STRIDE + tile_n, acc_frag, D_STRIDE, mem_row_major);
             }
             __syncthreads();
 
@@ -869,7 +863,7 @@ flash_attention_backward_kernel(
             // ========================================================================
             __half* sQ = sdO;
 
-            load_tile_uint4(q_vec, sQ_vec, valid_q_rows, d_stride_uint4, q_stride_uint4, tid, THREADS_PER_BLOCK);
+            load_tile_uint4(q_vec, sQ_vec, valid_q_rows, d_stride_uint4, n_stride_uint4, tid, THREADS_PER_BLOCK);
 
             __syncthreads();
 
@@ -897,7 +891,7 @@ flash_attention_backward_kernel(
                 fragment<matrix_a, WMMA_M, WMMA_N, WMMA_K, __half, col_major> a_frag;
                 fragment<matrix_b, WMMA_M, WMMA_N, WMMA_K, __half, row_major> b_frag;
                 fragment<accumulator, WMMA_M, WMMA_N, WMMA_K, float> acc_frag;
-                load_matrix_sync(acc_frag, sdK + tile_m * KV_STRIDE + tile_n, KV_STRIDE, mem_row_major);
+                load_matrix_sync(acc_frag, sdK + tile_m * D_STRIDE + tile_n, D_STRIDE, mem_row_major);
 
                 #pragma unroll
                 for (int k_tile = 0; k_tile < num_tiles_k_dk; ++k_tile) {
@@ -905,10 +899,10 @@ flash_attention_backward_kernel(
                     if (k_offset >= valid_q_rows) break;
 
                     load_matrix_sync(a_frag, sdS + k_offset * BLOCK_M + tile_m, BLOCK_M);
-                    load_matrix_sync(b_frag, sQ + k_offset * Q_STRIDE + tile_n, Q_STRIDE);
+                    load_matrix_sync(b_frag, sQ + k_offset * D_STRIDE + tile_n, D_STRIDE);
                     mma_sync(acc_frag, a_frag, b_frag, acc_frag);
                 }
-                store_matrix_sync(sdK + tile_m * KV_STRIDE + tile_n, acc_frag, KV_STRIDE, mem_row_major);
+                store_matrix_sync(sdK + tile_m * D_STRIDE + tile_n, acc_frag, D_STRIDE, mem_row_major);
             }
             __syncthreads();
         }
@@ -921,8 +915,8 @@ flash_attention_backward_kernel(
             const int row = i / (D / 4);
             const int col = (i % (D / 4)) * 4;
 
-            const float* s_dK_row = sdK + row * KV_STRIDE;
-            const float* s_dV_row = sdV + row * KV_STRIDE;
+            const float* s_dK_row = sdK + row * D_STRIDE;
+            const float* s_dV_row = sdV + row * D_STRIDE;
 
             const __half hk0 = __float2half_rn(s_dK_row[col + 0]);
             const __half hk1 = __float2half_rn(s_dK_row[col + 1]);

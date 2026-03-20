@@ -21,7 +21,7 @@
 #define WARPS 16
 
 // ============================================================================
-// COMPILE-TIME CONFIG
+// CONFIGURATIONS
 // ============================================================================
 template<int D>
 struct KernelConfig {
@@ -31,23 +31,20 @@ struct KernelConfig {
     static constexpr int THREADS_PER_BLOCK = WARPS_PER_BLOCK * MAX_THREADS_PER_WARP;
     static constexpr int THREADS_PER_ROW   = THREADS_PER_BLOCK / BLOCK_M;
     static constexpr int PAD               = (8 - (D % 32) + 32) % 32;
-    static constexpr int Q_STRIDE          = D + PAD;
-    static constexpr int KV_STRIDE         = D + PAD;
-    static constexpr int S_STRIDE          = BLOCK_N + PAD + (((BLOCK_N + PAD) % 32 == 0) ? 1 : 0);
-    static constexpr int O_STRIDE          = D + PAD;
-    static constexpr int PER_UINT4         = 8;
+    static constexpr int D_STRIDE          = D + PAD + (((D + PAD) % 64 == 0) ? 1 : 0);
+    static constexpr int N_STRIDE          = BLOCK_N + PAD + (((BLOCK_N + PAD) % 32 == 0) ? 1 : 0);
 
     struct alignas(128) SmemLayout {
-        alignas(16) __half q      [BLOCK_M * Q_STRIDE];
+        alignas(16) __half q      [BLOCK_M * D_STRIDE];
     union {
-        alignas(16) __half k      [BLOCK_N * KV_STRIDE];
-        alignas(16) __half v      [BLOCK_N * KV_STRIDE];
+        alignas(16) __half k      [BLOCK_N * D_STRIDE];
+        alignas(16) __half v      [BLOCK_N * D_STRIDE];
     } reuse_kv;
     union {
-        alignas(16) float  s      [BLOCK_M * S_STRIDE];
-        alignas(16) __half p      [BLOCK_M * S_STRIDE];
+        alignas(16) float  s      [BLOCK_M * N_STRIDE];
+        alignas(16) __half p      [BLOCK_M * N_STRIDE];
     } reuse_sp;
-        alignas(16) float  o      [BLOCK_M * O_STRIDE];
+        alignas(16) float  o      [BLOCK_M * D_STRIDE];
         alignas(16) float  row_max[BLOCK_M];
         alignas(16) float  row_sum[BLOCK_M];
     };
