@@ -16,6 +16,7 @@ using namespace nvcuda::wmma;
 #include "00_volta_const.cuh"
 #include "01_backward_config.cuh"
 #include "02_fused_func.cuh"
+#include "03_wmma.cuh"
 
 // ======================================================================================
 // BACKWARD KERNEL
@@ -224,43 +225,17 @@ flash_attention_backward_kernel(
             __syncthreads();
 
             // ==================================================================================
-            // Compute dOV = dO @ V^T
+            // Compute:  dOV = dO @ V^T
+            // Layout:   dO[row: BLOCK_M, D], V[col: BLOCK_N, D] -> dOV[row: BLOCK_M, col: BLOCK_N]
+            // Template: BLOCK_X=BLOCK_M, BLOCK_Y=BLOCK_N
             // ==================================================================================
-            const int num_tiles_m_dov    = (BLOCK_M + WMMA_M - 1) / WMMA_M;   // dO @ V^T: along M
-            const int num_tiles_n_dov    = (BLOCK_N + WMMA_N - 1) / WMMA_N;   // dO @ V^T: along N
-            const int num_tiles_k_dov    = (D + WMMA_K - 1) / WMMA_K;         // dO @ V^T: inner along D
-            const int total_tiles_dov    = num_tiles_m_dov * num_tiles_n_dov;
-            const int tiles_per_warp_dov = (total_tiles_dov + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
+            WMMA_GEMM_SCORES<GemmType::dOV_dOVT, D, IS_CAUSAL, BLOCK_M, BLOCK_N, D_STRIDE, N_STRIDE, WARPS_PER_BLOCK>(
+            sdO, sV, sdOV,
+            valid_q_rows, valid_kv_rows,
+            0,            0,
+                  1.0f,
+            warp_id, lane_id);
 
-            for (int tile_idx = 0; tile_idx < tiles_per_warp_dov; ++tile_idx) {
-                const int global_tile_idx = warp_id * tiles_per_warp_dov + tile_idx;
-
-                if (global_tile_idx >= total_tiles_dov) break;
-
-                const int tile_m_idx = global_tile_idx / num_tiles_n_dov;
-                const int tile_n_idx = global_tile_idx % num_tiles_n_dov;
-
-                const int tile_m = tile_m_idx * WMMA_M;
-                const int tile_n = tile_n_idx * WMMA_N;
-
-                if (tile_m >= valid_q_rows || tile_n >= valid_kv_rows) continue;
-
-                fragment<matrix_a, WMMA_M, WMMA_N, WMMA_K, __half, row_major> a_frag;
-                fragment<matrix_b, WMMA_M, WMMA_N, WMMA_K, __half, col_major> b_frag;
-                fragment<accumulator, WMMA_M, WMMA_N, WMMA_K, float> acc_frag;
-
-                fill_fragment(acc_frag, 0.0f);
-
-                #pragma unroll
-                for (int k_tile = 0; k_tile < num_tiles_k_dov; ++k_tile) {
-                    const int k_offset = k_tile * WMMA_K;
-                    if (k_offset >= D) break;
-                    load_matrix_sync(a_frag, sdO + tile_m * D_STRIDE + k_offset, D_STRIDE);
-                    load_matrix_sync(b_frag, sV + tile_n * D_STRIDE + k_offset, D_STRIDE);
-                    mma_sync(acc_frag, a_frag, b_frag, acc_frag);
-                }
-                store_matrix_sync(sdOV + tile_m * N_STRIDE + tile_n, acc_frag, N_STRIDE, mem_row_major);
-            }
             __syncthreads();
 
             // ==================================================================================
@@ -276,68 +251,17 @@ flash_attention_backward_kernel(
             __syncthreads();
 
             // ==================================================================================
-            // Compute S = Q @ K^T
+            // Compute:  S = Q @ K^T
+            // Layout:   Q[row: BLOCK_M, D], K[col: BLOCK_N, D] -> S[row: BLOCK_M, col: BLOCK_N]
+            // Template: BLOCK_X=BLOCK_M, BLOCK_Y=BLOCK_N
             // ==================================================================================
-            const int num_tiles_m_qk    = (BLOCK_M + WMMA_M - 1) / WMMA_M;   // Q @ K^T: along M
-            const int num_tiles_n_qk    = (BLOCK_N + WMMA_N - 1) / WMMA_N;   // Q @ K^T: along N
-            const int num_tiles_k_qk    = (D + WMMA_K - 1) / WMMA_K;         // Q @ K^T: inner along D
-            const int total_tiles_qk    = num_tiles_m_qk * num_tiles_n_qk;
-            const int tiles_per_warp_qk = (total_tiles_qk + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
-            const unsigned row_causal   = (lane_id & 0b1) + ((lane_id >> 2) & 0b1) * 8 + ((lane_id >> 4) & 0b1) * 4;
-            const unsigned col_causal   = ((lane_id >> 1) & 0b1) * 2 + ((lane_id >> 3) & 0b1) * 8;
+            WMMA_GEMM_SCORES<GemmType::sQ_KT, D, IS_CAUSAL, BLOCK_M, BLOCK_N, D_STRIDE, N_STRIDE, WARPS_PER_BLOCK>(
+            sQ, sK, sS,
+            valid_q_rows, valid_kv_rows,
+            start_q,      start_kv,
+            softmax_scale,
+            warp_id,      lane_id);
 
-            for (int tile_idx = 0; tile_idx < tiles_per_warp_qk; ++tile_idx) {
-                const int global_tile_idx = warp_id * tiles_per_warp_qk + tile_idx;
-
-                if (global_tile_idx >= total_tiles_qk) break;
-
-                const int tile_m_idx = global_tile_idx / num_tiles_n_qk;
-                const int tile_n_idx = global_tile_idx % num_tiles_n_qk;
-
-                const int tile_m = tile_m_idx * WMMA_M;
-                const int tile_n = tile_n_idx * WMMA_N;
-
-                if (tile_m >= valid_q_rows || tile_n >= valid_kv_rows) continue;
-
-                fragment<matrix_a, WMMA_M, WMMA_N, WMMA_K, __half, row_major> a_frag;
-                fragment<matrix_b, WMMA_M, WMMA_N, WMMA_K, __half, col_major> b_frag;
-                fragment<accumulator, WMMA_M, WMMA_N, WMMA_K, float> acc_frag;
-
-                fill_fragment(acc_frag, 0.0f);
-
-                #pragma unroll
-                for (int k_tile = 0; k_tile < num_tiles_k_qk; ++k_tile) {
-                    const int k_offset = k_tile * WMMA_K;
-                    if (k_offset >= D) break;
-                    load_matrix_sync(a_frag, sQ + tile_m * D_STRIDE + k_offset, D_STRIDE);
-                    load_matrix_sync(b_frag, sK + tile_n * D_STRIDE + k_offset, D_STRIDE);
-                    mma_sync(acc_frag, a_frag, b_frag, acc_frag);
-                }
-                // Fused scaling + causal mask
-                if constexpr (IS_CAUSAL) {
-                    #pragma unroll
-                    for (int i = 0; i < acc_frag.num_elements; ++i) {
-                        const unsigned col = col_causal + (i & 0b1) + ((i >> 2) & 0b1) * 4;
-                        const unsigned row = row_causal + ((i >> 1) & 0b1) * 2;
-
-                        const int global_m = start_q + tile_m + row;
-                        const int global_n = start_kv + tile_n + col;
-
-                        const bool is_valid = (global_m < start_q + valid_q_rows) &&
-                                              (global_n < start_kv + valid_kv_rows);
-
-                        acc_frag.x[i] = is_valid
-                            ? ((global_n > global_m) ? NEG_INF : acc_frag.x[i] * softmax_scale)
-                            : NEG_INF;
-                    }
-                } else {
-                    #pragma unroll
-                    for (int i = 0; i < acc_frag.num_elements; ++i) {
-                        acc_frag.x[i] *= softmax_scale;
-                    }
-                }
-                store_matrix_sync(sS + tile_m * N_STRIDE + tile_n, acc_frag, N_STRIDE, mem_row_major);
-            }
             __syncthreads();
 
             // ==================================================================================
@@ -599,66 +523,17 @@ flash_attention_backward_kernel(
             __syncthreads();
 
             // ==================================================================================
-            // Compute S = Q @ K^T
+            // Compute:  S = Q @ K^T
+            // Layout:   Q[row: BLOCK_N, D], K[col: BLOCK_M, D] -> S[row: BLOCK_N, col: BLOCK_M]
+            // Template: BLOCK_X=BLOCK_N, BLOCK_Y=BLOCK_M
             // ==================================================================================
-            const int num_tiles_m_qk    = (BLOCK_N + WMMA_M - 1) / WMMA_M;   // Q @ K^T: along M (Q)
-            const int num_tiles_n_qk    = (BLOCK_M + WMMA_N - 1) / WMMA_N;   // Q @ K^T: along N (K)
-            const int num_tiles_k_qk    = (D + WMMA_K - 1) / WMMA_K;         // Q @ K^T: inner along D
-            const int total_tiles_qk    = num_tiles_m_qk * num_tiles_n_qk;
-            const int tiles_per_warp_qk = (total_tiles_qk + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
-            const unsigned row_causal   = (lane_id & 0b1) + ((lane_id >> 2) & 0b1) * 8 + ((lane_id >> 4) & 0b1) * 4;
-            const unsigned col_causal   = ((lane_id >> 1) & 0b1) * 2 + ((lane_id >> 3) & 0b1) * 8;
+            WMMA_GEMM_SCORES<GemmType::sQ_KT, D, IS_CAUSAL, BLOCK_N, BLOCK_M, D_STRIDE, M_STRIDE, WARPS_PER_BLOCK>(
+            sQ, sK, sS,
+            valid_q_rows, valid_kv_rows,
+            start_q,      start_kv,
+            softmax_scale,
+            warp_id,      lane_id);
 
-            for (int tile_local = 0; tile_local < tiles_per_warp_qk; ++tile_local) {
-                const int tile_idx = warp_id * tiles_per_warp_qk + tile_local;
-                if (tile_idx >= total_tiles_qk) break;
-
-                const int tile_m_idx = tile_idx / num_tiles_n_qk;
-                const int tile_n_idx = tile_idx % num_tiles_n_qk;
-
-                const int tile_m = tile_m_idx * WMMA_M;
-                const int tile_n = tile_n_idx * WMMA_N;
-
-                if (tile_m >= valid_q_rows || tile_n >= valid_kv_rows) continue;
-
-                fragment<matrix_a, WMMA_M, WMMA_N, WMMA_K, __half, row_major> a_frag;
-                fragment<matrix_b, WMMA_M, WMMA_N, WMMA_K, __half, col_major> b_frag;
-                fragment<accumulator, WMMA_M, WMMA_N, WMMA_K, float> acc_frag;
-                fill_fragment(acc_frag, 0.0f);
-
-                #pragma unroll
-                for (int k_tile = 0; k_tile < num_tiles_k_qk; ++k_tile) {
-                    const int k_offset = k_tile * WMMA_K;
-                    if (k_offset >= D) break;
-                    load_matrix_sync(a_frag, sQ + tile_m * D_STRIDE + k_offset, D_STRIDE);
-                    load_matrix_sync(b_frag, sK + tile_n * D_STRIDE + k_offset, D_STRIDE);
-                    mma_sync(acc_frag, a_frag, b_frag, acc_frag);
-                }
-                // Fused scaling + causal mask
-                if constexpr (IS_CAUSAL) {
-                    #pragma unroll
-                    for (int i = 0; i < acc_frag.num_elements; ++i) {
-                        const unsigned col = col_causal + (i & 0b1) + ((i >> 2) & 0b1) * 4;
-                        const unsigned row = row_causal + ((i >> 1) & 0b1) * 2;
-
-                        const int global_m = start_q + tile_m + row;
-                        const int global_n = start_kv  + tile_n + col;
-
-                        const bool is_valid = (global_m < start_q + valid_q_rows) &&
-                                              (global_n < start_kv  + valid_kv_rows);
-
-                        acc_frag.x[i] = is_valid
-                            ? ((global_n > global_m) ? NEG_INF : acc_frag.x[i] * softmax_scale)
-                            : NEG_INF;
-                    }
-                } else {
-                    #pragma unroll
-                    for (int i = 0; i < acc_frag.num_elements; ++i) {
-                        acc_frag.x[i] *= softmax_scale;
-                    }
-                }
-                store_matrix_sync(sS + tile_m * M_STRIDE + tile_n, acc_frag, M_STRIDE, mem_row_major);
-            }
             __syncthreads();
 
             // ==================================================================================
@@ -740,41 +615,16 @@ flash_attention_backward_kernel(
             __syncthreads();
 
             // ==================================================================================
-            // Compute dOV = dO @ V^T
+            // Compute:  dOV = dO @ V^T
+            // Layout:   dO[row: BLOCK_N, D], V[col: BLOCK_M, D] -> dOV[row: BLOCK_N, col: BLOCK_M]
+            // Template: BLOCK_X=BLOCK_N, BLOCK_Y=BLOCK_M
             // ==================================================================================
-            const int num_tiles_m_dov    = (BLOCK_N + WMMA_M - 1) / WMMA_M;   // dO @ V^T: along M
-            const int num_tiles_n_dov    = (BLOCK_M + WMMA_N - 1) / WMMA_N;   // dO @ V^T: along N
-            const int num_tiles_k_dov    = (D + WMMA_K - 1) / WMMA_K;         // dO @ V^T: inner along D
-            const int total_tiles_dov    = num_tiles_m_dov * num_tiles_n_dov;
-            const int tiles_per_warp_dov = (total_tiles_dov + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
-
-            for (int tile_local = 0; tile_local < tiles_per_warp_dov; ++tile_local) {
-                const int tile_idx = warp_id * tiles_per_warp_dov + tile_local;
-                if (tile_idx >= total_tiles_dov) break;
-
-                const int tile_m_idx = tile_idx / num_tiles_n_dov;
-                const int tile_n_idx = tile_idx % num_tiles_n_dov;
-
-                const int tile_m = tile_m_idx * WMMA_M;
-                const int tile_n = tile_n_idx * WMMA_N;
-
-                if (tile_m >= valid_q_rows || tile_n >= valid_kv_rows) continue;
-
-                fragment<matrix_a, WMMA_M, WMMA_N, WMMA_K, __half, row_major> a_frag;
-                fragment<matrix_b, WMMA_M, WMMA_N, WMMA_K, __half, col_major> b_frag;
-                fragment<accumulator, WMMA_M, WMMA_N, WMMA_K, float> acc_frag;
-                fill_fragment(acc_frag, 0.0f);
-
-                #pragma unroll
-                for (int k_tile = 0; k_tile < num_tiles_k_dov; ++k_tile) {
-                    const int k_offset = k_tile * WMMA_K;
-                    if (k_offset >= D) break;
-                    load_matrix_sync(a_frag, sdO + tile_m * D_STRIDE + k_offset, D_STRIDE);
-                    load_matrix_sync(b_frag, sV + tile_n * D_STRIDE + k_offset, D_STRIDE);
-                    mma_sync(acc_frag, a_frag, b_frag, acc_frag);
-                }
-                store_matrix_sync(sdOV + tile_m * M_STRIDE + tile_n, acc_frag, M_STRIDE, mem_row_major);
-            }
+            WMMA_GEMM_SCORES<GemmType::dOV_dOVT, D, IS_CAUSAL, BLOCK_N, BLOCK_M, D_STRIDE, M_STRIDE, WARPS_PER_BLOCK>(
+            sdO, sV, sdOV,
+            valid_q_rows, valid_kv_rows,
+            0,            0,
+                  1.0f,
+            warp_id, lane_id);
             __syncthreads();
 
             // ==================================================================================
