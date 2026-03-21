@@ -342,51 +342,17 @@ flash_attention_backward_kernel(
             __syncthreads();
 
             // ==================================================================================
-            // Compute dQ += dS @ K
+            // Compute:  dQ += dS @ K
+            // Layout:   dS[row: BLOCK_M, BLOCK_N], K[row: BLOCK_N, D] -> dQ[row: BLOCK_M, D]
+            // Template: BLOCK_X=BLOCK_M, BLOCK_Y=BLOCK_N
             // ==================================================================================
-            const int num_tiles_m_dq    = (BLOCK_M + WMMA_M - 1) / WMMA_M;   // dS @ K: along M
-            const int num_tiles_n_dq    = (D + WMMA_N - 1) / WMMA_N;         // dS @ K: along D
-            const int num_tiles_k_dq    = (BLOCK_N + WMMA_K - 1) / WMMA_K;   // dS @ K: inner along N
-            const int total_tiles_dq    = num_tiles_m_dq * num_tiles_n_dq;
-            const int tiles_per_warp_dq = (total_tiles_dq + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
+            WMMA_GEMM_GRADIENTS<GemmType::dQ_dSK, D, BLOCK_M, BLOCK_N, N_STRIDE, D_STRIDE, WARPS_PER_BLOCK>(
+            sdS, sK, sdQ,
+            valid_q_rows, valid_kv_rows,
+            warp_id,      lane_id);
 
-            for (int tile_local = 0; tile_local < tiles_per_warp_dq; ++tile_local) {
-                const int global_tile_idx = warp_id * tiles_per_warp_dq + tile_local;
-                if (global_tile_idx >= total_tiles_dq) break;
-
-                const int tile_m_idx = global_tile_idx / num_tiles_n_dq;
-                const int tile_n_idx = global_tile_idx % num_tiles_n_dq;
-
-                const int tile_m = tile_m_idx * WMMA_M;
-                const int tile_n = tile_n_idx * WMMA_N;
-
-                if (tile_m >= valid_q_rows || tile_n >= D) continue;
-
-                fragment<matrix_a, WMMA_M, WMMA_N, WMMA_K, __half, row_major> a_frag;
-                fragment<matrix_b, WMMA_M, WMMA_N, WMMA_K, __half, row_major> b_frag;
-                fragment<accumulator, WMMA_M, WMMA_N, WMMA_K, float> acc_frag;
-                fill_fragment(acc_frag, 0.0f);
-
-                #pragma unroll
-                for (int k_tile = 0; k_tile < num_tiles_k_dq; ++k_tile) {
-                    const int k_offset = k_tile * WMMA_K;
-                    if (k_offset >= valid_kv_rows) break;
-
-                    load_matrix_sync(a_frag, sdS + tile_m * N_STRIDE + k_offset, N_STRIDE);
-                    load_matrix_sync(b_frag, sK + k_offset * D_STRIDE + tile_n, D_STRIDE);
-                    mma_sync(acc_frag, a_frag, b_frag, acc_frag);
-                }
-
-                fragment<accumulator, WMMA_M, WMMA_N, WMMA_K, float> curr_frag;
-                load_matrix_sync(curr_frag, sdQ + tile_m * D_STRIDE + tile_n, D_STRIDE, mem_row_major);
-
-                #pragma unroll
-                for (int i = 0; i < curr_frag.num_elements; ++i) {
-                    curr_frag.x[i] += acc_frag.x[i];
-                }
-                store_matrix_sync(sdQ + tile_m * D_STRIDE + tile_n, curr_frag, D_STRIDE, mem_row_major);
-            }
             __syncthreads();
+
         } // END MAIN LOOP
 
         // ==================================================================================
@@ -697,43 +663,16 @@ flash_attention_backward_kernel(
             }
             __syncthreads();
 
-           // ==================================================================================
-           // Compute dV = P^T @ dO
-           // ==================================================================================
-            const int num_tiles_m_dv    = (BLOCK_M + WMMA_M - 1) / WMMA_M;    // P^T @ dO: along M (P^T rows = K rows)
-            const int num_tiles_n_dv    = (D + WMMA_N - 1) / WMMA_N;          // P^T @ dO: along N (dO cols = D)
-            const int num_tiles_k_dv    = (BLOCK_N + WMMA_K - 1) / WMMA_K;    // P^T @ dO: inner along N (cols of P = rows of dO)
-            const int total_tiles_dv    = num_tiles_m_dv * num_tiles_n_dv;
-            const int tiles_per_warp_dv = (total_tiles_dv + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
+            // ==================================================================================
+            // Compute:  dV += P^T @ dO
+            // Layout:   P^T[col: BLOCK_M, BLOCK_N], dO[row: BLOCK_N, D] -> dV[row: BLOCK_M, D]
+            // Template: BLOCK_X=BLOCK_M, BLOCK_Y=BLOCK_N
+            // ==================================================================================
+            WMMA_GEMM_GRADIENTS<GemmType::dV_PTdO, D, BLOCK_M, BLOCK_N, BLOCK_M, D_STRIDE, WARPS_PER_BLOCK>(
+            sP, sdO, sdV,
+            valid_kv_rows, valid_q_rows,
+            warp_id,       lane_id);
 
-            for (int tile_local = 0; tile_local < tiles_per_warp_dv; ++tile_local) {
-                const int tile_idx = warp_id * tiles_per_warp_dv + tile_local;
-                if (tile_idx >= total_tiles_dv) break;
-
-                const int tile_m_idx = tile_idx / num_tiles_n_dv;
-                const int tile_n_idx = tile_idx % num_tiles_n_dv;
-
-                const int tile_m = tile_m_idx * WMMA_M;
-                const int tile_n = tile_n_idx * WMMA_N;
-
-                if (tile_m >= valid_kv_rows || tile_n >= D) continue;
-
-                fragment<matrix_a, WMMA_M, WMMA_N, WMMA_K, __half, col_major> a_frag;
-                fragment<matrix_b, WMMA_M, WMMA_N, WMMA_K, __half, row_major> b_frag;
-                fragment<accumulator, WMMA_M, WMMA_N, WMMA_K, float> acc_frag;
-                load_matrix_sync(acc_frag, sdV + tile_m * D_STRIDE + tile_n, D_STRIDE, mem_row_major);
-
-                #pragma unroll
-                for (int k_tile = 0; k_tile < num_tiles_k_dv; ++k_tile) {
-                    const int k_offset = k_tile * WMMA_K;
-                    if (k_offset >= valid_q_rows) break;
-
-                    load_matrix_sync(a_frag, sP + k_offset * BLOCK_M + tile_m, BLOCK_M);
-                    load_matrix_sync(b_frag, sdO + k_offset * D_STRIDE + tile_n, D_STRIDE);
-                    mma_sync(acc_frag, a_frag, b_frag, acc_frag);
-                }
-                store_matrix_sync(sdV + tile_m * D_STRIDE + tile_n, acc_frag, D_STRIDE, mem_row_major);
-            }
             __syncthreads();
 
             // ==================================================================================
@@ -747,44 +686,18 @@ flash_attention_backward_kernel(
             __syncthreads();
 
             // ==================================================================================
-            // Compute dK = dS^T @ Q
+            // Compute:  dK += dS^T @ Q
+            // Layout:   dS^T[col: BLOCK_M, BLOCK_N], Q[row: BLOCK_N, D] -> dK[row: BLOCK_M, D]
+            // Template: BLOCK_X=BLOCK_M, BLOCK_Y=BLOCK_N
             // ==================================================================================
-            const int num_tiles_m_dk    = (BLOCK_M + WMMA_M - 1) / WMMA_M;    // dS^T @ Q: along M (dS^T rows = K rows)
-            const int num_tiles_n_dk    = (D + WMMA_N - 1) / WMMA_N;          // dS^T @ Q: along N (Q cols = D)
-            const int num_tiles_k_dk    = (BLOCK_N + WMMA_K - 1) / WMMA_K;    // dS^T @ Q: inner along N (cols of dS = rows of Q)
-            const int total_tiles_dk    = num_tiles_m_dk * num_tiles_n_dk;
-            const int tiles_per_warp_dk = (total_tiles_dk + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
+            WMMA_GEMM_GRADIENTS<GemmType::dK_dSTQ, D, BLOCK_M, BLOCK_N, BLOCK_M, D_STRIDE, WARPS_PER_BLOCK>(
+            sdS, sQ, sdK,
+            valid_kv_rows, valid_q_rows,
+            warp_id,       lane_id);
 
-            for (int tile_local = 0; tile_local < tiles_per_warp_dk; ++tile_local) {
-                const int tile_idx = warp_id * tiles_per_warp_dk + tile_local;
-                if (tile_idx >= total_tiles_dk) break;
-
-                const int tile_m_idx = tile_idx / num_tiles_n_dk;
-                const int tile_n_idx = tile_idx % num_tiles_n_dk;
-
-                const int tile_m = tile_m_idx * WMMA_M;
-                const int tile_n = tile_n_idx * WMMA_N;
-
-                if (tile_m >= valid_kv_rows || tile_n >= D) continue;
-
-                fragment<matrix_a, WMMA_M, WMMA_N, WMMA_K, __half, col_major> a_frag;
-                fragment<matrix_b, WMMA_M, WMMA_N, WMMA_K, __half, row_major> b_frag;
-                fragment<accumulator, WMMA_M, WMMA_N, WMMA_K, float> acc_frag;
-                load_matrix_sync(acc_frag, sdK + tile_m * D_STRIDE + tile_n, D_STRIDE, mem_row_major);
-
-                #pragma unroll
-                for (int k_tile = 0; k_tile < num_tiles_k_dk; ++k_tile) {
-                    const int k_offset = k_tile * WMMA_K;
-                    if (k_offset >= valid_q_rows) break;
-
-                    load_matrix_sync(a_frag, sdS + k_offset * BLOCK_M + tile_m, BLOCK_M);
-                    load_matrix_sync(b_frag, sQ + k_offset * D_STRIDE + tile_n, D_STRIDE);
-                    mma_sync(acc_frag, a_frag, b_frag, acc_frag);
-                }
-                store_matrix_sync(sdK + tile_m * D_STRIDE + tile_n, acc_frag, D_STRIDE, mem_row_major);
-            }
             __syncthreads();
-        }
+
+        } // END MAIN LOOP
 
         // ==================================================================================
         // Store final dK + dV to global memory
