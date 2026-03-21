@@ -1,6 +1,6 @@
-// ============================================================================
+// ======================================================================================
 // * Copyright (c) 2025, D.Skryabin / tg @ai_bond007 SPDX-License: BSD-3-Clause
-// ============================================================================
+// ======================================================================================
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
@@ -17,9 +17,9 @@ using namespace nvcuda::wmma;
 #include "01_forward_config.cuh"
 #include "02_fused_func.cuh"
 
-// ============================================================================
+// ======================================================================================
 // FORWARD KERNEL
-// ============================================================================
+// ======================================================================================
 template<int D, bool IS_CAUSAL>
 __global__ void __launch_bounds__(KernelConfig<D>::THREADS_PER_BLOCK, 2)
 flash_attention_forward_kernel(
@@ -54,7 +54,11 @@ flash_attention_forward_kernel(
     int num_kv_tiles = (N + BLOCK_N - 1) / BLOCK_N;
     const int valid_q_rows = min(BLOCK_M, M - start_q);
 
-    // Early loop limit n_blocks for causal
+    // ==================================================================================
+    // Trim iteration count for causal attention: K/V blocks beyond Q position are skipped
+    // Logic:    max_key_pos = start_q + valid_q_rows - 1 (last Q position in this tile)
+    //           num_kv_tiles = min(original, ceil((max_key_pos + 1) / BLOCK_N))
+    // ==================================================================================
     if constexpr (IS_CAUSAL) {
         const int max_key_pos = start_q + valid_q_rows - 1;
         if (max_key_pos < 0) {
@@ -64,53 +68,60 @@ flash_attention_forward_kernel(
         }
     }
 
+    // ==================================================================================
+    // Init:   thread/warp/lane IDs for WMMA coordination
+    // ==================================================================================
     const int tid     = threadIdx.x;
     const int warp_id = tid >> 5;
     const int lane_id = tid & 31;
 
-    // Global pointers
+    // ==================================================================================
+    // Layout: [B, H, M/N, D] linear offset: batch_head_id * (M/N) * D + start_* * D
+    // ==================================================================================
     const __half* __restrict__ q_ptr           = Q +           (size_t)batch_head_id * M * D + start_q * D;
     const __half* __restrict__ k_ptr           = K +           (size_t)batch_head_id * N * D;
     const __half* __restrict__ v_ptr           = V +           (size_t)batch_head_id * N * D;
           __half* __restrict__ out_ptr         = Out +         (size_t)batch_head_id * M * D + start_q * D;
            float* __restrict__ softmax_lse_ptr = softmax_lse + (size_t)batch_head_id * M + start_q;
 
-    // Shared memory layout
+    // ==================================================================================
+    // Init:   shared memory with zero-fill union regions to avoid stale data
+    // ==================================================================================
     extern __shared__ char smem_raw[];
-    init_smem<Config>(smem_raw);
+
+    INIT_SMEM<Config>(smem_raw);
+    __syncthreads();
+
     auto& smem = *reinterpret_cast<typename Config::SmemLayout*>(smem_raw);
 
-    __half* __restrict__ sQ      = smem.q;           // phase 0: load Q
-    __half* __restrict__ sK      = smem.reuse_kv.k;  // phase 1: load K
-    __half* __restrict__ sV      = smem.reuse_kv.v;  // phase 2: load V
-    float*  __restrict__ sS      = smem.reuse_sp.s;  // phase 1: QK^T
-    __half* __restrict__ sP      = smem.reuse_sp.p;  // phase 2: softmax(P)
-    float*  __restrict__ sO      = smem.o;           // phase 3: write to global
+    __half* __restrict__ sQ      = smem.q;
+    __half* __restrict__ sK      = smem.reuse_kv.k;
+    __half* __restrict__ sV      = smem.reuse_kv.v;
+    float*  __restrict__ sS      = smem.reuse_sp.s;
+    __half* __restrict__ sP      = smem.reuse_sp.p;
+    float*  __restrict__ sO      = smem.o;
     float*  __restrict__ sRowMax = smem.row_max;
     float*  __restrict__ sRowSum = smem.row_sum;
 
-    // Vector strides
-    constexpr int  d_stride_uint4  = (D + 8 - 1) / 8;
-    constexpr int  n_stride_uint4  = (D_STRIDE  + 8 - 1) / 8;
-
-    // Init state buffers
     if (tid < BLOCK_M) {
         sRowMax[tid] = NEG_INF;
     }
 
-    // ========================================================================
-    // Load Q (into sQ)
-    // ========================================================================
+    // ==================================================================================
+    // Load:     Q tile from global to sQ shared memory
+    // Layout:   Q: global[row: BLOCK_M, D] -> shared[row: BLOCK_M, D_STRIDE]
+    // Template: SRC_STRIDE=D, DST_STRIDE=D_STRIDE
+    // ==================================================================================
     const uint4*      q_vec = reinterpret_cast<const uint4*>(q_ptr);
-    uint4*           sQ_vec = reinterpret_cast<uint4*>(sQ);
+          uint4*     sQ_vec = reinterpret_cast<uint4*>(sQ);
 
-    load_tile_uint4(q_vec, sQ_vec, valid_q_rows, d_stride_uint4, n_stride_uint4, tid, THREADS_PER_BLOCK);
+    LOAD_TILE<D, D_STRIDE>(q_vec, sQ_vec, valid_q_rows, tid, THREADS_PER_BLOCK);
 
     __syncthreads();
 
-    // ========================================================================
+    // ==================================================================================
     // MAIN LOOP (iterates over K/V blocks for current Q block)
-    // ========================================================================
+    // ==================================================================================
     for (int block = 0; block < num_kv_tiles; ++block) {
         const int start_kv = block * BLOCK_N;
         if (start_kv >= N) break;
@@ -119,28 +130,21 @@ flash_attention_forward_kernel(
         // Early skip per tile
         if constexpr (IS_CAUSAL) { if (start_kv >= start_q + valid_q_rows) continue; }
 
-        // ========================================================================
-        // Load K (into sK)
-        // ========================================================================
+        // ==================================================================================
+        // Load:     K tile from global to sK(reuse) shared memory
+        // Layout:   K: global[row: BLOCK_N, D] -> shared[row: BLOCK_N, D_STRIDE]
+        // Template: SRC_STRIDE=D, DST_STRIDE=D_STRIDE
+        // ==================================================================================
         const uint4* k_vec     = reinterpret_cast<const uint4*>(k_ptr + start_kv * D);
-        uint4*       sK_vec    = reinterpret_cast<uint4*>(sK);
+              uint4* sK_vec    = reinterpret_cast<uint4*>(sK);
 
-        #pragma unroll 2
-        for (int idx = tid; idx < (valid_kv_rows * d_stride_uint4); idx += THREADS_PER_BLOCK) {
-            const int row = idx / d_stride_uint4;
-            const int vec_col = idx % d_stride_uint4;
+        LOAD_TILE<D, D_STRIDE>(k_vec, sK_vec, valid_kv_rows, tid, THREADS_PER_BLOCK);
 
-            uint4 k_val = make_uint4(0, 0, 0, 0);
-            if (row < valid_kv_rows) {
-                k_val = __ldg(&k_vec[row * d_stride_uint4 + vec_col]);
-            }
-            sK_vec[row * n_stride_uint4 + vec_col] = k_val;
-        }
         __syncthreads();
 
-        // ========================================================================
+        // ==================================================================================
         // Compute S = Q @ K^T
-        // ========================================================================
+        // ==================================================================================
         const int num_tiles_m_qk    = (BLOCK_M + WMMA_M - 1) / WMMA_M;   // Q @ K^T: along M
         const int num_tiles_n_qk    = (BLOCK_N + WMMA_N - 1) / WMMA_N;   // Q @ K^T: along N
         const int num_tiles_k_qk    = (D + WMMA_K - 1) / WMMA_K;         // Q @ K^T: inner along D
@@ -203,9 +207,9 @@ flash_attention_forward_kernel(
         }
         __syncthreads();
 
-        // ========================================================================
+        // ==================================================================================
         // Compute Online Softmax + Scale
-        // ========================================================================
+        // ==================================================================================
         if (tid < valid_q_rows * THREADS_PER_ROW) {
             const int row = tid / THREADS_PER_ROW;
             const int thread_in_row = tid % THREADS_PER_ROW;
@@ -320,19 +324,21 @@ flash_attention_forward_kernel(
         }
         __syncthreads();
 
-        // ========================================================================
-        // Load V (into sV)
-        // ========================================================================
+        // ==================================================================================
+        // Load:     V tile from global to sV(reuse) shared memory
+        // Layout:   V: global[row: BLOCK_N, D] -> shared[row: BLOCK_N, D_STRIDE]
+        // Template: SRC_STRIDE=D, DST_STRIDE=D_STRIDE
+        // ==================================================================================
         const uint4* v_vec     = reinterpret_cast<const uint4*>(v_ptr + start_kv * D);
-        uint4*       sV_vec    = reinterpret_cast<uint4*>(sV);
+              uint4* sV_vec    = reinterpret_cast<uint4*>(sV);
 
-        load_tile_uint4(v_vec, sV_vec, valid_kv_rows, d_stride_uint4, n_stride_uint4, tid, THREADS_PER_BLOCK);
+        LOAD_TILE<D, D_STRIDE>(v_vec, sV_vec, valid_kv_rows, tid, THREADS_PER_BLOCK);
 
         __syncthreads();
 
-        // ========================================================================
+        // ==================================================================================
         // Compute P @ V
-        // ========================================================================
+        // ==================================================================================
         const int num_tiles_m_pv    = (BLOCK_M + WMMA_M - 1) / WMMA_M;   // P @ V: along M
         const int num_tiles_n_pv    = (D + WMMA_N - 1) / WMMA_N;         // P @ V: along D
         const int num_tiles_k_pv    = (BLOCK_N + WMMA_K - 1) / WMMA_K;   // P @ V: inner along N
@@ -371,9 +377,9 @@ flash_attention_forward_kernel(
         __syncthreads();
     }
 
-    // ========================================================================
+    // ==================================================================================
     // Store final sO to global memory
-    // ========================================================================
+    // ==================================================================================
     const int total_fp16_x4 = (valid_q_rows * D) / 4;
 
     for (int i = tid; i < total_fp16_x4; i += THREADS_PER_BLOCK) {
@@ -407,9 +413,9 @@ flash_attention_forward_kernel(
     }
 }
 
-// ============================================================================
+// ======================================================================================
 // LAUNCHER
-// ============================================================================
+// ======================================================================================
 template<int D>
 void launcher_flash_attention_forward(
     const torch::Tensor& Q,
@@ -462,9 +468,9 @@ void launcher_flash_attention_forward(
     }
 }
 
-// ============================================================================
+// ======================================================================================
 // WRAPPER
-// ============================================================================
+// ======================================================================================
 std::vector<at::Tensor> flash_attention_forward(
     at::Tensor& q,
     const at::Tensor& k,

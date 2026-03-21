@@ -4,11 +4,11 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 
-// ============================================================================
+// ======================================================================================
 // INIT SMEM LAYOUT
-// ============================================================================
+// ======================================================================================
 template<typename Config>
-__device__ __forceinline__ void init_smem(char* smem_raw) {
+__device__ __forceinline__ void INIT_SMEM(char* smem_raw) {
     constexpr int N_U4 = Config::TOTAL_SMEM / 16;
     const int tid = threadIdx.x;
     const int stride = blockDim.x;
@@ -21,58 +21,63 @@ __device__ __forceinline__ void init_smem(char* smem_raw) {
                      :: "r"(addr + (i << 4))
                      : "memory");
     }
-    __syncthreads();
 }
 
-// ============================================================================
-// UINT4 TILE LOADER
-// ============================================================================
-__device__ __forceinline__ void load_tile_uint4(
-    const uint4* __restrict__ src_vec,
-          uint4* __restrict__ dst_vec,
-    int valid_rows,
-    int src_stride_uint4,
-    int dst_stride_uint4,
-    int tid,
-    int threads_per_block
+// ======================================================================================
+// TILE LOADER UINT4
+// ======================================================================================
+template<int SRC_STRIDE, int DST_STRIDE>
+__device__ __forceinline__ void LOAD_TILE(
+    const uint4* __restrict__ SRC_VEC,
+          uint4* __restrict__ DST_VEC,
+    int VALID_ROWS,
+    int THREAD_ID,
+    int THREADS_TOTAL
 ) {
+    constexpr int src_stride_uint4 = (SRC_STRIDE + 7) / 8;
+    constexpr int dst_stride_uint4 = (DST_STRIDE + 7) / 8;
+
     #pragma unroll 2
-    for (int idx = tid; idx < (valid_rows * src_stride_uint4); idx += threads_per_block) {
+    for (int idx = THREAD_ID; idx < (VALID_ROWS * src_stride_uint4); idx += THREADS_TOTAL) {
         const int row = idx / src_stride_uint4;
-        const int vec_col = idx % src_stride_uint4;
+        const int col = idx % src_stride_uint4;
+
         uint4 val = make_uint4(0, 0, 0, 0);
-        if (row < valid_rows) {
-            val = __ldg(&src_vec[row * src_stride_uint4 + vec_col]);
+        if (row < VALID_ROWS) {
+            val = __ldg(&SRC_VEC[row * src_stride_uint4 + col]);
         }
-        dst_vec[row * dst_stride_uint4 + vec_col] = val;
+        DST_VEC[row * dst_stride_uint4 + col] = val;
     }
 }
 
-// ============================================================================
-// DUAL UINT4 TILE LOADER
-// ============================================================================
-__device__ __forceinline__ void load_tile_uint4_dual(
-    const uint4* __restrict__ src0_vec,
-    const uint4* __restrict__ src1_vec,
-    uint4* __restrict__ dst0_vec,
-    uint4* __restrict__ dst1_vec,
-    int valid_rows,
-    int src_stride_uint4,
-    int dst_stride_uint4,
-    int tid,
-    int threads_per_block
+// ======================================================================================
+// TILE DUAL LOADER UINT4
+// ======================================================================================
+template<int SRC_STRIDE, int DST_STRIDE>
+__device__ __forceinline__ void LOAD_TILE_DUAL(
+    const uint4* __restrict__ SRC0_VEC,
+    const uint4* __restrict__ SRC1_VEC,
+          uint4* __restrict__ DST0_VEC,
+          uint4* __restrict__ DST1_VEC,
+    int VALID_ROWS,
+    int THREAD_ID,
+    int THREADS_TOTAL
 ) {
+    constexpr int src_stride_uint4 = (SRC_STRIDE + 7) / 8;
+    constexpr int dst_stride_uint4 = (DST_STRIDE + 7) / 8;
+
     #pragma unroll 2
-    for (int idx = tid; idx < (valid_rows * src_stride_uint4); idx += threads_per_block) {
+    for (int idx = THREAD_ID; idx < (VALID_ROWS * src_stride_uint4); idx += THREADS_TOTAL) {
         const int row = idx / src_stride_uint4;
-        const int vec_col = idx % src_stride_uint4;
+        const int col = idx % src_stride_uint4;
+
         uint4 val0 = make_uint4(0, 0, 0, 0);
         uint4 val1 = make_uint4(0, 0, 0, 0);
-        if (row < valid_rows) {
-            val0 = __ldg(&src0_vec[row * src_stride_uint4 + vec_col]);
-            val1 = __ldg(&src1_vec[row * src_stride_uint4 + vec_col]);
+        if (row < VALID_ROWS) {
+            val0 = __ldg(&SRC0_VEC[row * src_stride_uint4 + col]);
+            val1 = __ldg(&SRC1_VEC[row * src_stride_uint4 + col]);
         }
-        dst0_vec[row * dst_stride_uint4 + vec_col] = val0;
-        dst1_vec[row * dst_stride_uint4 + vec_col] = val1;
+        DST0_VEC[row * dst_stride_uint4 + col] = val0;
+        DST1_VEC[row * dst_stride_uint4 + col] = val1;
     }
 }
