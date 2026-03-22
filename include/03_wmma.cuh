@@ -5,23 +5,6 @@
 #include <cuda_fp16.h>
 
 // ============================================================================
-// GEMM OPERATION
-// Bit 0 (0x1): CONTEXT-DEPENDENT FLAG
-//  * In WMMA_GEMM_SCORES:    APPLY_MASK (1=apply causal mask to output, 0=no mask)
-//  * In WMMA_GEMM_GRADIENTS: ACCUMULATE (1=C += A@B, 0=C = A@B / overwrite)
-// Bit 1 (0x2): A_IS_COL   (1=load A as col_major / interpret as A^T, 0=row_major)
-// Bit 2 (0x4): B_IS_COL   (1=load B as col_major / interpret as B^T, 0=row_major)
-// ============================================================================
-enum class GemmType : uint8_t {
-    sQ_KT     = (1<<0) | (0<<1) | (1<<2),  // 0b101 = 5:    Q(row) @  K(col)^T, APPLY_MASK=1, A=row, B=col
-    dOV_dOVT  = (0<<0) | (0<<1) | (1<<2),  // 0b100 = 4:   dO(row) @  V(col)^T, APPLY_MASK=0, A=row, B=col
-    dO_PV     = (1<<0) | (0<<1) | (0<<2),  // 0b001 = 1:    P(row) @  V(col)^T, ACCUMULATE=1, A=row, B=col
-    dQ_dSK    = (1<<0) | (0<<1) | (0<<2),  // 0b001 = 1:   dS(row) @  K(row),   ACCUMULATE=1, A=row, B=row
-    dV_PTdO   = (1<<0) | (1<<1) | (0<<2),  // 0b011 = 3:  P^T(col) @ dO(row),   ACCUMULATE=1, A=col, B=row
-    dK_dSTQ   = (1<<0) | (1<<1) | (0<<2),  // 0b011 = 3: dS^T(col) @  Q(row),   ACCUMULATE=1, A=col, B=row
-};
-
-// ============================================================================
 // WMMA_GEMM_SCORES: Compute C = (A @ B) * scale [+(causal mask)]
 // Use for: Q@K^T (forward), dO@V^T (backward pre-softmax)
 // ============================================================================
@@ -179,5 +162,73 @@ __device__ __forceinline__ void WMMA_GEMM_GRADIENTS(
         }
 
         store_matrix_sync(SMEM_C + tile_m * OUT_STRIDE + tile_n, acc_frag, OUT_STRIDE, mem_row_major);
+    }
+}
+
+// ============================================================================
+// KERNEL_EPILOGUE
+// ============================================================================
+template<GemmType TYPE, int D, int D_STRIDE>
+__device__ __forceinline__ void WMMA_GEMM_EPILOGUE(
+    const float* __restrict__ S0_SRC,
+    const float* __restrict__ S1_SRC,
+         __half* __restrict__ G0_DST,
+         __half* __restrict__ G1_DST,
+    const float* __restrict__ ROW_SUM,
+    int VALID_ROWS,
+    int THREAD_ID,
+    int THREADS_PER_BLOCK
+) {
+    constexpr uint8_t bits = static_cast<uint8_t>(TYPE);
+
+    constexpr bool NORMLZE = bits & 0x1;
+    constexpr bool DUAL    = bits & 0x2;
+
+    constexpr int VEC = 4;
+    constexpr int COL_BLOCKS = D / VEC;
+    const int total_iters = VALID_ROWS * COL_BLOCKS;
+
+    for (int i = THREAD_ID; i < total_iters; i += THREADS_PER_BLOCK) {
+        const int row =  i / COL_BLOCKS;
+        const int col = (i % COL_BLOCKS) * VEC;
+
+        float norm = 1.0f;
+        if constexpr (NORMLZE) {
+            norm = 1.0f / fmaxf(ROW_SUM[row], 1e-24f);
+        }
+
+        const float* s_row = S0_SRC + row * D_STRIDE;
+        const __half h0 = __float2half_rn(s_row[col + 0] * norm);
+        const __half h1 = __float2half_rn(s_row[col + 1] * norm);
+        const __half h2 = __float2half_rn(s_row[col + 2] * norm);
+        const __half h3 = __float2half_rn(s_row[col + 3] * norm);
+
+        asm volatile(
+            "st.global.v4.u16 [%0], {%1, %2, %3, %4};"
+            : : "l"(G0_DST + row * D + col),
+                "h"(__half_as_ushort(h0)),
+                "h"(__half_as_ushort(h1)),
+                "h"(__half_as_ushort(h2)),
+                "h"(__half_as_ushort(h3))
+            : "memory"
+        );
+
+        if constexpr (DUAL) {
+            const float* s_row2 = S1_SRC + row * D_STRIDE;
+            const __half k0 = __float2half_rn(s_row2[col + 0] * norm);
+            const __half k1 = __float2half_rn(s_row2[col + 1] * norm);
+            const __half k2 = __float2half_rn(s_row2[col + 2] * norm);
+            const __half k3 = __float2half_rn(s_row2[col + 3] * norm);
+
+            asm volatile(
+                "st.global.v4.u16 [%0], {%1, %2, %3, %4};"
+                : : "l"(G1_DST + row * D + col),
+                    "h"(__half_as_ushort(k0)),
+                    "h"(__half_as_ushort(k1)),
+                    "h"(__half_as_ushort(k2)),
+                    "h"(__half_as_ushort(k3))
+                : "memory"
+            );
+        }
     }
 }

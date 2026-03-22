@@ -358,11 +358,9 @@ flash_attention_backward_kernel(
         // ==================================================================================
         // Compute:  Store gradient dQ without normalization
         // Layout:   sdQ[valid_q_rows, D_STRIDE] -> dQ_ptr[valid_q_rows, D]
-        // Template  NORMLZE=false : No row-wise scaling
-        //           DUAL=false    : Single output tensor (only dQ)
-        //           D, D_STRIDE   : Head dimension and stride from KernelConfig<D>::DQ
+        // Template: D, D_STRIDE Head dimension and stride
         // ==================================================================================
-        KERNEL_EPILOGUE<false, false, D, D_STRIDE>(
+        WMMA_GEMM_EPILOGUE<GemmType::write_dQ, D, D_STRIDE>(
         sdQ,    nullptr,
         dQ_ptr, nullptr,
             nullptr,
@@ -691,11 +689,9 @@ flash_attention_backward_kernel(
         // Layout:
         //   sdK[valid_kv_rows, D_STRIDE] -> dK_ptr[valid_kv_rows, D]
         //   sdV[valid_kv_rows, D_STRIDE] -> dV_ptr[valid_kv_rows, D]
-        // Template  NORMLZE=false : No row-wise scaling
-        //           DUAL=true     : Two independent outputs stored in same iteration (dK + dV)
-        //           D, D_STRIDE   : Head dimension and stride from KernelConfig<D>::DKV
+        // Template: D, D_STRIDE Head dimension and stride
         // ==================================================================================
-        KERNEL_EPILOGUE<false, true, D, D_STRIDE>(
+        WMMA_GEMM_EPILOGUE<GemmType::write_dKV, D, D_STRIDE>(
         sdK,    sdV,
         dK_ptr, dV_ptr,
             nullptr,

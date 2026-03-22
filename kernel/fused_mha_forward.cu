@@ -303,11 +303,9 @@ flash_attention_forward_kernel(
     // ==================================================================================
     // Compute:  Store normalized attention output O = softmax(S) @ V
     // Layout:   sO[valid_q_rows, D_STRIDE] -> out_ptr[valid_q_rows, D]
-    // Template  NORMLZE=true : Apply 1.0f / fmaxf(row_sum[row], 1e-24f) scaling
-    //           DUAL=false   : Single output tensor (only O)
-    //           D, D_STRIDE  : Head dimension and shared memory stride from KernelConfig<D>
+    // Template  D, D_STRIDE  : Head dimension and shared memory stride
     // ==================================================================================
-    KERNEL_EPILOGUE<true, false, D, D_STRIDE>(
+    WMMA_GEMM_EPILOGUE<GemmType::write_dO, D, D_STRIDE>(
     sO,      nullptr,
     out_ptr, nullptr,
     sRowSum,
