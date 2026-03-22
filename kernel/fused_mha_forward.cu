@@ -12,8 +12,7 @@
 
 #include "00_volta_const.cuh"
 #include "01_forward_config.cuh"
-#include "02_fused_func.cuh"
-#include "03_wmma.cuh"
+#include "02_wmma.cuh"
 
 // ======================================================================================
 // FORWARD KERNEL
@@ -87,7 +86,8 @@ flash_attention_forward_kernel(
     // ==================================================================================
     extern __shared__ char smem_raw[];
 
-    INIT_SMEM<Config>(smem_raw);
+    WMMA_GEMM_INIT_SMEM<Config>(smem_raw);
+
     __syncthreads();
 
     auto& smem = *reinterpret_cast<typename Config::SmemLayout*>(smem_raw);
@@ -108,12 +108,13 @@ flash_attention_forward_kernel(
     // ==================================================================================
     // Load:     Q tile from global to sQ shared memory
     // Layout:   Q: global[row: BLOCK_M, D] -> shared[row: BLOCK_M, D_STRIDE]
-    // Template: SRC_STRIDE=D, DST_STRIDE=D_STRIDE
+    // Template: DUAL_LOAD=false, SRC_STRIDE=D, DST_STRIDE=D_STRIDE
     // ==================================================================================
-    const uint4*      q_vec = reinterpret_cast<const uint4*>(q_ptr);
-          uint4*     sQ_vec = reinterpret_cast<uint4*>(sQ);
-
-    LOAD_TILE<D, D_STRIDE>(q_vec, sQ_vec, valid_q_rows, tid, THREADS_PER_BLOCK);
+    WMMA_GEMM_LOAD_TILE<false, D, D_STRIDE>(
+    q_ptr,   sQ,
+    nullptr, nullptr,
+    valid_q_rows, tid,
+    THREADS_PER_BLOCK);
 
     __syncthreads();
 
@@ -131,12 +132,13 @@ flash_attention_forward_kernel(
         // ==================================================================================
         // Load:     K tile from global to sK(reuse) shared memory
         // Layout:   K: global[row: BLOCK_N, D] -> shared[row: BLOCK_N, D_STRIDE]
-        // Template: SRC_STRIDE=D, DST_STRIDE=D_STRIDE
+        // Template: DUAL_LOAD=false, SRC_STRIDE=D, DST_STRIDE=D_STRIDE
         // ==================================================================================
-        const uint4* k_vec     = reinterpret_cast<const uint4*>(k_ptr + start_kv * D);
-              uint4* sK_vec    = reinterpret_cast<uint4*>(sK);
-
-        LOAD_TILE<D, D_STRIDE>(k_vec, sK_vec, valid_kv_rows, tid, THREADS_PER_BLOCK);
+        WMMA_GEMM_LOAD_TILE<false, D, D_STRIDE>(
+        k_ptr + start_kv * D, sK,
+        nullptr, nullptr,
+        valid_kv_rows, tid,
+        THREADS_PER_BLOCK);
 
         __syncthreads();
 
@@ -274,12 +276,13 @@ flash_attention_forward_kernel(
         // ==================================================================================
         // Load:     V tile from global to sV(reuse) shared memory
         // Layout:   V: global[row: BLOCK_N, D] -> shared[row: BLOCK_N, D_STRIDE]
-        // Template: SRC_STRIDE=D, DST_STRIDE=D_STRIDE
+        // Template: DUAL_LOAD=false, SRC_STRIDE=D, DST_STRIDE=D_STRIDE
         // ==================================================================================
-        const uint4* v_vec     = reinterpret_cast<const uint4*>(v_ptr + start_kv * D);
-              uint4* sV_vec    = reinterpret_cast<uint4*>(sV);
-
-        LOAD_TILE<D, D_STRIDE>(v_vec, sV_vec, valid_kv_rows, tid, THREADS_PER_BLOCK);
+        WMMA_GEMM_LOAD_TILE<false, D, D_STRIDE>(
+        v_ptr + start_kv * D, sV,
+        nullptr, nullptr,
+        valid_kv_rows, tid,
+        THREADS_PER_BLOCK);
 
         __syncthreads();
 

@@ -5,6 +5,68 @@
 #include <cuda_fp16.h>
 #include <mma.h>
 
+// ======================================================================================
+// INIT SMEM LAYOUT
+// ======================================================================================
+template<typename Config>
+__device__ __forceinline__ void WMMA_GEMM_INIT_SMEM(char* smem_raw) {
+    constexpr int N_U4 = Config::TOTAL_SMEM / 16;
+    const int tid = threadIdx.x;
+    const int stride = blockDim.x;
+
+    uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_raw));
+
+    #pragma unroll 4
+    for (int i = tid; i < N_U4; i += stride) {
+        asm volatile("st.shared.v4.u32 [%0], {0x0, 0x0, 0x0, 0x0};"
+                     :: "r"(addr + (i << 4))
+                     : "memory");
+    }
+}
+
+// ======================================================================================
+// TILE LOADER UINT4 (Universal: Single or Dual load, with internal casting)
+// Loads uint4-vectorized tiles from global memory to shared memory with bounds checking.
+// ======================================================================================
+template<bool DUAL_LOAD, int SRC_STRIDE, int DST_STRIDE>
+__device__ __forceinline__ void WMMA_GEMM_LOAD_TILE(
+    const __half* __restrict__ SRC0,
+          __half* __restrict__ DST0,
+    const __half* __restrict__ SRC1,
+          __half* __restrict__ DST1,
+    int VALID_ROWS,
+    int THREAD_ID,
+    int THREADS_TOTAL
+) {
+    const uint4* __restrict__ SRC0_VEC = reinterpret_cast<const uint4*>(SRC0);
+    const uint4* __restrict__ SRC1_VEC = reinterpret_cast<const uint4*>(SRC1);
+          uint4* __restrict__ DST0_VEC = reinterpret_cast<uint4*>(DST0);
+          uint4* __restrict__ DST1_VEC = reinterpret_cast<uint4*>(DST1);
+
+    constexpr int src_stride_uint4 = (SRC_STRIDE + 7) / 8;
+    constexpr int dst_stride_uint4 = (DST_STRIDE + 7) / 8;
+
+    #pragma unroll 2
+    for (int idx = THREAD_ID; idx < (VALID_ROWS * src_stride_uint4); idx += THREADS_TOTAL) {
+        const int row = idx / src_stride_uint4;
+        const int col = idx % src_stride_uint4;
+
+        uint4 val0 = make_uint4(0, 0, 0, 0);
+        if (row < VALID_ROWS) {
+            val0 = __ldg(&SRC0_VEC[row * src_stride_uint4 + col]);
+        }
+        DST0_VEC[row * dst_stride_uint4 + col] = val0;
+
+        if constexpr (DUAL_LOAD) {
+            uint4 val1 = make_uint4(0, 0, 0, 0);
+            if (row < VALID_ROWS) {
+                val1 = __ldg(&SRC1_VEC[row * src_stride_uint4 + col]);
+            }
+            DST1_VEC[row * dst_stride_uint4 + col] = val1;
+        }
+    }
+}
+
 // ============================================================================
 // WMMA_GEMM_SCORES: Compute C = (A @ B) * scale [+(causal mask)]
 // Use for: Q@K^T (forward), dO@V^T (backward pre-softmax)
