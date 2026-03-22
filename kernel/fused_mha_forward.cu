@@ -10,9 +10,6 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 
-#include <mma.h>
-using namespace nvcuda::wmma;
-
 #include "00_volta_const.cuh"
 #include "01_forward_config.cuh"
 #include "02_fused_func.cuh"

@@ -3,6 +3,7 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <mma.h>
 
 // ============================================================================
 // WMMA_GEMM_SCORES: Compute C = (A @ B) * scale [+(causal mask)]
@@ -229,6 +230,98 @@ __device__ __forceinline__ void WMMA_GEMM_EPILOGUE(
                     "h"(__half_as_ushort(k3))
                 : "memory"
             );
+        }
+    }
+}
+
+// ============================================================================
+// COMPUTE_ROW_DOT
+// ============================================================================
+template<GemmType TYPE, int D, int D_STRIDE>
+__device__ __forceinline__ void WMMA_GEMM_DOT_PRODUCT(
+    const __half* __restrict__ PTR_O,
+    const __half* __restrict__ SMEM_DO,
+    const  float* __restrict__ PTR_LSE,
+           float* __restrict__ SMEM_LSE,
+           float* __restrict__ SMEM_DOT,
+    int VALID_ROWS,
+    int OFFSET,
+    int THREAD_ID,
+    int THREADS_PER_ROW,
+    int THREADS_PER_BLOCK
+) {
+    constexpr uint8_t bits = static_cast<uint8_t>(TYPE);
+
+    constexpr bool LSE_OFFSET = bits & 0x1;
+    constexpr bool USE_FULL_MASK  = bits & 0x2;
+
+    constexpr int VEC = 4;
+    constexpr int COL_BLOCKS = D / VEC;
+
+    const int work_per_thread = (COL_BLOCKS + THREADS_PER_ROW - 1) / THREADS_PER_ROW;
+
+    if (THREAD_ID < VALID_ROWS * THREADS_PER_ROW) {
+        const int row = THREAD_ID / THREADS_PER_ROW;
+        const int thread_in_row = THREAD_ID % THREADS_PER_ROW;
+
+        const unsigned mask = USE_FULL_MASK ? 0xFFFFFFFFU : __activemask();
+
+        float thread_dot = 0.0f;
+
+        #pragma unroll
+        for (int j = 0; j < work_per_thread; ++j) {
+            const int chunk_idx = thread_in_row + j * THREADS_PER_ROW;
+            if (chunk_idx >= COL_BLOCKS) break;
+            const int col = chunk_idx * VEC;
+
+            // Load O from global memory (vectorized 4×half)
+            const __half* o_addr = PTR_O + row * D + col;
+            ushort o_h0, o_h1, o_h2, o_h3;
+            asm volatile(
+                "ld.global.v4.u16 {%0, %1, %2, %3}, [%4];"
+                : "=h"(o_h0), "=h"(o_h1), "=h"(o_h2), "=h"(o_h3)
+                : "l"(o_addr)
+                : "memory"
+            );
+
+            // Load dO from shared memory (vectorized 4×half)
+            const __half* dO_addr = SMEM_DO + row * D_STRIDE + col;
+            ushort d_h0, d_h1, d_h2, d_h3;
+            const uint32_t ptr_dO = static_cast<uint32_t>(
+                reinterpret_cast<uintptr_t>(__cvta_generic_to_shared(dO_addr))
+            );
+            asm volatile(
+                "ld.shared.v4.u16 {%0, %1, %2, %3}, [%4];"
+                : "=h"(d_h0), "=h"(d_h1), "=h"(d_h2), "=h"(d_h3)
+                : "r"(ptr_dO)
+                : "memory"
+            );
+
+            thread_dot = __fmaf_rn(__half2float(__ushort_as_half(o_h0)),
+                                   __half2float(__ushort_as_half(d_h0)), thread_dot);
+            thread_dot = __fmaf_rn(__half2float(__ushort_as_half(o_h1)),
+                                   __half2float(__ushort_as_half(d_h1)), thread_dot);
+            thread_dot = __fmaf_rn(__half2float(__ushort_as_half(o_h2)),
+                                   __half2float(__ushort_as_half(d_h2)), thread_dot);
+            thread_dot = __fmaf_rn(__half2float(__ushort_as_half(o_h3)),
+                                   __half2float(__ushort_as_half(d_h3)), thread_dot);
+        }
+
+        #pragma unroll
+        for (int offset = THREADS_PER_ROW / 2; offset > 0; offset >>= 1) {
+            thread_dot += __shfl_down_sync(mask, thread_dot, offset, THREADS_PER_ROW);
+        }
+
+        if (thread_in_row == 0) {
+            SMEM_DOT[row] = thread_dot;
+        }
+    }
+
+    if (THREAD_ID < VALID_ROWS) {
+        if constexpr (LSE_OFFSET) {
+            SMEM_LSE[THREAD_ID] = PTR_LSE[OFFSET + THREAD_ID];
+        } else {
+            SMEM_LSE[THREAD_ID] = PTR_LSE[THREAD_ID];
         }
     }
 }

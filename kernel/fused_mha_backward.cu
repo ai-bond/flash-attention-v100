@@ -10,9 +10,6 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 
-#include <mma.h>
-using namespace nvcuda::wmma;
-
 #include "00_volta_const.cuh"
 #include "01_backward_config.cuh"
 #include "02_fused_func.cuh"
@@ -136,69 +133,15 @@ flash_attention_backward_kernel(
         __syncthreads();
 
         // ==================================================================================
-        // Compute row_dot = sum(O ⊙ dO)
+        // Compute:  row_dot = sum(O ⊙ dO)
+        // Layout:   O[global: total_q, D], dO[shared: valid_q_rows, D_STRIDE] -> sRowDot[shared: valid_q_rows]
+        // Template: HAS_LSE_OFFSET=0, USE_FULL_MASK=0, D, D_STRIDE
         // ==================================================================================
-        if (tid < valid_q_rows * THREADS_PER_ROW) {
-            const int row = tid / THREADS_PER_ROW;
-            const int thread_in_row = tid % THREADS_PER_ROW;
-            const int fp16_x4_per_row = D / 4;
-            const int work_per_thread = (fp16_x4_per_row + THREADS_PER_ROW - 1) / THREADS_PER_ROW;
-            const unsigned mask = (valid_q_rows == BLOCK_M) ? 0xFFFFFFFFU : __activemask();
+        WMMA_GEMM_DOT_PRODUCT<GemmType::rowdot_dQ, D, D_STRIDE>(
+        o_ptr,   sdO, lse_ptr, sLse,
+        sRowDot, valid_q_rows, 0, tid,
+        THREADS_PER_ROW, THREADS_PER_BLOCK);
 
-            float thread_dot = 0.0f;
-
-            #pragma unroll
-            for (int j = 0; j < work_per_thread; ++j) {
-                const int chunk_idx = thread_in_row + j * THREADS_PER_ROW;
-                if (chunk_idx >= fp16_x4_per_row) break;
-                const int col = chunk_idx * 4;
-
-                const __half* o_addr = o_ptr + row * D + col;
-                ushort o_h0, o_h1, o_h2, o_h3;
-                asm volatile(
-                    "ld.global.v4.u16 {%0, %1, %2, %3}, [%4];"
-                    : "=h"(o_h0), "=h"(o_h1), "=h"(o_h2), "=h"(o_h3)
-                    : "l"(o_addr)
-                    : "memory"
-                );
-
-                const __half* dO_addr = sdO + row * D_STRIDE + col;
-                ushort d_h0, d_h1, d_h2, d_h3;
-                const uint32_t ptr_dO = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(__cvta_generic_to_shared(dO_addr)));
-                asm volatile(
-                    "ld.shared.v4.u16 {%0, %1, %2, %3}, [%4];"
-                    : "=h"(d_h0), "=h"(d_h1), "=h"(d_h2), "=h"(d_h3)
-                    : "r"(ptr_dO)
-                    : "memory"
-                );
-
-                const float fo_0 = __half2float(__ushort_as_half(o_h0));
-                const float fo_1 = __half2float(__ushort_as_half(o_h1));
-                const float fo_2 = __half2float(__ushort_as_half(o_h2));
-                const float fo_3 = __half2float(__ushort_as_half(o_h3));
-
-                const float fd_0 = __half2float(__ushort_as_half(d_h0));
-                const float fd_1 = __half2float(__ushort_as_half(d_h1));
-                const float fd_2 = __half2float(__ushort_as_half(d_h2));
-                const float fd_3 = __half2float(__ushort_as_half(d_h3));
-
-                thread_dot = __fmaf_rn(fo_0, fd_0, thread_dot);
-                thread_dot = __fmaf_rn(fo_1, fd_1, thread_dot);
-                thread_dot = __fmaf_rn(fo_2, fd_2, thread_dot);
-                thread_dot = __fmaf_rn(fo_3, fd_3, thread_dot);
-            }
-
-            #pragma unroll
-            for (int o = THREADS_PER_ROW / 2; o > 0; o >>= 1)
-                thread_dot += __shfl_down_sync(mask, thread_dot, o, THREADS_PER_ROW);
-
-            if (thread_in_row == 0) {
-                sRowDot[row] = thread_dot;
-            }
-        }
-
-        // Load LSE
-        if (tid < valid_q_rows) { sLse[tid] = lse_ptr[tid]; }
         __syncthreads();
 
         // ==================================================================================
@@ -500,69 +443,17 @@ flash_attention_backward_kernel(
             __syncthreads();
 
             // ==================================================================================
-            // Compute row_dot = O ⊙ dO
+            // Compute:  row_dot = sum(O ⊙ dO)
+            // Layout:   O[global: valid_q_rows, D] (pre-offset = start_q*D), dO[shared: valid_q_rows, D_STRIDE] -> sRowDot[shared]
+            // Template: HAS_LSE_OFFSET=1, USE_FULL_MASK=1, D, D_STRIDE
+            // Note:     o_ptr must be pre-offset by caller (o_ptr + start_q*D), lse_ptr loaded with offset
             // ==================================================================================
-            const __half* current_o_ptr = o_ptr + start_q * D;
+            WMMA_GEMM_DOT_PRODUCT<GemmType::rowdot_dKV, D, D_STRIDE>(
+            o_ptr + start_q * D, sdO,
+            lse_ptr, sLse, sRowDot,
+            valid_q_rows, start_q, tid,
+            THREADS_PER_ROW, THREADS_PER_BLOCK);
 
-            if (tid < valid_q_rows * THREADS_PER_ROW) {
-                const int row = tid / THREADS_PER_ROW;
-                const int thread_in_row = tid % THREADS_PER_ROW;
-                const int fp16_x4_per_row = D / 4;
-                const int work_per_thread = (fp16_x4_per_row + THREADS_PER_ROW - 1) / THREADS_PER_ROW;
-                const unsigned mask = (valid_q_rows == BLOCK_N) ? 0xFFFFFFFFU : __activemask();
-
-                float thread_dot = 0.0f;
-
-                #pragma unroll
-                for (int j = 0; j < work_per_thread; ++j) {
-                    const int chunk_idx = thread_in_row + j * THREADS_PER_ROW;
-                    if (chunk_idx >= fp16_x4_per_row) break;
-                    const int col = chunk_idx * 4;
-
-                    const half* o_addr = current_o_ptr + row * D + col;
-                    ushort o_h0, o_h1, o_h2, o_h3;
-                    asm volatile(
-                        "ld.global.v4.u16 {%0, %1, %2, %3}, [%4];"
-                        : "=h"(o_h0), "=h"(o_h1), "=h"(o_h2), "=h"(o_h3)
-                        : "l"(o_addr)
-                        : "memory"
-                    );
-
-                    const half* dO_addr = sdO + row * D_STRIDE + col;
-                    ushort d_h0, d_h1, d_h2, d_h3;
-                    const uint32_t ptr_dO = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(__cvta_generic_to_shared(dO_addr)));
-                    asm volatile(
-                        "ld.shared.v4.u16 {%0, %1, %2, %3}, [%4];"
-                        : "=h"(d_h0), "=h"(d_h1), "=h"(d_h2), "=h"(d_h3)
-                        : "r"(ptr_dO)
-                        : "memory"
-                    );
-
-                    const float fo_0 = __half2float(__ushort_as_half(o_h0));
-                    const float fo_1 = __half2float(__ushort_as_half(o_h1));
-                    const float fo_2 = __half2float(__ushort_as_half(o_h2));
-                    const float fo_3 = __half2float(__ushort_as_half(o_h3));
-
-                    const float fd_0 = __half2float(__ushort_as_half(d_h0));
-                    const float fd_1 = __half2float(__ushort_as_half(d_h1));
-                    const float fd_2 = __half2float(__ushort_as_half(d_h2));
-                    const float fd_3 = __half2float(__ushort_as_half(d_h3));
-
-                    thread_dot = __fmaf_rn(fo_0, fd_0, thread_dot);
-                    thread_dot = __fmaf_rn(fo_1, fd_1, thread_dot);
-                    thread_dot = __fmaf_rn(fo_2, fd_2, thread_dot);
-                    thread_dot = __fmaf_rn(fo_3, fd_3, thread_dot);
-                }
-
-                #pragma unroll
-                for (int o = THREADS_PER_ROW / 2; o > 0; o >>= 1)
-                    thread_dot += __shfl_down_sync(mask, thread_dot, o, THREADS_PER_ROW);
-
-                if (thread_in_row == 0) { sRowDot[row] = thread_dot; }
-            }
-
-            // Load LSE
-            if (tid < valid_q_rows) { sLse[tid] = lse_ptr[start_q + tid]; }
             __syncthreads();
 
             // ==================================================================================
@@ -576,6 +467,7 @@ flash_attention_backward_kernel(
             0,            0,
                   1.0f,
             warp_id, lane_id);
+
             __syncthreads();
 
             // ==================================================================================
