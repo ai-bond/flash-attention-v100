@@ -356,31 +356,18 @@ flash_attention_backward_kernel(
         } // END MAIN LOOP
 
         // ==================================================================================
-        // Store final dQ to global memory
+        // Compute:  Store gradient dQ without normalization
+        // Layout:   sdQ[valid_q_rows, D_STRIDE] -> dQ_ptr[valid_q_rows, D]
+        // Template  NORMLZE=false : No row-wise scaling
+        //           DUAL=false    : Single output tensor (only dQ)
+        //           D, D_STRIDE   : Head dimension and stride from KernelConfig<D>::DQ
         // ==================================================================================
-        const int total_fp16_x4 = (valid_q_rows * D) / 4;
-        for (int i = tid; i < total_fp16_x4; i += THREADS_PER_BLOCK) {
-            const int row = i / (D / 4);
-            const int col = (i % (D / 4)) * 4;
-
-            const float* s_dQ_row = sdQ + row * D_STRIDE;
-
-            const __half h0 = __float2half_rn(s_dQ_row[col + 0]);
-            const __half h1 = __float2half_rn(s_dQ_row[col + 1]);
-            const __half h2 = __float2half_rn(s_dQ_row[col + 2]);
-            const __half h3 = __float2half_rn(s_dQ_row[col + 3]);
-
-            asm volatile(
-                "st.global.v4.u16 [%0], {%1, %2, %3, %4};"
-                :
-                : "l"(dQ_ptr + row * D + col),
-                  "h"(__half_as_ushort(h0)),
-                  "h"(__half_as_ushort(h1)),
-                  "h"(__half_as_ushort(h2)),
-                  "h"(__half_as_ushort(h3))
-                : "memory"
-            );
-        }
+        KERNEL_EPILOGUE<false, false, D, D_STRIDE>(
+        sdQ,    nullptr,
+        dQ_ptr, nullptr,
+            nullptr,
+        valid_q_rows, tid,
+        THREADS_PER_BLOCK);
     }
     // ===================================================================================
     // PHASE 2: dKV
@@ -700,48 +687,20 @@ flash_attention_backward_kernel(
         } // END MAIN LOOP
 
         // ==================================================================================
-        // Store final dK + dV to global memory
+        // Compute:  Store gradients dK + dV without normalization
+        // Layout:
+        //   sdK[valid_kv_rows, D_STRIDE] -> dK_ptr[valid_kv_rows, D]
+        //   sdV[valid_kv_rows, D_STRIDE] -> dV_ptr[valid_kv_rows, D]
+        // Template  NORMLZE=false : No row-wise scaling
+        //           DUAL=true     : Two independent outputs stored in same iteration (dK + dV)
+        //           D, D_STRIDE   : Head dimension and stride from KernelConfig<D>::DKV
         // ==================================================================================
-        const int total_fp16_x4 = (valid_kv_rows * D) / 4;
-        for (int i = tid; i < total_fp16_x4; i += THREADS_PER_BLOCK) {
-            const int row = i / (D / 4);
-            const int col = (i % (D / 4)) * 4;
-
-            const float* s_dK_row = sdK + row * D_STRIDE;
-            const float* s_dV_row = sdV + row * D_STRIDE;
-
-            const __half hk0 = __float2half_rn(s_dK_row[col + 0]);
-            const __half hk1 = __float2half_rn(s_dK_row[col + 1]);
-            const __half hk2 = __float2half_rn(s_dK_row[col + 2]);
-            const __half hk3 = __float2half_rn(s_dK_row[col + 3]);
-
-            const __half hv0 = __float2half_rn(s_dV_row[col + 0]);
-            const __half hv1 = __float2half_rn(s_dV_row[col + 1]);
-            const __half hv2 = __float2half_rn(s_dV_row[col + 2]);
-            const __half hv3 = __float2half_rn(s_dV_row[col + 3]);
-
-            asm volatile(
-                "st.global.v4.u16 [%0], {%1, %2, %3, %4};"
-                :
-                : "l"(dK_ptr + row * D + col),
-                  "h"(__half_as_ushort(hk0)),
-                  "h"(__half_as_ushort(hk1)),
-                  "h"(__half_as_ushort(hk2)),
-                  "h"(__half_as_ushort(hk3))
-                : "memory"
-            );
-
-            asm volatile(
-                "st.global.v4.u16 [%0], {%1, %2, %3, %4};"
-                :
-                : "l"(dV_ptr + row * D + col),
-                  "h"(__half_as_ushort(hv0)),
-                  "h"(__half_as_ushort(hv1)),
-                  "h"(__half_as_ushort(hv2)),
-                  "h"(__half_as_ushort(hv3))
-                : "memory"
-            );
-        }
+        KERNEL_EPILOGUE<false, true, D, D_STRIDE>(
+        sdK,    sdV,
+        dK_ptr, dV_ptr,
+            nullptr,
+        valid_kv_rows, tid,
+        THREADS_PER_BLOCK);
     }
 }
 

@@ -301,34 +301,18 @@ flash_attention_forward_kernel(
     }   // END MAIN LOOP
 
     // ==================================================================================
-    // Store final sO to global memory
+    // Compute:  Store normalized attention output O = softmax(S) @ V
+    // Layout:   sO[valid_q_rows, D_STRIDE] -> out_ptr[valid_q_rows, D]
+    // Template  NORMLZE=true : Apply 1.0f / fmaxf(row_sum[row], 1e-24f) scaling
+    //           DUAL=false   : Single output tensor (only O)
+    //           D, D_STRIDE  : Head dimension and shared memory stride from KernelConfig<D>
     // ==================================================================================
-    const int total_fp16_x4 = (valid_q_rows * D) / 4;
-
-    for (int i = tid; i < total_fp16_x4; i += THREADS_PER_BLOCK) {
-        const int row = i / (D / 4);
-        const int col = (i % (D / 4)) * 4;
-
-        const float sum_clamped = fmaxf(sRowSum[row], 1e-24f);
-        const float inv_sum = 1.0f / sum_clamped;
-        const float* sO_row = sO + row * D_STRIDE;
-
-        const __half h0 = __float2half_rn(sO_row[col + 0] * inv_sum);
-        const __half h1 = __float2half_rn(sO_row[col + 1] * inv_sum);
-        const __half h2 = __float2half_rn(sO_row[col + 2] * inv_sum);
-        const __half h3 = __float2half_rn(sO_row[col + 3] * inv_sum);
-
-        asm volatile(
-            "st.global.v4.u16 [%0], {%1, %2, %3, %4};"
-            :
-            : "l"(out_ptr + row * D + col),
-              "h"(__half_as_ushort(h0)),
-              "h"(__half_as_ushort(h1)),
-              "h"(__half_as_ushort(h2)),
-              "h"(__half_as_ushort(h3))
-            : "memory"
-        );
-    }
+    KERNEL_EPILOGUE<true, false, D, D_STRIDE>(
+    sO,      nullptr,
+    out_ptr, nullptr,
+    sRowSum,
+    valid_q_rows, tid,
+    THREADS_PER_BLOCK);
 
     if (tid < valid_q_rows) {
         const float sum = fmaxf(sRowSum[tid], 1e-24f);
