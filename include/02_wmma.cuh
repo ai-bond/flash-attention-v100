@@ -38,31 +38,94 @@ __device__ __forceinline__ void WMMA_GEMM_LOAD_TILE(
     int THREAD_ID,
     int THREADS_TOTAL
 ) {
-    const uint4* __restrict__ SRC0_VEC = reinterpret_cast<const uint4*>(SRC0);
-    const uint4* __restrict__ SRC1_VEC = reinterpret_cast<const uint4*>(SRC1);
-          uint4* __restrict__ DST0_VEC = reinterpret_cast<uint4*>(DST0);
-          uint4* __restrict__ DST1_VEC = reinterpret_cast<uint4*>(DST1);
+    constexpr int src_stride_uint4 = (SRC_STRIDE + 7) >> 3;
+    constexpr int dst_stride_uint4 = (DST_STRIDE + 7) >> 3;
 
-    constexpr int src_stride_uint4 = (SRC_STRIDE + 7) / 8;
-    constexpr int dst_stride_uint4 = (DST_STRIDE + 7) / 8;
+    const int total_iters   = VALID_ROWS * src_stride_uint4;
+
+    if (total_iters == 0) return;
+
+    uint64_t src_base0 = static_cast<uint64_t>(__cvta_generic_to_global(SRC0));
+    uint64_t dst_base0 = static_cast<uint64_t>(__cvta_generic_to_shared(DST0));
+
+    uint64_t src_base1 = 0, dst_base1 = 0;
+    if constexpr (DUAL_LOAD) {
+        src_base1 = static_cast<uint64_t>(__cvta_generic_to_global(SRC1));
+        dst_base1 = static_cast<uint64_t>(__cvta_generic_to_shared(DST1));
+    }
 
     #pragma unroll 2
-    for (int idx = THREAD_ID; idx < (VALID_ROWS * src_stride_uint4); idx += THREADS_TOTAL) {
+    for (int idx = THREAD_ID; idx < total_iters; idx += THREADS_TOTAL) {
         const int row = idx / src_stride_uint4;
         const int col = idx % src_stride_uint4;
 
-        uint4 val0 = make_uint4(0, 0, 0, 0);
-        if (row < VALID_ROWS) {
-            val0 = __ldg(&SRC0_VEC[row * src_stride_uint4 + col]);
-        }
-        DST0_VEC[row * dst_stride_uint4 + col] = val0;
+        const int src_offset = row * src_stride_uint4 + col;
+        const int dst_offset = row * dst_stride_uint4 + col;
 
-        if constexpr (DUAL_LOAD) {
-            uint4 val1 = make_uint4(0, 0, 0, 0);
-            if (row < VALID_ROWS) {
-                val1 = __ldg(&SRC1_VEC[row * src_stride_uint4 + col]);
+        const bool in_bounds = (row < VALID_ROWS);
+        const int pred = in_bounds ? 1 : 0;
+
+        if (in_bounds) {
+            uint64_t src_addr0 = src_base0 + (static_cast<uint64_t>(src_offset) << 4);
+            uint64_t dst_addr0 = dst_base0 + (static_cast<uint64_t>(dst_offset) << 4);
+
+            if constexpr (DUAL_LOAD) {
+                uint64_t src_addr1 = src_base1 + (static_cast<uint64_t>(src_offset) << 4);
+                uint64_t dst_addr1 = dst_base1 + (static_cast<uint64_t>(dst_offset) << 4);
+
+                uint32_t r0, r1, r2, r3;
+                asm volatile(
+                    "{\n"
+                    "  .reg .pred p;\n"
+                    "  setp.ne.b32 p, %8, 0;\n"
+                    "  mov.u32 %0, 0;\n"
+                    "  mov.u32 %1, 0;\n"
+                    "  mov.u32 %2, 0;\n"
+                    "  mov.u32 %3, 0;\n"
+                    "  @p ld.global.v4.u32 {%0, %1, %2, %3}, [%4];\n"
+                    "  @p st.shared.v4.u32 [%6], {%0, %1, %2, %3};\n"
+                    "  @p ld.global.v4.u32 {%0, %1, %2, %3}, [%5];\n"
+                    "  @p st.shared.v4.u32 [%7], {%0, %1, %2, %3};\n"
+                    "}\n"
+                    : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
+                    : "l"(src_addr0), "l"(src_addr1),
+                      "l"(dst_addr0), "l"(dst_addr1),
+                    "r"(pred)
+                    : "memory"
+                );
+            } else {
+                uint32_t r0, r1, r2, r3;
+                asm volatile(
+                    "{\n"
+                    "  .reg .pred p;\n"
+                    "  setp.ne.b32 p, %6, 0;\n"
+                    "  mov.u32 %0, 0;\n"
+                    "  mov.u32 %1, 0;\n"
+                    "  mov.u32 %2, 0;\n"
+                    "  mov.u32 %3, 0;\n"
+                    "  @p ld.global.v4.u32 {%0, %1, %2, %3}, [%4];\n"
+                    "  @p st.shared.v4.u32 [%5], {%0, %1, %2, %3};\n"
+                    "}\n"
+                    : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
+                    : "l"(src_addr0), "l"(dst_addr0), "r"(pred)
+                    : "memory"
+                );
             }
-            DST1_VEC[row * dst_stride_uint4 + col] = val1;
+        } else {
+            uint64_t dst_addr0 = dst_base0 + (static_cast<uint64_t>(dst_offset) << 4);
+            if constexpr (DUAL_LOAD) {
+                uint64_t dst_addr1 = dst_base1 + (static_cast<uint64_t>(dst_offset) << 4);
+                asm volatile(
+                    "st.shared.v4.u32 [%0], {0x0, 0x0, 0x0, 0x0};\n\t"
+                    "st.shared.v4.u32 [%1], {0x0, 0x0, 0x0, 0x0};"
+                    : : "l"(dst_addr0), "l"(dst_addr1) : "memory"
+                );
+            } else {
+                asm volatile(
+                    "st.shared.v4.u32 [%0], {0x0, 0x0, 0x0, 0x0};"
+                    : : "l"(dst_addr0) : "memory"
+                );
+            }
         }
     }
 }
@@ -429,10 +492,15 @@ __device__ __forceinline__ void WMMA_GEMM_POST_SOFTMAX_GRADIENT(
         const bool in0 = (row0 < VALID_Q_ROWS) && (col0 < VALID_KV_ROWS);
         const bool in1 = has_pair && (row1 < VALID_Q_ROWS) && (col1 < VALID_KV_ROWS);
 
-        float s0 = in0 ? SMEM_S[row0 * ROW_STRIDE + col0] : NEG_INF;
-        float s1 = in1 ? SMEM_S[row1 * ROW_STRIDE + col1] : NEG_INF;
-        float dov0 = (s0 != NEG_INF) ? SMEM_DOV[row0 * ROW_STRIDE + col0] : 0.0f;
-        float dov1 = (s1 != NEG_INF) ? SMEM_DOV[row1 * ROW_STRIDE + col1] : 0.0f;
+        const int offset0 = row0 * ROW_STRIDE + col0;
+        const int offset1 = in1 ? (row1 * ROW_STRIDE + col1) : 0;
+        const int out_offset0 = row0 * OUT_STRIDE + col0;
+        const int out_offset1 = in1 ? (row1 * OUT_STRIDE + col1) : 0;
+
+        float s0 = in0 ? SMEM_S[offset0] : NEG_INF;
+        float s1 = in1 ? SMEM_S[offset1] : NEG_INF;
+        float dov0 = (s0 != NEG_INF) ? SMEM_DOV[offset0] : 0.0f;
+        float dov1 = (s1 != NEG_INF) ? SMEM_DOV[offset1] : 0.0f;
 
         float lse0 = SMEM_LSE[row0];
         float lse1 = (in1 && row1 != row0) ? SMEM_LSE[row1] : lse0;
@@ -457,24 +525,24 @@ __device__ __forceinline__ void WMMA_GEMM_POST_SOFTMAX_GRADIENT(
             if (buf_idx < 2) {
                 buf_ds[buf_idx] = h2_ds;
             } else {
-                if (in0) SMEM_DS[row0 * OUT_STRIDE + col0] = h2_ds.x;
-                if (in1) SMEM_DS[row1 * OUT_STRIDE + col1] = h2_ds.y;
+                if (in0) SMEM_DS[out_offset0] = h2_ds.x;
+                if (in1) SMEM_DS[out_offset1] = h2_ds.y;
             }
         }
         else {
             if (col1 < BLOCK_Y && row1 == row0) {
-                __half* dst_p  = SMEM_P  + row0 * OUT_STRIDE + col0;
-                __half* dst_ds = SMEM_DS + row0 * OUT_STRIDE + col0;
+                __half* dst_p  = SMEM_P  + out_offset0;
+                __half* dst_ds = SMEM_DS + out_offset0;
                 *reinterpret_cast<__half2*>(dst_p)  = h2_p;
                 *reinterpret_cast<__half2*>(dst_ds) = h2_ds;
             } else {
                 if (in0) {
-                    SMEM_P[row0 * OUT_STRIDE + col0]  = h2_p.x;
-                    SMEM_DS[row0 * OUT_STRIDE + col0] = h2_ds.x;
+                    SMEM_P[out_offset0]  = h2_p.x;
+                    SMEM_DS[out_offset0] = h2_ds.x;
                 }
                 if (in1) {
-                    SMEM_P[row1 * OUT_STRIDE + col1]  = h2_p.y;
-                    SMEM_DS[row1 * OUT_STRIDE + col1] = h2_ds.y;
+                    SMEM_P[out_offset1]  = h2_p.y;
+                    SMEM_DS[out_offset1] = h2_ds.y;
                 }
             }
         }
@@ -497,13 +565,20 @@ __device__ __forceinline__ void WMMA_GEMM_POST_SOFTMAX_GRADIENT(
             const int row1 = has_pair ? idx1 / BLOCK_Y : row0;
             const int col1 = has_pair ? idx1 % BLOCK_Y : col0 + 1;
 
+            const int out_offset0 = row0 * OUT_STRIDE + col0;
+            const bool in1_phase2 = has_pair && (row1 < VALID_Q_ROWS) && (col1 < VALID_KV_ROWS);
+            const int out_offset1 = in1_phase2 ? (row1 * OUT_STRIDE + col1) : 0;
+
             if (col1 < BLOCK_Y && row1 == row0) {
-                __half* dst_ds = SMEM_DS + row0 * OUT_STRIDE + col0;
+                __half* dst_ds = SMEM_DS + out_offset0;
                 *reinterpret_cast<__half2*>(dst_ds) = buf_ds[buf_idx];
             } else {
-                SMEM_DS[row0 * OUT_STRIDE + col0] = buf_ds[buf_idx].x;
+                SMEM_DS[out_offset0] = buf_ds[buf_idx].x;
                 if (has_pair && idx1 < TOTAL_ELEMENTS) {
-                    SMEM_DS[row1 * OUT_STRIDE + col1] = buf_ds[buf_idx].y;
+                    const bool in1_write = (row1 < VALID_Q_ROWS) && (col1 < VALID_KV_ROWS);
+                    if (in1_write) {
+                        SMEM_DS[out_offset1] = buf_ds[buf_idx].y;
+                    }
                 }
             }
         }
