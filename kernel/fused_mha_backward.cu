@@ -208,80 +208,19 @@ flash_attention_backward_kernel(
             __syncthreads();
 
             // ==================================================================================
-            // Compute dS = exp(S - lse) * (dOV - row_dot) * scale
+            // Compute:  dS = exp(S - lse) * (dOV - row_dot) * scale
+            // Layout:   S[row: BLOCK_M, BLOCK_N], dOV[row: BLOCK_M, BLOCK_N],
+            //           LSE[row: BLOCK_M], row_dot[row: BLOCK_M] -> dS[row: BLOCK_M, BLOCK_N]
+            // Template: BLOCK_X=BLOCK_M, BLOCK_Y=BLOCK_N, STRIDE=N_STRIDE
             // ==================================================================================
-            if (tid < valid_q_rows * THREADS_PER_ROW) {
-                const int row = tid / THREADS_PER_ROW;
-                const int thread_in_row = tid % THREADS_PER_ROW;
+            WMMA_GEMM_POST_SOFTMAX_GRADIENT<GemmType::compute_dS, N_STRIDE, N_STRIDE, BLOCK_M, BLOCK_N>(
+            sS, sdOV, sLse, sRowDot,
+            nullptr, sdS,
+            valid_q_rows, valid_kv_rows,
+            softmax_scale,
+            tid,
+            THREADS_PER_ROW, THREADS_PER_BLOCK);
 
-                 float* sS_row   = sS   + row * N_STRIDE;
-                 float* sdOV_row = sdOV + row * N_STRIDE;
-                __half* sdS_row  = sdS  + row * N_STRIDE;
-
-                const float lse_val     = sLse[row];
-                const float row_dot_val = sRowDot[row];
-
-                const int vec8_cols = valid_kv_rows / 8;
-                const int vec8_per_thread = (vec8_cols + THREADS_PER_ROW - 1) / THREADS_PER_ROW;
-                const int tail_start = vec8_cols * 8;
-
-                float4* sS_vec4    = reinterpret_cast<float4*>(sS_row);
-                float4* sdOV_vec4  = reinterpret_cast<float4*>(sdOV_row);
-                uint4*  sdS_vec_u4 = reinterpret_cast<uint4*>(sdS_row);
-
-                uint4 buf[4]; int cnt = 0;
-
-                // Phase 1: compute full 8-elem chunks
-                #pragma unroll
-                for (int j = 0; j < vec8_per_thread; ++j) {
-                    const int v8 = thread_in_row + j * THREADS_PER_ROW;
-                    if (v8 >= vec8_cols) break;
-
-                    float4 s0 = sS_vec4[v8 * 2],   s1 = sS_vec4[v8 * 2 + 1];
-                    float4 d0 = sdOV_vec4[v8 * 2], d1 = sdOV_vec4[v8 * 2 + 1];
-
-                    #define COMP(i, sf, df) \
-                        float sh##i = (sf) - lse_val; \
-                        float p##i = (sh##i < -80.0f) ? 0.0f : __expf(sh##i); \
-                        float ds##i = p##i * softmax_scale * ((df) - row_dot_val);
-
-                    COMP(0, s0.x, d0.x) COMP(1, s0.y, d0.y) COMP(2, s0.z, d0.z) COMP(3, s0.w, d0.w)
-                    COMP(4, s1.x, d1.x) COMP(5, s1.y, d1.y) COMP(6, s1.z, d1.z) COMP(7, s1.w, d1.w)
-                    #undef COMP
-
-                    uint4 res;
-                    asm volatile(
-                        "{ mov.b32 %0, {%4,%5}; mov.b32 %1, {%6,%7}; mov.b32 %2, {%8,%9}; mov.b32 %3, {%10,%11}; }\n"
-                        : "=r"(res.x), "=r"(res.y), "=r"(res.z), "=r"(res.w)
-                        : "h"(__half_as_ushort(__float2half_rn(ds0))),
-                          "h"(__half_as_ushort(__float2half_rn(ds1))),
-                          "h"(__half_as_ushort(__float2half_rn(ds2))),
-                          "h"(__half_as_ushort(__float2half_rn(ds3))),
-                          "h"(__half_as_ushort(__float2half_rn(ds4))),
-                          "h"(__half_as_ushort(__float2half_rn(ds5))),
-                          "h"(__half_as_ushort(__float2half_rn(ds6))),
-                          "h"(__half_as_ushort(__float2half_rn(ds7)))
-                    );
-                    buf[cnt++] = res;
-                }
-                // Phase 2: tail
-                #pragma unroll
-                for (int c = tail_start + thread_in_row; c < BLOCK_N; c += THREADS_PER_ROW) {
-                    float s =   (c < valid_kv_rows) ? sS_row[c] : NEG_INF;
-                    float dov = (c < valid_kv_rows) ? sdOV_row[c] : 0.0f;
-                    float p =   (s - lse_val < -80.0f) ? 0.0f : __expf(s - lse_val);
-                    float ds =  p * softmax_scale * ((c < valid_kv_rows) ? (dov - row_dot_val) : 0.0f);
-                    sdS_row[c] = __float2half_rn(ds);
-                }
-                // Phase 3: write buffered uint4s
-                #pragma unroll
-                for (int i = 0; i < cnt; ++i) {
-                        const int v8 = thread_in_row + i * THREADS_PER_ROW;
-                        if (v8 < vec8_cols) {
-                            sdS_vec_u4[v8] = buf[i];
-                        }
-                }
-            }
             __syncthreads();
 
             // ==================================================================================
@@ -472,73 +411,18 @@ flash_attention_backward_kernel(
             __syncthreads();
 
             // ==================================================================================
-            // Compute dP = exp(S - lse) & dS = P * (dOV - row_dot) * scale
+            // Compute:  P = exp(S - lse), dS = P * (dOV - row_dot) * scale
+            // Layout:   S[row: BLOCK_N, BLOCK_M], dOV[row: BLOCK_N, BLOCK_M],
+            //           LSE[row: BLOCK_N], row_dot[row: BLOCK_N] -> P[row: BLOCK_N, BLOCK_M], dS[row: BLOCK_N, BLOCK_M]
+            // Template: BLOCK_X=BLOCK_N, BLOCK_Y=BLOCK_M, STRIDE_IN=M_STRIDE, STRIDE_OUT=BLOCK_M
             // ==================================================================================
-            const int total_elements = BLOCK_N * BLOCK_M;
-            const int total_pairs = (total_elements + 1) / 2;
+            WMMA_GEMM_POST_SOFTMAX_GRADIENT<GemmType::compute_P_dS, M_STRIDE, BLOCK_M, BLOCK_N, BLOCK_M>(
+            sS, sdOV, sLse, sRowDot,
+            sP, sdS,
+            valid_q_rows, valid_kv_rows,
+            softmax_scale, tid,
+            THREADS_PER_ROW, THREADS_PER_BLOCK);
 
-            #pragma unroll 2
-            for (int i = tid; i < total_pairs; i += THREADS_PER_BLOCK) {
-                const int linear_idx0 = i * 2;
-                const int linear_idx1 = linear_idx0 + 1;
-
-                const int row0 = linear_idx0 / BLOCK_M;
-                const int col0 = linear_idx0 % BLOCK_M;
-                const bool has_pair = (linear_idx1 < total_elements);
-                const int row1 = has_pair ? linear_idx1 / BLOCK_M : row0;
-                const int col1 = has_pair ? linear_idx1 % BLOCK_M : col0 + 1;
-
-                // Load S and dOV
-                float s0 = 0.0f, s1 = 0.0f;
-                float dov0 = 0.0f, dov1 = 0.0f;
-
-                const bool in_bounds0 = (row0 < valid_q_rows) && (col0 < valid_kv_rows);
-                const bool causal_ok0 = !IS_CAUSAL || ((start_kv + col0) <= (start_q + row0));
-                const bool valid0 = in_bounds0 && causal_ok0;
-
-                bool valid1 = false;
-                if (has_pair) {
-                    const bool in_bounds1 = (row1 < valid_q_rows) && (col1 < valid_kv_rows);
-                    const bool causal_ok1 = !IS_CAUSAL || ((start_kv + col1) <= (start_q + row1));
-                    valid1 = in_bounds1 && causal_ok1;
-                }
-
-                if (valid0) { s0 = sS[row0 * M_STRIDE + col0]; dov0 = sdOV[row0 * M_STRIDE + col0]; } else { s0 = NEG_INF; }
-                if (valid1) { s1 = sS[row1 * M_STRIDE + col1]; dov1 = sdOV[row1 * M_STRIDE + col1]; } else { s1 = NEG_INF; }
-
-                float lse0 = sLse[row0];
-                float lse1 = (valid1 && row1 != row0) ? sLse[row1] : lse0;
-                float row_dot0 = sRowDot[row0];
-                float row_dot1 = (valid1 && row1 != row0) ? sRowDot[row1] : row_dot0;
-
-                // Compute P0, P1 in float
-                float shifted0 = s0 - lse0;
-                float shifted1 = s1 - lse1;
-
-                float p0 = (shifted0 < -80.0f) ? 0.0f : __expf(shifted0);
-                float p1 = (shifted1 < -80.0f) ? 0.0f : __expf(shifted1);
-
-                // Compute dS
-                float diff0 = dov0 - row_dot0;
-                float diff1 = dov1 - row_dot1;
-                float ds0 = valid0 ? fmaf(p0, softmax_scale * diff0, 0.0f) : 0.0f;
-                float ds1 = valid1 ? fmaf(p1, softmax_scale * diff1, 0.0f) : 0.0f;
-
-                // Convert P and dS to half
-                __half2 p_h2 = __float22half2_rn(make_float2(p0, p1));
-                __half2 ds_h2 = __float22half2_rn(make_float2(ds0, ds1));
-
-                // Store P and dS in half (row-major, BLOCK_M stride)
-                if (col1 < BLOCK_M && row1 == row0) {
-                    __half* p_dst  = sP  + row0 * BLOCK_M + col0;
-                    __half* ds_dst = sdS + row0 * BLOCK_M + col0;
-                    p_dst[0]  = p_h2.x;  p_dst[1]  = p_h2.y;
-                    ds_dst[0] = ds_h2.x; ds_dst[1] = ds_h2.y;
-                } else {
-                    if (valid0) { sP[row0 * BLOCK_M + col0] = p_h2.x; sdS[row0 * BLOCK_M + col0] = ds_h2.x; }
-                    if (valid1) { sP[row1 * BLOCK_M + col1] = p_h2.y; sdS[row1 * BLOCK_M + col1] = ds_h2.y; }
-                }
-            }
             __syncthreads();
 
             // ==================================================================================

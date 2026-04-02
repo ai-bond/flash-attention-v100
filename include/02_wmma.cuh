@@ -387,3 +387,125 @@ __device__ __forceinline__ void WMMA_GEMM_DOT_PRODUCT(
         }
     }
 }
+
+// ============================================================================
+// WMMA_GEMM_POST_SOFTMAX_GRADIENT: Unified post-softmax computation
+// ============================================================================
+template<GemmType TYPE, int ROW_STRIDE, int OUT_STRIDE, int BLOCK_X, int BLOCK_Y>
+__device__ __forceinline__ void WMMA_GEMM_POST_SOFTMAX_GRADIENT(
+    const float* __restrict__ SMEM_S,
+    const float* __restrict__ SMEM_DOV,
+    const float* __restrict__ SMEM_LSE,
+    const float* __restrict__ SMEM_DOT,
+    __half* __restrict__ SMEM_P,
+    __half* __restrict__ SMEM_DS,
+    int VALID_Q_ROWS,
+    int VALID_KV_ROWS,
+    float SOFTMAX_SCALE,
+    int THREAD_ID,
+    int THREADS_PER_ROW,
+    int THREADS_PER_BLOCK
+) {
+    constexpr int TOTAL_ELEMENTS = BLOCK_X * BLOCK_Y;
+    constexpr int TOTAL_PAIRS = (TOTAL_ELEMENTS + 1) / 2;
+
+    constexpr bool IS_SDS_SP = static_cast<uint8_t>(TYPE) & 0x1;
+
+    __half2 buf_ds[2];
+
+    // ====================================================================
+    // PHASE 1: READ + COMPUTE
+    // ====================================================================
+    #pragma unroll 1
+    for (int i = THREAD_ID; i < TOTAL_PAIRS; i += THREADS_PER_BLOCK) {
+        const int idx0 = i * 2;
+        const int idx1 = idx0 + 1;
+        const int row0 = idx0 / BLOCK_Y;
+        const int col0 = idx0 % BLOCK_Y;
+        const bool has_pair = (idx1 < TOTAL_ELEMENTS);
+        const int row1 = has_pair ? idx1 / BLOCK_Y : row0;
+        const int col1 = has_pair ? idx1 % BLOCK_Y : col0 + 1;
+
+        const bool in0 = (row0 < VALID_Q_ROWS) && (col0 < VALID_KV_ROWS);
+        const bool in1 = has_pair && (row1 < VALID_Q_ROWS) && (col1 < VALID_KV_ROWS);
+
+        float s0 = in0 ? SMEM_S[row0 * ROW_STRIDE + col0] : NEG_INF;
+        float s1 = in1 ? SMEM_S[row1 * ROW_STRIDE + col1] : NEG_INF;
+        float dov0 = (s0 != NEG_INF) ? SMEM_DOV[row0 * ROW_STRIDE + col0] : 0.0f;
+        float dov1 = (s1 != NEG_INF) ? SMEM_DOV[row1 * ROW_STRIDE + col1] : 0.0f;
+
+        float lse0 = SMEM_LSE[row0];
+        float lse1 = (in1 && row1 != row0) ? SMEM_LSE[row1] : lse0;
+        float dot0 = SMEM_DOT[row0];
+        float dot1 = (in1 && row1 != row0) ? SMEM_DOT[row1] : dot0;
+
+        float sh0 = s0 - lse0;
+        float sh1 = s1 - lse1;
+        float p0 = (s0 == NEG_INF || sh0 < -80.0f) ? 0.0f : __expf(sh0);
+        float p1 = (s1 == NEG_INF || sh1 < -80.0f) ? 0.0f : __expf(sh1);
+
+        float diff0 = dov0 - dot0;
+        float diff1 = dov1 - dot1;
+        float ds0 = fmaf(p0, SOFTMAX_SCALE * diff0, 0.0f);
+        float ds1 = fmaf(p1, SOFTMAX_SCALE * diff1, 0.0f);
+
+        __half2 h2_p  = __float22half2_rn(make_float2(p0, p1));
+        __half2 h2_ds = __float22half2_rn(make_float2(ds0, ds1));
+
+        if constexpr (!IS_SDS_SP) {
+            int buf_idx = (i - THREAD_ID) / THREADS_PER_BLOCK;
+            if (buf_idx < 2) {
+                buf_ds[buf_idx] = h2_ds;
+            } else {
+                if (in0) SMEM_DS[row0 * OUT_STRIDE + col0] = h2_ds.x;
+                if (in1) SMEM_DS[row1 * OUT_STRIDE + col1] = h2_ds.y;
+            }
+        }
+        else {
+            if (col1 < BLOCK_Y && row1 == row0) {
+                __half* dst_p  = SMEM_P  + row0 * OUT_STRIDE + col0;
+                __half* dst_ds = SMEM_DS + row0 * OUT_STRIDE + col0;
+                *reinterpret_cast<__half2*>(dst_p)  = h2_p;
+                *reinterpret_cast<__half2*>(dst_ds) = h2_ds;
+            } else {
+                if (in0) {
+                    SMEM_P[row0 * OUT_STRIDE + col0]  = h2_p.x;
+                    SMEM_DS[row0 * OUT_STRIDE + col0] = h2_ds.x;
+                }
+                if (in1) {
+                    SMEM_P[row1 * OUT_STRIDE + col1]  = h2_p.y;
+                    SMEM_DS[row1 * OUT_STRIDE + col1] = h2_ds.y;
+                }
+            }
+        }
+    }
+
+    // ====================================================================
+    // PHASE 2: WRITE from register buffers to SMEM (dQ path ONLY)
+    // ====================================================================
+    if constexpr (!IS_SDS_SP) {
+        #pragma unroll 1
+        for (int i = THREAD_ID; i < TOTAL_PAIRS; i += THREADS_PER_BLOCK) {
+            int buf_idx = (i - THREAD_ID) / THREADS_PER_BLOCK;
+            if (buf_idx >= 2) continue;
+
+            const int idx0 = i * 2;
+            const int idx1 = idx0 + 1;
+            const int row0 = idx0 / BLOCK_Y;
+            const int col0 = idx0 % BLOCK_Y;
+            const bool has_pair = (idx1 < TOTAL_ELEMENTS);
+            const int row1 = has_pair ? idx1 / BLOCK_Y : row0;
+            const int col1 = has_pair ? idx1 % BLOCK_Y : col0 + 1;
+
+            if (col1 < BLOCK_Y && row1 == row0) {
+                __half* dst_ds = SMEM_DS + row0 * OUT_STRIDE + col0;
+                *reinterpret_cast<__half2*>(dst_ds) = buf_ds[buf_idx];
+            } else {
+                SMEM_DS[row0 * OUT_STRIDE + col0] = buf_ds[buf_idx].x;
+                if (has_pair && idx1 < TOTAL_ELEMENTS) {
+                    SMEM_DS[row1 * OUT_STRIDE + col1] = buf_ds[buf_idx].y;
+                }
+            }
+        }
+    }
+}
