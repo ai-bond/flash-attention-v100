@@ -46,12 +46,13 @@ __device__ __forceinline__ void WMMA_GEMM_LOAD_TILE(
     if (total_iters == 0) return;
 
     uint64_t src_base0 = static_cast<uint64_t>(__cvta_generic_to_global(SRC0));
-    uint64_t dst_base0 = static_cast<uint64_t>(__cvta_generic_to_shared(DST0));
+    uint32_t dst_base0 = static_cast<uint32_t>(__cvta_generic_to_shared(DST0));
 
-    uint64_t src_base1 = 0, dst_base1 = 0;
+    uint64_t src_base1 = 0;
+    uint32_t dst_base1 = 0;
     if constexpr (DUAL_LOAD) {
         src_base1 = static_cast<uint64_t>(__cvta_generic_to_global(SRC1));
-        dst_base1 = static_cast<uint64_t>(__cvta_generic_to_shared(DST1));
+        dst_base1 = static_cast<uint32_t>(__cvta_generic_to_shared(DST1));
     }
 
     #pragma unroll 2
@@ -67,11 +68,11 @@ __device__ __forceinline__ void WMMA_GEMM_LOAD_TILE(
 
         if (in_bounds) {
             uint64_t src_addr0 = src_base0 + (static_cast<uint64_t>(src_offset) << 4);
-            uint64_t dst_addr0 = dst_base0 + (static_cast<uint64_t>(dst_offset) << 4);
+            uint32_t dst_addr0 = dst_base0 + (static_cast<uint32_t>(dst_offset) << 4);
 
             if constexpr (DUAL_LOAD) {
                 uint64_t src_addr1 = src_base1 + (static_cast<uint64_t>(src_offset) << 4);
-                uint64_t dst_addr1 = dst_base1 + (static_cast<uint64_t>(dst_offset) << 4);
+                uint32_t dst_addr1 = dst_base1 + (static_cast<uint32_t>(dst_offset) << 4);
 
                 uint32_t r0, r1, r2, r3;
                 asm volatile(
@@ -89,7 +90,7 @@ __device__ __forceinline__ void WMMA_GEMM_LOAD_TILE(
                     "}\n"
                     : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
                     : "l"(src_addr0), "l"(src_addr1),
-                      "l"(dst_addr0), "l"(dst_addr1),
+                      "r"(dst_addr0), "r"(dst_addr1),
                     "r"(pred)
                     : "memory"
                 );
@@ -107,23 +108,23 @@ __device__ __forceinline__ void WMMA_GEMM_LOAD_TILE(
                     "  @p st.shared.v4.u32 [%5], {%0, %1, %2, %3};\n"
                     "}\n"
                     : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
-                    : "l"(src_addr0), "l"(dst_addr0), "r"(pred)
+                    : "l"(src_addr0), "r"(dst_addr0), "r"(pred)
                     : "memory"
                 );
             }
         } else {
-            uint64_t dst_addr0 = dst_base0 + (static_cast<uint64_t>(dst_offset) << 4);
+            uint32_t dst_addr0 = dst_base0 + (static_cast<uint32_t>(dst_offset) << 4);
             if constexpr (DUAL_LOAD) {
-                uint64_t dst_addr1 = dst_base1 + (static_cast<uint64_t>(dst_offset) << 4);
+                uint32_t dst_addr1 = dst_base1 + (static_cast<uint32_t>(dst_offset) << 4);
                 asm volatile(
                     "st.shared.v4.u32 [%0], {0x0, 0x0, 0x0, 0x0};\n\t"
                     "st.shared.v4.u32 [%1], {0x0, 0x0, 0x0, 0x0};"
-                    : : "l"(dst_addr0), "l"(dst_addr1) : "memory"
+                    : : "r"(dst_addr0), "r"(dst_addr1) : "memory"
                 );
             } else {
                 asm volatile(
                     "st.shared.v4.u32 [%0], {0x0, 0x0, 0x0, 0x0};"
-                    : : "l"(dst_addr0) : "memory"
+                    : : "r"(dst_addr0) : "memory"
                 );
             }
         }
