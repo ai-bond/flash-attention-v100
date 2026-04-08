@@ -132,11 +132,11 @@ flash_attention_backward_kernel(
         __syncthreads();
 
         // ==================================================================================
-        // Compute:  row_dot = sum(O ⊙ dO)
+        // Compute:  row_dot = sum(O ⊙ dO) [dQ backward pass]
         // Layout:   O[global: total_q, D], dO[shared: valid_q_rows, D_STRIDE] -> sRowDot[shared: valid_q_rows]
-        // Template: HAS_LSE_OFFSET=0, USE_FULL_MASK=0, D, D_STRIDE
+        // Template: TYPE=rowdot_dQ (LSE_OFFSET=0), GLOBAL_STRIDE=D, SMEM_STRIDE=D_STRIDE, FULL_ROWS=BLOCK_Y
         // ==================================================================================
-        WMMA_GEMM_DOT_PRODUCT<GemmType::rowdot_dQ, D, D_STRIDE>(
+        WMMA_GEMM_DOT_PRODUCT<GemmType::rowdot_dQ, D, D_STRIDE, BLOCK_M>(
         o_ptr,   sdO, lse_ptr, sLse,
         sRowDot, valid_q_rows, 0, tid,
         THREADS_PER_ROW, THREADS_PER_BLOCK);
@@ -384,12 +384,12 @@ flash_attention_backward_kernel(
             __syncthreads();
 
             // ==================================================================================
-            // Compute:  row_dot = sum(O ⊙ dO)
+            // Compute:  row_dot = sum(O ⊙ dO) [dK/dV backward pass]
             // Layout:   O[global: valid_q_rows, D] (pre-offset = start_q*D), dO[shared: valid_q_rows, D_STRIDE] -> sRowDot[shared]
-            // Template: HAS_LSE_OFFSET=1, USE_FULL_MASK=1, D, D_STRIDE
+            // Template: TYPE=rowdot_dKV (LSE_OFFSET=1), GLOBAL_STRIDE=D, SMEM_STRIDE=D_STRIDE, FULL_ROWS=BLOCK_Y
             // Note:     o_ptr must be pre-offset by caller (o_ptr + start_q*D), lse_ptr loaded with offset
             // ==================================================================================
-            WMMA_GEMM_DOT_PRODUCT<GemmType::rowdot_dKV, D, D_STRIDE>(
+            WMMA_GEMM_DOT_PRODUCT<GemmType::rowdot_dKV, D, D_STRIDE, BLOCK_N>(
             o_ptr + start_q * D, sdO,
             lse_ptr, sLse, sRowDot,
             valid_q_rows, start_q, tid,

@@ -39,8 +39,8 @@ enum class GemmType : uint8_t {
     dQ_dSK       = (1<<0) | (0<<1) | (0<<2),  // 0b001 = 1:   dS(row) @  K(row),   ACCUMULATE=1, A=row, B=row
     dV_PTdO      = (1<<0) | (1<<1) | (0<<2),  // 0b011 = 3:  P^T(col) @ dO(row),   ACCUMULATE=1, A=col, B=row
     dK_dSTQ      = (1<<0) | (1<<1) | (0<<2),  // 0b011 = 3: dS^T(col) @  Q(row),   ACCUMULATE=1, A=col, B=row
-    rowdot_dQ    = (0<<0) | (0<<1) | (0<<2),  // 0b000 = 0: LSE_OFFSET=0, USE_FULL_MASK=0
-    rowdot_dKV   = (1<<0) | (1<<1) | (0<<2),  // 0b011 = 3: LSE_OFFSET=1, USE_FULL_MASK=1
+    rowdot_dQ    = (0<<0) | (0<<1) | (0<<2),  // 0b000 = 0: LSE_OFFSET=0
+    rowdot_dKV   = (1<<0) | (0<<1) | (0<<2),  // 0b011 = 3: LSE_OFFSET=1
     compute_dS   = (0<<0) | (0<<1) | (0<<2),  // 0b000 = 0: IS_SDS_SP=0  dQ
     compute_P_dS = (1<<0) | (0<<1) | (0<<2),  // 0b001 = 1: IS_SDS_SP=1  dKV
     write_dO     = (1<<0) | (0<<1) | (0<<2),  // 0b001 = 1: NORMALIZE=1, DUAL_OUTPUT=0 (forward  O)

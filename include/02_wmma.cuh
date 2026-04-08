@@ -363,7 +363,7 @@ __device__ __forceinline__ void WMMA_GEMM_EPILOGUE(
 // ============================================================================
 // COMPUTE_ROW_DOT
 // ============================================================================
-template<GemmType TYPE, int D, int D_STRIDE>
+template<GemmType TYPE, int GLOBAL_STRIDE, int SMEM_STRIDE, int FULL_ROWS>
 __device__ __forceinline__ void WMMA_GEMM_DOT_PRODUCT(
     const __half* __restrict__ PTR_O,
     const __half* __restrict__ SMEM_DO,
@@ -376,61 +376,67 @@ __device__ __forceinline__ void WMMA_GEMM_DOT_PRODUCT(
     int THREADS_PER_ROW,
     int THREADS_PER_BLOCK
 ) {
+    constexpr int global_blocks = GLOBAL_STRIDE >> 3;
+
+    const int total_iters = VALID_ROWS * global_blocks;
+    if (total_iters == 0) return;
+
+    uint64_t global_base = static_cast<uint64_t>(__cvta_generic_to_global(PTR_O));
+    uint32_t shared_base = static_cast<uint32_t>(__cvta_generic_to_shared(SMEM_DO));
+
     constexpr uint8_t bits = static_cast<uint8_t>(TYPE);
-
     constexpr bool LSE_OFFSET = bits & 0x1;
-    constexpr bool USE_FULL_MASK  = bits & 0x2;
 
-    constexpr int VEC = 4;
-    constexpr int COL_BLOCKS = D / VEC;
-
-    const int work_per_thread = (COL_BLOCKS + THREADS_PER_ROW - 1) / THREADS_PER_ROW;
+    const int work = (global_blocks + THREADS_PER_ROW - 1) / THREADS_PER_ROW;
 
     if (THREAD_ID < VALID_ROWS * THREADS_PER_ROW) {
-        const int row = THREAD_ID / THREADS_PER_ROW;
-        const int thread_in_row = THREAD_ID % THREADS_PER_ROW;
+        const int row    = THREAD_ID / THREADS_PER_ROW;
+        const int thread = THREAD_ID % THREADS_PER_ROW;
 
-        const unsigned mask = USE_FULL_MASK ? 0xFFFFFFFFU : __activemask();
+        const unsigned mask = (VALID_ROWS == FULL_ROWS) ? 0xFFFFFFFFU : __activemask();
 
         float thread_dot = 0.0f;
 
+        const uint64_t row_global = global_base + (static_cast<uint64_t>(row) * GLOBAL_STRIDE * 2);
+        const uint32_t row_shared = shared_base + (static_cast<uint32_t>(row) * SMEM_STRIDE * 2);
+
         #pragma unroll
-        for (int j = 0; j < work_per_thread; ++j) {
-            const int chunk_idx = thread_in_row + j * THREADS_PER_ROW;
-            if (chunk_idx >= COL_BLOCKS) break;
-            const int col = chunk_idx * VEC;
+        for (int j = 0; j < work; ++j) {
+            const int chunk = thread + j * THREADS_PER_ROW;
+            if (chunk >= global_blocks) break;
+            const int col  =  chunk << 3;
+            const int pred = (chunk < global_blocks) ? 1 : 0;
 
-            // Load O from global memory (vectorized 4×half)
-            const __half* o_addr = PTR_O + row * D + col;
-            ushort o_h0, o_h1, o_h2, o_h3;
+            uint32_t o_pack[4], d_pack[4];
+
+            const uint64_t global_addr = row_global + (static_cast<uint64_t>(col) * 2);
+            const uint32_t shared_addr = row_shared + (static_cast<uint32_t>(col) * 2);
+
             asm volatile(
-                "ld.global.v4.u16 {%0, %1, %2, %3}, [%4];"
-                : "=h"(o_h0), "=h"(o_h1), "=h"(o_h2), "=h"(o_h3)
-                : "l"(o_addr)
+                "{\n"
+                "  .reg .pred p;\n"
+                "  setp.ne.b32 p, %10, 0;\n"
+                "  mov.u32 %0, 0; mov.u32 %1, 0; mov.u32 %2, 0; mov.u32 %3, 0;\n"
+                "  mov.u32 %4, 0; mov.u32 %5, 0; mov.u32 %6, 0; mov.u32 %7, 0;\n"
+                "  @p ld.global.v4.u32 {%0, %1, %2, %3}, [%8];\n"
+                "  @p ld.shared.v4.u32 {%4, %5, %6, %7}, [%9];\n"
+                "}\n"
+                : "=r"(o_pack[0]), "=r"(o_pack[1]), "=r"(o_pack[2]), "=r"(o_pack[3]),
+                  "=r"(d_pack[0]), "=r"(d_pack[1]), "=r"(d_pack[2]), "=r"(d_pack[3])
+                : "l"(global_addr), "r"(shared_addr), "r"(pred)
                 : "memory"
             );
 
-            // Load dO from shared memory (vectorized 4×half)
-            const __half* dO_addr = SMEM_DO + row * D_STRIDE + col;
-            ushort d_h0, d_h1, d_h2, d_h3;
-            const uint32_t ptr_dO = static_cast<uint32_t>(
-                reinterpret_cast<uintptr_t>(__cvta_generic_to_shared(dO_addr))
-            );
-            asm volatile(
-                "ld.shared.v4.u16 {%0, %1, %2, %3}, [%4];"
-                : "=h"(d_h0), "=h"(d_h1), "=h"(d_h2), "=h"(d_h3)
-                : "r"(ptr_dO)
-                : "memory"
-            );
-
-            thread_dot = __fmaf_rn(__half2float(__ushort_as_half(o_h0)),
-                                   __half2float(__ushort_as_half(d_h0)), thread_dot);
-            thread_dot = __fmaf_rn(__half2float(__ushort_as_half(o_h1)),
-                                   __half2float(__ushort_as_half(d_h1)), thread_dot);
-            thread_dot = __fmaf_rn(__half2float(__ushort_as_half(o_h2)),
-                                   __half2float(__ushort_as_half(d_h2)), thread_dot);
-            thread_dot = __fmaf_rn(__half2float(__ushort_as_half(o_h3)),
-                                   __half2float(__ushort_as_half(d_h3)), thread_dot);
+            #define H2F_XY(pack, xy) (__half22float2(reinterpret_cast<const __half2&>(pack)).xy)
+              thread_dot = __fmaf_rn(H2F_XY(o_pack[0], x), H2F_XY(d_pack[0], x), thread_dot);
+              thread_dot = __fmaf_rn(H2F_XY(o_pack[0], y), H2F_XY(d_pack[0], y), thread_dot);
+              thread_dot = __fmaf_rn(H2F_XY(o_pack[1], x), H2F_XY(d_pack[1], x), thread_dot);
+              thread_dot = __fmaf_rn(H2F_XY(o_pack[1], y), H2F_XY(d_pack[1], y), thread_dot);
+              thread_dot = __fmaf_rn(H2F_XY(o_pack[2], x), H2F_XY(d_pack[2], x), thread_dot);
+              thread_dot = __fmaf_rn(H2F_XY(o_pack[2], y), H2F_XY(d_pack[2], y), thread_dot);
+              thread_dot = __fmaf_rn(H2F_XY(o_pack[3], x), H2F_XY(d_pack[3], x), thread_dot);
+              thread_dot = __fmaf_rn(H2F_XY(o_pack[3], y), H2F_XY(d_pack[3], y), thread_dot);
+            #undef H2F_XY
         }
 
         #pragma unroll
@@ -438,7 +444,7 @@ __device__ __forceinline__ void WMMA_GEMM_DOT_PRODUCT(
             thread_dot += __shfl_down_sync(mask, thread_dot, offset, THREADS_PER_ROW);
         }
 
-        if (thread_in_row == 0) {
+        if (thread == 0) {
             SMEM_DOT[row] = thread_dot;
         }
     }
