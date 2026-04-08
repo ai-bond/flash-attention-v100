@@ -211,7 +211,7 @@ flash_attention_backward_kernel(
             // Compute:  dS = exp(S - lse) * (dOV - row_dot) * scale
             // Layout:   S[row: BLOCK_M, BLOCK_N], dOV[row: BLOCK_M, BLOCK_N],
             //           LSE[row: BLOCK_M], row_dot[row: BLOCK_M] -> dS[row: BLOCK_M, BLOCK_N]
-            // Template: BLOCK_X=BLOCK_M, BLOCK_Y=BLOCK_N, STRIDE=N_STRIDE
+            // Template: LDS_STRIDE=N_STRIDE, LDO_STRIDE=N_STRIDE, TILE_X=BLOCK_M, TILE_Y=BLOCK_N
             // ==================================================================================
             WMMA_GEMM_POST_SOFTMAX_GRADIENT<GemmType::compute_dS, N_STRIDE, N_STRIDE, BLOCK_M, BLOCK_N>(
             sS, sdOV, sLse, sRowDot,
@@ -414,7 +414,7 @@ flash_attention_backward_kernel(
             // Compute:  P = exp(S - lse), dS = P * (dOV - row_dot) * scale
             // Layout:   S[row: BLOCK_N, BLOCK_M], dOV[row: BLOCK_N, BLOCK_M],
             //           LSE[row: BLOCK_N], row_dot[row: BLOCK_N] -> P[row: BLOCK_N, BLOCK_M], dS[row: BLOCK_N, BLOCK_M]
-            // Template: BLOCK_X=BLOCK_N, BLOCK_Y=BLOCK_M, STRIDE_IN=M_STRIDE, STRIDE_OUT=BLOCK_M
+            // Template: LDS_STRIDE=M_STRIDE, LDO_STRIDE=BLOCK_M, TILE_X=BLOCK_N, TILE_Y=BLOCK_M
             // ==================================================================================
             WMMA_GEMM_POST_SOFTMAX_GRADIENT<GemmType::compute_P_dS, M_STRIDE, BLOCK_M, BLOCK_N, BLOCK_M>(
             sS, sdOV, sLse, sRowDot,

@@ -461,7 +461,7 @@ __device__ __forceinline__ void WMMA_GEMM_DOT_PRODUCT(
 // ============================================================================
 // WMMA_GEMM_POST_SOFTMAX_GRADIENT: Unified post-softmax computation
 // ============================================================================
-template<GemmType TYPE, int ROW_STRIDE, int OUT_STRIDE, int BLOCK_X, int BLOCK_Y>
+template<GemmType TYPE, int SMEM_LDS_STRIDE, int SMEM_LDO_STRIDE, int TILE_X, int TILE_Y>
 __device__ __forceinline__ void WMMA_GEMM_POST_SOFTMAX_GRADIENT(
     const float* __restrict__ SMEM_S,
     const float* __restrict__ SMEM_DOV,
@@ -476,7 +476,7 @@ __device__ __forceinline__ void WMMA_GEMM_POST_SOFTMAX_GRADIENT(
     int THREADS_PER_ROW,
     int THREADS_PER_BLOCK
 ) {
-    constexpr int TOTAL_ELEMENTS = BLOCK_X * BLOCK_Y;
+    constexpr int TOTAL_ELEMENTS = TILE_X * TILE_Y;
     constexpr int TOTAL_PAIRS = (TOTAL_ELEMENTS + 1) / 2;
 
     constexpr bool IS_SDS_SP = static_cast<uint8_t>(TYPE) & 0x1;
@@ -490,24 +490,22 @@ __device__ __forceinline__ void WMMA_GEMM_POST_SOFTMAX_GRADIENT(
     for (int i = THREAD_ID; i < TOTAL_PAIRS; i += THREADS_PER_BLOCK) {
         const int idx0 = i * 2;
         const int idx1 = idx0 + 1;
-        const int row0 = idx0 / BLOCK_Y;
-        const int col0 = idx0 % BLOCK_Y;
+        const int row0 = idx0 / TILE_Y;
+        const int col0 = idx0 % TILE_Y;
         const bool has_pair = (idx1 < TOTAL_ELEMENTS);
-        const int row1 = has_pair ? idx1 / BLOCK_Y : row0;
-        const int col1 = has_pair ? idx1 % BLOCK_Y : col0 + 1;
-
+        const int row1 = has_pair ? idx1 / TILE_Y : row0;
+        const int col1 = has_pair ? idx1 % TILE_Y : col0 + 1;
         const bool in0 = (row0 < VALID_Q_ROWS) && (col0 < VALID_KV_ROWS);
         const bool in1 = has_pair && (row1 < VALID_Q_ROWS) && (col1 < VALID_KV_ROWS);
+        const int lds_offset0 = row0 * SMEM_LDS_STRIDE + col0;
+        const int lds_offset1 = in1 ? (row1 * SMEM_LDS_STRIDE + col1) : 0;
+        const int ldo_offset0 = row0 * SMEM_LDO_STRIDE + col0;
+        const int ldo_offset1 = in1 ? (row1 * SMEM_LDO_STRIDE + col1) : 0;
 
-        const int offset0 = row0 * ROW_STRIDE + col0;
-        const int offset1 = in1 ? (row1 * ROW_STRIDE + col1) : 0;
-        const int out_offset0 = row0 * OUT_STRIDE + col0;
-        const int out_offset1 = in1 ? (row1 * OUT_STRIDE + col1) : 0;
-
-        float s0 = in0 ? SMEM_S[offset0] : NEG_INF;
-        float s1 = in1 ? SMEM_S[offset1] : NEG_INF;
-        float dov0 = (s0 != NEG_INF) ? SMEM_DOV[offset0] : 0.0f;
-        float dov1 = (s1 != NEG_INF) ? SMEM_DOV[offset1] : 0.0f;
+        float s0 = in0 ? SMEM_S[lds_offset0] : NEG_INF;
+        float s1 = in1 ? SMEM_S[lds_offset1] : NEG_INF;
+        float dov0 = (s0 != NEG_INF) ? SMEM_DOV[lds_offset0] : 0.0f;
+        float dov1 = (s1 != NEG_INF) ? SMEM_DOV[lds_offset1] : 0.0f;
 
         float lse0 = SMEM_LSE[row0];
         float lse1 = (in1 && row1 != row0) ? SMEM_LSE[row1] : lse0;
@@ -532,24 +530,30 @@ __device__ __forceinline__ void WMMA_GEMM_POST_SOFTMAX_GRADIENT(
             if (buf_idx < 2) {
                 buf_ds[buf_idx] = h2_ds;
             } else {
-                if (in0) SMEM_DS[out_offset0] = h2_ds.x;
-                if (in1) SMEM_DS[out_offset1] = h2_ds.y;
+                if (in0) SMEM_DS[ldo_offset0] = h2_ds.x;
+                if (in1) SMEM_DS[ldo_offset1] = h2_ds.y;
             }
         }
         else {
-            if (col1 < BLOCK_Y && row1 == row0) {
-                __half* dst_p  = SMEM_P  + out_offset0;
-                __half* dst_ds = SMEM_DS + out_offset0;
-                *reinterpret_cast<__half2*>(dst_p)  = h2_p;
-                *reinterpret_cast<__half2*>(dst_ds) = h2_ds;
+            bool vectorize = (col1 < TILE_Y) && (row1 == row0);
+
+            if (vectorize) {
+                uintptr_t addr_p  = reinterpret_cast<uintptr_t>(SMEM_P  + ldo_offset0);
+                uintptr_t addr_ds = reinterpret_cast<uintptr_t>(SMEM_DS + ldo_offset0);
+                vectorize = ((addr_p & 0x3) == 0) && ((addr_ds & 0x3) == 0);
+            }
+
+            if (vectorize) {
+                *reinterpret_cast<__half2*>(SMEM_P  + ldo_offset0) = h2_p;
+                *reinterpret_cast<__half2*>(SMEM_DS + ldo_offset0) = h2_ds;
             } else {
                 if (in0) {
-                    SMEM_P[out_offset0]  = h2_p.x;
-                    SMEM_DS[out_offset0] = h2_ds.x;
+                    SMEM_P[ldo_offset0]  = h2_p.x;
+                    SMEM_DS[ldo_offset0] = h2_ds.x;
                 }
                 if (in1) {
-                    SMEM_P[out_offset1]  = h2_p.y;
-                    SMEM_DS[out_offset1] = h2_ds.y;
+                    SMEM_P[ldo_offset1]  = h2_p.y;
+                    SMEM_DS[ldo_offset1] = h2_ds.y;
                 }
             }
         }
@@ -566,26 +570,27 @@ __device__ __forceinline__ void WMMA_GEMM_POST_SOFTMAX_GRADIENT(
 
             const int idx0 = i * 2;
             const int idx1 = idx0 + 1;
-            const int row0 = idx0 / BLOCK_Y;
-            const int col0 = idx0 % BLOCK_Y;
+            const int row0 = idx0 / TILE_Y;
+            const int col0 = idx0 % TILE_Y;
             const bool has_pair = (idx1 < TOTAL_ELEMENTS);
-            const int row1 = has_pair ? idx1 / BLOCK_Y : row0;
-            const int col1 = has_pair ? idx1 % BLOCK_Y : col0 + 1;
+            const int row1 = has_pair ? idx1 / TILE_Y : row0;
+            const int col1 = has_pair ? idx1 % TILE_Y : col0 + 1;
+            const int ldo_offset0 = row0 * SMEM_LDO_STRIDE + col0;
+            const int ldo_offset1 = has_pair ? (row1 * SMEM_LDO_STRIDE + col1) : 0;
 
-            const int out_offset0 = row0 * OUT_STRIDE + col0;
-            const bool in1_phase2 = has_pair && (row1 < VALID_Q_ROWS) && (col1 < VALID_KV_ROWS);
-            const int out_offset1 = in1_phase2 ? (row1 * OUT_STRIDE + col1) : 0;
+            bool vectorize = (col1 < TILE_Y) && (row1 == row0);
 
-            if (col1 < BLOCK_Y && row1 == row0) {
-                __half* dst_ds = SMEM_DS + out_offset0;
-                *reinterpret_cast<__half2*>(dst_ds) = buf_ds[buf_idx];
+            if (vectorize) {
+                uintptr_t addr_ds = reinterpret_cast<uintptr_t>(SMEM_DS + ldo_offset0);
+                vectorize = ((addr_ds & 0x3) == 0);
+            }
+
+            if (vectorize) {
+                *reinterpret_cast<__half2*>(SMEM_DS + ldo_offset0) = buf_ds[buf_idx];
             } else {
-                SMEM_DS[out_offset0] = buf_ds[buf_idx].x;
-                if (has_pair && idx1 < TOTAL_ELEMENTS) {
-                    const bool in1_write = (row1 < VALID_Q_ROWS) && (col1 < VALID_KV_ROWS);
-                    if (in1_write) {
-                        SMEM_DS[out_offset1] = buf_ds[buf_idx].y;
-                    }
+                SMEM_DS[ldo_offset0] = buf_ds[buf_idx].x;
+                if (has_pair && (row1 < VALID_Q_ROWS) && (col1 < VALID_KV_ROWS)) {
+                    SMEM_DS[ldo_offset1] = buf_ds[buf_idx].y;
                 }
             }
         }
