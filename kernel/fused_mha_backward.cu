@@ -243,9 +243,9 @@ flash_attention_backward_kernel(
         // Template: D, D_STRIDE Head dimension and stride
         // ==================================================================================
         WMMA_GEMM_EPILOGUE<GemmType::write_dQ, D, D_STRIDE>(
-        sdQ,    nullptr,
-        dQ_ptr, nullptr,
-            nullptr,
+        sdQ,     dQ_ptr,
+        nullptr, nullptr,
+        nullptr,
         valid_q_rows, tid,
         THREADS_PER_BLOCK);
     }
@@ -472,9 +472,9 @@ flash_attention_backward_kernel(
         // Template: D, D_STRIDE Head dimension and stride
         // ==================================================================================
         WMMA_GEMM_EPILOGUE<GemmType::write_dKV, D, D_STRIDE>(
-        sdK,    sdV,
-        dK_ptr, dV_ptr,
-            nullptr,
+        sdK,    dK_ptr,
+        sdV,    dV_ptr,
+        nullptr,
         valid_kv_rows, tid,
         THREADS_PER_BLOCK);
     }

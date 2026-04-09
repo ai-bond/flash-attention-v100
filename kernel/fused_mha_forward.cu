@@ -306,8 +306,8 @@ flash_attention_forward_kernel(
     // Template  D, D_STRIDE  : Head dimension and shared memory stride
     // ==================================================================================
     WMMA_GEMM_EPILOGUE<GemmType::write_dO, D, D_STRIDE>(
-    sO,      nullptr,
-    out_ptr, nullptr,
+    sO,      out_ptr,
+    nullptr, nullptr,
     sRowSum,
     valid_q_rows, tid,
     THREADS_PER_BLOCK);
