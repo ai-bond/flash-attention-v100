@@ -618,3 +618,114 @@ __device__ __forceinline__ void WMMA_GEMM_EPILOGUE(
         }
     }
 }
+
+// ============================================================================
+// ONLINE_SOFTMAX: Online softmax with O-scaling
+// ============================================================================
+template<int BLOCK_M, int BLOCK_N, int SCORE_STRIDE, int HEAD_STRIDE, int THREADS_PER_ROW>
+__device__ __forceinline__ void ONLINE_SOFTMAX(
+    float*  __restrict__ SMEM_S,
+    __half* __restrict__ SMEM_P,
+    float*  __restrict__ SMEM_O,
+    float*  __restrict__ SMEM_MAX,
+    float*  __restrict__ SMEM_SUM,
+    int VALID_Q,
+    int VALID_KV,
+    int THREAD_ID,
+    int BLOCK_ID
+) {
+    if (VALID_Q == 0 || VALID_KV == 0) return;
+
+    const int row      = THREAD_ID / THREADS_PER_ROW;
+    const int thread   = THREAD_ID % THREADS_PER_ROW;
+
+    float thread_max = NEG_INF, new_max = NEG_INF;
+    float thread_sum = 0.0f, exp_diff = 1.0f;
+
+    __half2 half_buffer[8];
+
+    float*   sS_float  = SMEM_S + row * SCORE_STRIDE;
+    float4*  sS_float4 = reinterpret_cast<float4*>(sS_float);
+    __half*  sP_half   = SMEM_P + row * SCORE_STRIDE;
+    __half2* sP_half2  = reinterpret_cast<__half2*>(sP_half);
+
+    const int cols = VALID_KV >> 2;
+    const int tail = cols << 2;
+
+    // Phase 1: Max reduction
+    if (row < VALID_Q) {
+        #pragma unroll 4
+        for (int idx = thread; idx < cols; idx += THREADS_PER_ROW) {
+            float4 buffer = sS_float4[idx];
+            thread_max = fmaxf(thread_max, fmaxf(fmaxf(buffer.x, buffer.y), fmaxf(buffer.z, buffer.w)));
+        }
+    }
+
+    // Phase 2: Warp reduction thread_max
+    #pragma unroll
+    for (int offset = THREADS_PER_ROW / 2; offset > 0; offset >>= 1) {
+        thread_max = fmaxf(thread_max, __shfl_xor_sync(0xFFFFFFFFU, thread_max, offset, THREADS_PER_ROW));
+    }
+
+    // Phase 3: calc exp_diff, thread_sum + sP write
+    if (row < VALID_Q) {
+        const float old_max = SMEM_MAX[row];
+        new_max  = fmaxf(old_max, thread_max);
+        exp_diff = __expf(old_max - new_max);
+
+        int rb_idx = 0;
+        #pragma unroll 4
+        for (int idx = thread; idx < cols; idx += THREADS_PER_ROW) {
+            float4 buffer = sS_float4[idx];
+            float e0 = __expf(fmaxf(buffer.x - new_max, -80.0f));
+            float e1 = __expf(fmaxf(buffer.y - new_max, -80.0f));
+            float e2 = __expf(fmaxf(buffer.z - new_max, -80.0f));
+            float e3 = __expf(fmaxf(buffer.w - new_max, -80.0f));
+
+            thread_sum += (e0 + e1) + (e2 + e3);
+            half_buffer[rb_idx++] = __float22half2_rn(make_float2(e0, e1));
+            half_buffer[rb_idx++] = __float22half2_rn(make_float2(e2, e3));
+        }
+
+        if (tail < VALID_KV) {
+            #pragma unroll 4
+            for (int idx = tail + thread; idx < BLOCK_N; idx += THREADS_PER_ROW) {
+                float v = (idx < VALID_KV) ? sS_float[idx] : NEG_INF;
+                float e = __expf(fmaxf(v - new_max, -80.0f));
+                thread_sum += (idx < VALID_KV) ? e : 0.0f;
+                sP_half[idx] = (idx < VALID_KV) ? __float2half_rn(e) : __float2half(0.f);
+            }
+        }
+
+        int wb_idx = 0;
+        #pragma unroll 4
+        for (int idx = thread; idx < cols; idx += THREADS_PER_ROW) {
+            int base = idx * 2;
+            sP_half2[base]     = half_buffer[wb_idx++];
+            sP_half2[base + 1] = half_buffer[wb_idx++];
+        }
+    }
+
+    // Phase 4: Warp reduction thread_sum
+    #pragma unroll
+    for (int offset = THREADS_PER_ROW / 2; offset > 0; offset >>= 1) {
+        thread_sum += __shfl_xor_sync(0xFFFFFFFFU, thread_sum, offset, THREADS_PER_ROW);
+    }
+
+    if (thread == 0) {
+        SMEM_SUM[row] = exp_diff * SMEM_SUM[row] + thread_sum;
+        SMEM_MAX[row] = new_max;
+    }
+
+    // Phase 5: sO scaling
+    if (row < VALID_Q && BLOCK_ID > 0) {
+        float4* sO_float4 = reinterpret_cast<float4*>(SMEM_O + row * HEAD_STRIDE);
+        #pragma unroll 4
+        for (int idx = thread; idx < ((HEAD_STRIDE + 3) >> 2); idx += THREADS_PER_ROW) {
+            float4 buffer = sO_float4[idx];
+            buffer.x *= exp_diff; buffer.y *= exp_diff;
+            buffer.z *= exp_diff; buffer.w *= exp_diff;
+            sO_float4[idx] = buffer;
+        }
+    }
+}

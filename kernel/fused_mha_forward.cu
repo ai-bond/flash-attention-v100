@@ -157,120 +157,16 @@ flash_attention_forward_kernel(
         __syncthreads();
 
         // ==================================================================================
-        // Compute Online Softmax + Scale
+        // Compute:  Online Softmax + O-scaling
+        // Layout:   S[BLOCK_M, BLOCK_N] -> P[BLOCK_M, BLOCK_N], O[BLOCK_M, D] scaled
+        // Template: BLOCK_M, BLOCK_N, N_STRIDE, D_STRIDE, THREADS_PER_ROW, FULL_ROWS
         // ==================================================================================
-        if (tid < valid_q_rows * THREADS_PER_ROW) {
-            const int row = tid / THREADS_PER_ROW;
-            const int thread_in_row = tid % THREADS_PER_ROW;
-            const unsigned mask = (valid_q_rows == BLOCK_M) ? 0xFFFFFFFFU : __activemask();
-            const int row_leader = __ffs(mask) - 1;
+        ONLINE_SOFTMAX<BLOCK_M, BLOCK_N, N_STRIDE, D_STRIDE, THREADS_PER_ROW>(
+        sS, sP, sO,
+        sRowMax, sRowSum,
+        valid_q_rows, valid_kv_rows,
+        tid, block);
 
-            float*  sS_row_f = sS + row * N_STRIDE;
-            __half* sP_row_h = sP + row * N_STRIDE;
-
-            const int vec_cols = valid_kv_rows >> 2;
-            const int vecs_per_thread = (vec_cols + THREADS_PER_ROW - 1) / THREADS_PER_ROW;
-            const int tail_start = vec_cols << 2;
-
-            // Phase 1: Max reduction with prefetch
-            float thread_max = NEG_INF;
-            float4* sS_vec4 = reinterpret_cast<float4*>(sS_row_f);
-
-            #pragma unroll 4
-            for (int j = 0; j < vecs_per_thread; ++j) {
-                int vc = thread_in_row + j * THREADS_PER_ROW;
-                if (vc < vec_cols) {
-                    float4 v4 = sS_vec4[vc];
-                    thread_max = fmaxf(thread_max, fmaxf(fmaxf(v4.x, v4.y), fmaxf(v4.z, v4.w)));
-                }
-            }
-
-            // 1.1 warp reduction
-            #pragma unroll
-            for (int o = THREADS_PER_ROW / 2; o > 0; o >>= 1)
-                thread_max = fmaxf(thread_max, __shfl_down_sync(mask, thread_max, o, THREADS_PER_ROW));
-
-            const float row_max  = __shfl_sync(mask, thread_max, row_leader, THREADS_PER_ROW);
-            const float old_max  = sRowMax[row];
-            const float new_max  = fmaxf(old_max, row_max);
-            const float exp_diff = __expf(old_max - new_max);
-
-            // Phase 2: Unified vectorized + tail processing
-            float thread_sum = 0.0f;
-            __half2 half_buffer[20];
-            int vc_base = thread_in_row;
-            int h2_idx = 0;
-
-            #pragma unroll 4
-            for (int j = 0; j < vecs_per_thread; ++j, vc_base += THREADS_PER_ROW) {
-                if (vc_base < vec_cols) {
-                    float4 v4 = sS_vec4[vc_base];
-
-                    float e0 = __expf(fmaxf(v4.x - new_max, -80.0f));
-                    float e1 = __expf(fmaxf(v4.y - new_max, -80.0f));
-                    float e2 = __expf(fmaxf(v4.z - new_max, -80.0f));
-                    float e3 = __expf(fmaxf(v4.w - new_max, -80.0f));
-
-                    thread_sum += (e0 + e1) + (e2 + e3);
-
-                    half_buffer[h2_idx++] = __float22half2_rn(make_float2(e0, e1));
-                    half_buffer[h2_idx++] = __float22half2_rn(make_float2(e2, e3));
-                }
-            }
-
-            #pragma unroll 4
-            for (int c = tail_start + thread_in_row; c < BLOCK_N; c += THREADS_PER_ROW) {
-                float v = (c < valid_kv_rows) ? sS_row_f[c] : NEG_INF;
-                float e = __expf(fmaxf(v - new_max, -80.0f));
-                thread_sum += (c < valid_kv_rows) ? e : 0.0f;
-                sP_row_h[c] = (c < valid_kv_rows) ? __float2half_rn(e) : __float2half(0.f);
-            }
-
-            #pragma unroll
-            for (int o = THREADS_PER_ROW / 2; o > 0; o >>= 1)
-                thread_sum += __shfl_down_sync(mask, thread_sum, o, THREADS_PER_ROW);
-
-            float row_sum = __shfl_sync(mask, thread_sum, row_leader, THREADS_PER_ROW);
-
-            if (thread_in_row == 0) {
-                sRowSum[row] = exp_diff * sRowSum[row] + row_sum;
-                sRowMax[row] = new_max;
-            }
-
-            // Phase 3: Vectorized writes
-            h2_idx = 0;
-            vc_base = thread_in_row;
-            __half2* sP_half2 = reinterpret_cast<__half2*>(sP_row_h);
-
-            #pragma unroll 4
-            for (int j = 0; j < vecs_per_thread; ++j, vc_base += THREADS_PER_ROW) {
-                if (vc_base < vec_cols) {
-                    int base_offset = vc_base * 2;
-
-                    sP_half2[base_offset]     = half_buffer[h2_idx++];
-                    sP_half2[base_offset + 1] = half_buffer[h2_idx++];
-                }
-            }
-
-            // Fused sO scaling
-            if (block > 0) {
-                float*  sO_row = sO + row * D_STRIDE;
-                float4* sO_vec = reinterpret_cast<float4*>(sO_row);
-                const int o_vec_count = (D_STRIDE + 3) >> 2;
-                float scale = exp_diff;
-
-                #pragma unroll 4
-                for (int ov = thread_in_row; ov < o_vec_count; ov += THREADS_PER_ROW) {
-                    float4 v = sO_vec[ov];
-                    v.x *= scale;
-                    v.y *= scale;
-                    v.z *= scale;
-                    v.w *= scale;
-
-                    sO_vec[ov] = v;
-                }
-            }
-        }
         __syncthreads();
 
         // ==================================================================================
