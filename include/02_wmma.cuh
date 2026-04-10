@@ -321,14 +321,12 @@ __device__ __forceinline__ void WMMA_GEMM_DOT_PRODUCT(
 
     const int work = (global_blocks + THREADS_PER_ROW - 1) / THREADS_PER_ROW;
 
-    if (THREAD_ID < VALID_ROWS * THREADS_PER_ROW) {
-        const int row    = THREAD_ID / THREADS_PER_ROW;
-        const int thread = THREAD_ID % THREADS_PER_ROW;
+    const int row    = THREAD_ID / THREADS_PER_ROW;
+    const int thread = THREAD_ID % THREADS_PER_ROW;
 
-        const unsigned mask = (VALID_ROWS == FULL_ROWS) ? 0xFFFFFFFFU : __activemask();
+    float thread_dot = 0.0f;
 
-        float thread_dot = 0.0f;
-
+    if (row < VALID_ROWS) {
         const uint64_t row_global = global_base + (static_cast<uint64_t>(row) * GLOBAL_STRIDE * 2);
         const uint32_t row_shared = shared_base + (static_cast<uint32_t>(row) * SMEM_STRIDE * 2);
 
@@ -370,15 +368,15 @@ __device__ __forceinline__ void WMMA_GEMM_DOT_PRODUCT(
               thread_dot = __fmaf_rn(H2F_XY(o_pack[3], y), H2F_XY(d_pack[3], y), thread_dot);
             #undef H2F_XY
         }
+    }
 
-        #pragma unroll
-        for (int offset = THREADS_PER_ROW / 2; offset > 0; offset >>= 1) {
-            thread_dot += __shfl_down_sync(mask, thread_dot, offset, THREADS_PER_ROW);
-        }
+    #pragma unroll
+    for (int offset = THREADS_PER_ROW / 2; offset > 0; offset >>= 1) {
+        thread_dot += __shfl_xor_sync(0xFFFFFFFFU, thread_dot, offset, THREADS_PER_ROW);
+    }
 
-        if (thread == 0) {
-            SMEM_DOT[row] = thread_dot;
-        }
+    if (thread == 0) {
+        SMEM_DOT[row] = thread_dot;
     }
 
     if (THREAD_ID < VALID_ROWS) {
