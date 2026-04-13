@@ -4,9 +4,13 @@
 # *
 
 import os
+import shutil
 from pathlib import Path
 from packaging.version import parse
 from setuptools import setup
+from setuptools.command.build_py import build_py
+from setuptools.command.install import install
+from torch.utils.cpp_extension import CUDAExtension, BuildExtension
 
 this_dir = Path(__file__).parent.resolve()
 
@@ -19,6 +23,21 @@ def get_ext_modules():
             "Please install torch >= 2.5 first (e.g., `pip install torch --index-url https://download.pytorch.org/whl/cu118`)."
         ) from e
 
+    nvcc_threads = int(os.environ.get("NVCC_THREADS", 4))
+    nvcc_flags = [
+        "-O3",
+        "-std=c++17",
+        "-gencode", "arch=compute_70,code=sm_70",
+        "-U__CUDA_NO_HALF_OPERATORS__",
+        "-U__CUDA_NO_HALF_CONVERSIONS__",
+        "-U__CUDA_NO_HALF2_OPERATORS__",
+        "--expt-relaxed-constexpr",
+        "--expt-extended-lambda",
+        "--use_fast_math",
+        "-Wno-deprecated-gpu-targets",
+        f"--threads={nvcc_threads}",
+    ]
+
     return [
         CUDAExtension(
             name="flash_attn_v100_cuda",
@@ -30,30 +49,54 @@ def get_ext_modules():
             include_dirs=[this_dir / "include"],
             extra_compile_args={
                 "cxx": ["-O3", "-std=c++17"],
-                "nvcc": [
-                    "-O3",
-                    "-std=c++17",
-                    "-gencode", "arch=compute_70,code=sm_70",
-                    "-U__CUDA_NO_HALF_OPERATORS__",
-                    "-U__CUDA_NO_HALF_CONVERSIONS__",
-                    "-U__CUDA_NO_HALF2_OPERATORS__",
-                    "--expt-relaxed-constexpr",
-                    "--expt-extended-lambda",
-                    "--use_fast_math",
-                    "-Wno-deprecated-gpu-targets",
-                ],
+                "nvcc": nvcc_flags,
             },
         )
     ]
 
-def get_cmdclass():
-    try:
-        from torch.utils.cpp_extension import BuildExtension
-    except ImportError as e:
-        raise RuntimeError(
-            "torch is required to build flash_attn_v100. "
-            "Please install torch >= 2.5 first."
-        ) from e
+class CopyAttention(build_py):
+    def run(self):
+        super().run()
+        build_lib = self.build_lib
+        this_dir = os.path.dirname(os.path.abspath(__file__))
+
+        src_pkg = os.path.join(this_dir, 'flash_attn')
+        dst_pkg = os.path.join(build_lib, 'flash_attn')
+        if os.path.exists(src_pkg):
+            if os.path.exists(dst_pkg):
+                shutil.rmtree(dst_pkg)
+            shutil.copytree(src_pkg, dst_pkg, ignore=shutil.ignore_patterns('__pycache__', '*.pyc', '*.so'))
+            print(f"Copied package: {src_pkg} -> {dst_pkg}")
+
+class InstallAttention(install):
+    def run(self):
+        install.run(self)
+
+        import site
+        site_packages = site.getsitepackages()[0]
+
+        dst_dir = os.path.join(site_packages, 'flash_attn-2.8.3.dist-info')
+        if os.path.exists(dst_dir):
+            shutil.rmtree(dst_dir)
+            print(f"Removed existing: {dst_dir}")
+        os.makedirs(dst_dir, exist_ok=True)
+
+        metadata = """\
+Metadata-Version: 2.4
+Name: flash-attn
+Version: 2.8.3
+Summary: Flash Attention for Tesla V100
+License-Expression: BSD-3-Clause
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+"""
+        with open(os.path.join(dst_dir, 'METADATA'), 'w') as f:
+            f.write(metadata)
+
+        with open(os.path.join(dst_dir, 'top_level.txt'), 'w') as f:
+            f.write('flash_attn\n')
+
+        print(f"Created: {dst_dir}")
 
 def get_cmdclass():
     try:
@@ -64,7 +107,7 @@ def get_cmdclass():
             "Please install torch >= 2.5 first."
         ) from e
 
-    class CustomBuildExtension(BuildExtension):
+    class BuildAttention(BuildExtension):
         def build_extensions(self):
             import torch
 
@@ -72,7 +115,7 @@ def get_cmdclass():
                 try:
                     import psutil
 
-                    nvcc_threads = int(os.environ.get("NVCC_THREADS", 3))
+                    nvcc_threads = int(os.environ.get("NVCC_THREADS", 4))
                     cores = os.cpu_count() or 4
                     free_mem_gb = psutil.virtual_memory().available / (1024**3)
 
@@ -101,7 +144,7 @@ def get_cmdclass():
                 raise RuntimeError(f"CUDA version {torch.version.cuda} < 11.6 is not supported. Please use CUDA ≥ 11.6 (e.g., PyTorch built with CUDA 11.8/12.x).")
             super().build_extensions()
 
-    return {"build_ext": CustomBuildExtension}
+    return {"build_ext": BuildAttention, "build_py": CopyAttention, 'install': InstallAttention}
 
 try:
     with open(this_dir / "README.md", encoding="utf-8") as f:
@@ -111,7 +154,7 @@ except FileNotFoundError:
 
 setup(
     name="flash_attn_v100",
-    version="26.02",
+    version="26.04",
     packages=["flash_attn_v100"],
     ext_modules=get_ext_modules(),
     cmdclass=get_cmdclass(),

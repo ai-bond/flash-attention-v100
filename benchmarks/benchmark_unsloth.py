@@ -22,11 +22,14 @@ from flash_attn_v100 import flash_attn_func
 
 fa = make_package("flash_attn")
 fa.flash_attn_func = flash_attn_func
+fa.flash_attn_varlen_func = flash_attn_func
+fa.flash_attn_with_kvcache = flash_attn_func
 sys.modules["flash_attn"] = fa
 
 fai = make_module("flash_attn.flash_attn_interface")
 fai.flash_attn_func = flash_attn_func
 fai.flash_attn_varlen_func = flash_attn_func
+fai.flash_attn_with_kvcache = flash_attn_func
 sys.modules["flash_attn.flash_attn_interface"] = fai
 
 fbp = make_module("flash_attn.bert_padding")

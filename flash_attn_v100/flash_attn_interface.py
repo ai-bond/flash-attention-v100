@@ -214,4 +214,6 @@ def flash_attn_func(
         traceback.print_exc()
         raise
 
-__all__ = ["flash_attn_func"]
+flash_attn_gpu = flash_attn_func
+
+__all__ = ["flash_attn_func", "flash_attn_gpu"]
