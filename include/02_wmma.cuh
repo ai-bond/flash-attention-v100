@@ -389,7 +389,7 @@ __device__ __forceinline__ void WMMA_GEMM_DOT_PRODUCT(
 }
 
 // ============================================================================
-// WMMA_GEMM_POST_SOFTMAX_GRADIENT: Unified post-softmax computation
+// WMMA_GEMM_POST_SOFTMAX_GRADIENT
 // ============================================================================
 template<GemmType TYPE, int SMEM_LDS_STRIDE, int SMEM_LDO_STRIDE, int TILE_X, int TILE_Y>
 __device__ __forceinline__ void WMMA_GEMM_POST_SOFTMAX_GRADIENT(
@@ -407,121 +407,119 @@ __device__ __forceinline__ void WMMA_GEMM_POST_SOFTMAX_GRADIENT(
     int THREADS_PER_BLOCK
 ) {
     constexpr int TOTAL_ELEMENTS = TILE_X * TILE_Y;
-    constexpr int TOTAL_PAIRS = (TOTAL_ELEMENTS + 1) / 2;
+    constexpr int TOTAL_PAIRS    = (TOTAL_ELEMENTS + 1) >> 1;
+    
+    constexpr bool IS_SDS_SP     = static_cast<uint8_t>(TYPE) & 0x1;
 
-    constexpr bool IS_SDS_SP = static_cast<uint8_t>(TYPE) & 0x1;
+    __half2 buf_ds[2] = { 
+        __float22half2_rn(make_float2(0.0f, 0.0f)), 
+        __float22half2_rn(make_float2(0.0f, 0.0f)) 
+    };
 
-    __half2 buf_ds[2];
-
-    // ====================================================================
-    // PHASE 1: READ + COMPUTE
-    // ====================================================================
     #pragma unroll 1
     for (int i = THREAD_ID; i < TOTAL_PAIRS; i += THREADS_PER_BLOCK) {
-        const int idx0 = i * 2;
+        const int idx0 = i << 1;
         const int idx1 = idx0 + 1;
         const int row0 = idx0 / TILE_Y;
         const int col0 = idx0 % TILE_Y;
         const bool has_pair = (idx1 < TOTAL_ELEMENTS);
-        const int row1 = has_pair ? idx1 / TILE_Y : row0;
-        const int col1 = has_pair ? idx1 % TILE_Y : col0 + 1;
+        const int row1 = has_pair ? (idx1 / TILE_Y) : row0;
+        const int col1 = has_pair ? (idx1 % TILE_Y) : (col0 + 1);
+
         const bool in0 = (row0 < VALID_Q_ROWS) && (col0 < VALID_KV_ROWS);
         const bool in1 = has_pair && (row1 < VALID_Q_ROWS) && (col1 < VALID_KV_ROWS);
-        const int lds_offset0 = row0 * SMEM_LDS_STRIDE + col0;
-        const int lds_offset1 = in1 ? (row1 * SMEM_LDS_STRIDE + col1) : 0;
-        const int ldo_offset0 = row0 * SMEM_LDO_STRIDE + col0;
-        const int ldo_offset1 = in1 ? (row1 * SMEM_LDO_STRIDE + col1) : 0;
 
-        float s0 = in0 ? SMEM_S[lds_offset0] : NEG_INF;
-        float s1 = in1 ? SMEM_S[lds_offset1] : NEG_INF;
-        float dov0 = (s0 != NEG_INF) ? SMEM_DOV[lds_offset0] : 0.0f;
-        float dov1 = (s1 != NEG_INF) ? SMEM_DOV[lds_offset1] : 0.0f;
+        const float lse0 = (row0 < VALID_Q_ROWS) ? SMEM_LSE[row0] : 0.0f;
+        const float lse1 = (row1 < VALID_Q_ROWS) ? SMEM_LSE[row1] : lse0;
+        const float dot0 = (row0 < VALID_Q_ROWS) ? SMEM_DOT[row0] : 0.0f;
+        const float dot1 = (row1 < VALID_Q_ROWS) ? SMEM_DOT[row1] : dot0;
 
-        float lse0 = SMEM_LSE[row0];
-        float lse1 = (in1 && row1 != row0) ? SMEM_LSE[row1] : lse0;
-        float dot0 = SMEM_DOT[row0];
-        float dot1 = (in1 && row1 != row0) ? SMEM_DOT[row1] : dot0;
+        const int lds0 = row0 * SMEM_LDS_STRIDE + col0;
+        const int lds1 = has_pair ? (row1 * SMEM_LDS_STRIDE + col1) : 0;
+
+        float s0 = in0 ? SMEM_S[lds0] : NEG_INF;
+        float s1 = in1 ? SMEM_S[lds1] : NEG_INF;
+        float dov0 = (s0 != NEG_INF) ? SMEM_DOV[lds0] : 0.0f;
+        float dov1 = (s1 != NEG_INF) ? SMEM_DOV[lds1] : 0.0f;
 
         float sh0 = s0 - lse0;
         float sh1 = s1 - lse1;
-        float p0 = (s0 == NEG_INF || sh0 < -80.0f) ? 0.0f : __expf(sh0);
-        float p1 = (s1 == NEG_INF || sh1 < -80.0f) ? 0.0f : __expf(sh1);
+        float p0  = (s0 == NEG_INF || sh0 < -80.0f) ? 0.0f : __expf(sh0);
+        float p1  = (s1 == NEG_INF || sh1 < -80.0f) ? 0.0f : __expf(sh1);
 
         float diff0 = dov0 - dot0;
         float diff1 = dov1 - dot1;
         float ds0 = fmaf(p0, SOFTMAX_SCALE * diff0, 0.0f);
         float ds1 = fmaf(p1, SOFTMAX_SCALE * diff1, 0.0f);
 
-        __half2 h2_p  = __float22half2_rn(make_float2(p0, p1));
-        __half2 h2_ds = __float22half2_rn(make_float2(ds0, ds1));
+        const __half2 h2_p  = __float22half2_rn(make_float2(p0, p1));
+        const __half2 h2_ds = __float22half2_rn(make_float2(ds0, ds1));
+
+        const int ldo0 = row0 * SMEM_LDO_STRIDE + col0;
+        const int ldo1 = has_pair ? (row1 * SMEM_LDO_STRIDE + col1) : 0;
 
         if constexpr (!IS_SDS_SP) {
-            int buf_idx = (i - THREAD_ID) / THREADS_PER_BLOCK;
+            const int buf_idx = (i - THREAD_ID) / THREADS_PER_BLOCK;
             if (buf_idx < 2) {
                 buf_ds[buf_idx] = h2_ds;
             } else {
-                if (in0) SMEM_DS[ldo_offset0] = h2_ds.x;
-                if (in1) SMEM_DS[ldo_offset1] = h2_ds.y;
+                SMEM_DS[ldo0] = h2_ds.x;
+                if (has_pair) SMEM_DS[ldo1] = h2_ds.y;
             }
-        }
-        else {
-            bool vectorize = (col1 < TILE_Y) && (row1 == row0);
-
+        } else {
+            bool vectorize = has_pair && (row1 == row0) && ((ldo0 & 1) == 0);
             if (vectorize) {
-                uintptr_t addr_p  = reinterpret_cast<uintptr_t>(SMEM_P  + ldo_offset0);
-                uintptr_t addr_ds = reinterpret_cast<uintptr_t>(SMEM_DS + ldo_offset0);
+                uintptr_t addr_p  = reinterpret_cast<uintptr_t>(SMEM_P  + ldo0);
+                uintptr_t addr_ds = reinterpret_cast<uintptr_t>(SMEM_DS + ldo0);
                 vectorize = ((addr_p & 0x3) == 0) && ((addr_ds & 0x3) == 0);
             }
 
             if (vectorize) {
-                *reinterpret_cast<__half2*>(SMEM_P  + ldo_offset0) = h2_p;
-                *reinterpret_cast<__half2*>(SMEM_DS + ldo_offset0) = h2_ds;
+                *reinterpret_cast<__half2*>(SMEM_P  + ldo0) = h2_p;
+                *reinterpret_cast<__half2*>(SMEM_DS + ldo0) = h2_ds;
             } else {
-                if (in0) {
-                    SMEM_P[ldo_offset0]  = h2_p.x;
-                    SMEM_DS[ldo_offset0] = h2_ds.x;
-                }
-                if (in1) {
-                    SMEM_P[ldo_offset1]  = h2_p.y;
-                    SMEM_DS[ldo_offset1] = h2_ds.y;
+                SMEM_P [ldo0] = h2_p.x;
+                SMEM_DS[ldo0] = h2_ds.x;
+                if (has_pair) {
+                    SMEM_P [ldo1] = h2_p.y;
+                    SMEM_DS[ldo1] = h2_ds.y;
                 }
             }
         }
     }
 
     // ====================================================================
-    // PHASE 2: WRITE from register buffers to SMEM (dQ path ONLY)
+    // PHASE 2: Flush register buffers to SMEM (dQ path ONLY)
     // ====================================================================
     if constexpr (!IS_SDS_SP) {
-        #pragma unroll 1
-        for (int i = THREAD_ID; i < TOTAL_PAIRS; i += THREADS_PER_BLOCK) {
-            int buf_idx = (i - THREAD_ID) / THREADS_PER_BLOCK;
-            if (buf_idx >= 2) continue;
+        const int max_buf = min(2, (TOTAL_PAIRS + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
+        #pragma unroll 2
+        for (int b = 0; b < max_buf; ++b) {
+            const int i = THREAD_ID + b * THREADS_PER_BLOCK;
+            if (i >= TOTAL_PAIRS) break;
 
-            const int idx0 = i * 2;
+            const int idx0 = i << 1;
             const int idx1 = idx0 + 1;
             const int row0 = idx0 / TILE_Y;
             const int col0 = idx0 % TILE_Y;
             const bool has_pair = (idx1 < TOTAL_ELEMENTS);
-            const int row1 = has_pair ? idx1 / TILE_Y : row0;
-            const int col1 = has_pair ? idx1 % TILE_Y : col0 + 1;
-            const int ldo_offset0 = row0 * SMEM_LDO_STRIDE + col0;
-            const int ldo_offset1 = has_pair ? (row1 * SMEM_LDO_STRIDE + col1) : 0;
+            const int row1 = has_pair ? (idx1 / TILE_Y) : row0;
+            const int col1 = has_pair ? (idx1 % TILE_Y) : (col0 + 1);
 
-            bool vectorize = (col1 < TILE_Y) && (row1 == row0);
+            const int ldo0 = row0 * SMEM_LDO_STRIDE + col0;
+            const int ldo1 = has_pair ? (row1 * SMEM_LDO_STRIDE + col1) : 0;
 
+            bool vectorize = has_pair && (row1 == row0) && ((ldo0 & 1) == 0);
             if (vectorize) {
-                uintptr_t addr_ds = reinterpret_cast<uintptr_t>(SMEM_DS + ldo_offset0);
+                uintptr_t addr_ds = reinterpret_cast<uintptr_t>(SMEM_DS + ldo0);
                 vectorize = ((addr_ds & 0x3) == 0);
             }
 
             if (vectorize) {
-                *reinterpret_cast<__half2*>(SMEM_DS + ldo_offset0) = buf_ds[buf_idx];
+                *reinterpret_cast<__half2*>(SMEM_DS + ldo0) = buf_ds[b];
             } else {
-                SMEM_DS[ldo_offset0] = buf_ds[buf_idx].x;
-                if (has_pair && (row1 < VALID_Q_ROWS) && (col1 < VALID_KV_ROWS)) {
-                    SMEM_DS[ldo_offset1] = buf_ds[buf_idx].y;
-                }
+                SMEM_DS[ldo0] = buf_ds[b].x;
+                if (has_pair) SMEM_DS[ldo1] = buf_ds[b].y;
             }
         }
     }
