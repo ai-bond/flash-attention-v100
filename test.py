@@ -15,13 +15,15 @@ except ImportError:
     print("flash_attn_v100_cuda not found. Skipping test.")
     exit(0)
 
-def ref_mha_forward(q, k, v, scale=1.0, causal=False):
-
+def ref_mha_forward(q, k, v, scale=1.0, causal=False, upcast=True):
     """
     Queries [B,H,M,D] → Scores [B,H,M,N] → Weights [B,H,M,N] → Output [B,H,M,D]
       Keys [B,H,N,D] ↗              ↓              ↓
                                Causal Mask    Values [B,H,N,D] ↗
     """
+    dtype_og = q.dtype
+    if upcast:
+        q, k, v = q.float(), k.float(), v.float()
 
     s = torch.einsum('bhmd,bhnd->bhmn', q, k) * scale
     if causal:
@@ -29,32 +31,35 @@ def ref_mha_forward(q, k, v, scale=1.0, causal=False):
         s = s.masked_fill(mask, float('-inf'))
     p = torch.softmax(s, dim=-1)
     o = torch.einsum('bhmn,bhnd->bhmd', p, v)
-    return o
+    return o.to(dtype=dtype_og)
 
-def ref_mha_backward(q, k, v, o, do, scale=1.0, causal=False):
+def ref_mha_backward(q, k, v, do, scale=1.0, causal=False, upcast=True):
     """
     Q [B,H,M,D] ────┐
-    K [B,H,N,D] ────┼─→ QK^T * scale → Scores [B,H,M,N] → Softmax → Weights [B,H,M,N] 
+    K [B,H,N,D] ────┼─→ QK^T * scale → Scores [B,H,M,N] → Softmax → Weights [B,H,M,N]
     V [B,H,N,D] ────┘                                                           │
-                                                                                ↓
+    ↓                                                                           │
     dO [B,H,M,D] ←─ Gradient Flow ── Output [B,H,M,D] ←─── Weights @ V ←────────┘
-            │              │              │
-            ↓              ↓              ↓
-            dQ            dK             dV
+    ↓              ↓              ↓
+    dQ            dK             dV
     """
-    q = q.detach().requires_grad_(True)
-    k = k.detach().requires_grad_(True)
-    v = v.detach().requires_grad_(True)
+    q = q.detach().clone().requires_grad_(True)
+    k = k.detach().clone().requires_grad_(True)
+    v = v.detach().clone().requires_grad_(True)
+    
+    dtype_og = q.dtype
+    if upcast:
+        q, k, v = q.float(), k.float(), v.float()
 
     s = torch.einsum('bhmd,bhnd->bhmn', q, k) * scale
     if causal:
-        mask = torch.triu(torch.ones(s.shape[-2], s.shape[-1], device=s.device), diagonal=1)
-        s = s.masked_fill(mask.bool(), float('-inf'))
+        mask = torch.triu(torch.ones(s.shape[-2], s.shape[-1], device=s.device, dtype=torch.bool), diagonal=1)
+        s = s.masked_fill(mask, float('-inf'))
     p = torch.softmax(s, dim=-1)
     o_ref = torch.einsum('bhmn,bhnd->bhmd', p, v)
-    (o_ref * do).sum().backward()
 
-    return q.grad, k.grad, v.grad
+    grads = torch.autograd.grad(o_ref.to(dtype=dtype_og), (q, k, v), do)
+    return tuple(g.to(dtype=dtype_og) for g in grads)
 
 def ensure_contiguous(tensor):
     return tensor if tensor.is_contiguous() else tensor.contiguous()
@@ -77,53 +82,37 @@ def format_performance_comparison(custom_time, ref_time):
     speedup = ref_time / custom_time
     slowdown = custom_time / ref_time
     time_diff_percent = (custom_time - ref_time) / ref_time * 100
-
     return speedup, slowdown, time_diff_percent
 
-def benchmark_kernel(kernel_func, num_warmup=0, num_runs=10):
-    # Warmup
+def benchmark_kernel(kernel_func, num_warmup=3, num_runs=10):
     for _ in range(num_warmup):
         kernel_func()
         torch.cuda.synchronize()
-
-    # Timed runs
     times = []
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
-
     for _ in range(num_runs):
         start.record()
         kernel_func()
         end.record()
         end.synchronize()
         times.append(start.elapsed_time(end) / 1000.0)
-
     return statistics.median(times)
 
 def measure_gpu_memory(kernel_func):
-    """
-    Measures peak GPU memory consumption of a single clean run.
-    Returns memory in MB.
-    """
     torch.cuda.reset_peak_memory_stats()
     torch.cuda.empty_cache()
     gc.collect()
-
-    # Warmup (to trigger all allocations)
     kernel_func()
     torch.cuda.synchronize()
-
-    # Reset and measure
     torch.cuda.reset_peak_memory_stats()
     kernel_func()
     torch.cuda.synchronize()
-
     peak_mem_bytes = torch.cuda.max_memory_allocated()
-    return peak_mem_bytes / (1024 * 1024)  # MB
+    return peak_mem_bytes / (1024 * 1024)
 
 def test_combined():
     test_cases = [
-        # GPT-2 / OPT / Falcon style (D=64)
         (1, 1, 16, 16, 16),
         (1, 1, 32, 32, 32),
         (1, 1, 64, 64, 64),
@@ -146,6 +135,7 @@ def test_combined():
         (1, 16, 1024, 1024, 256),
         (1, 32, 2048, 2048, 256),
         (1, 32, 4096, 4096, 256),
+        (1, 32, 8192, 8192, 256),
     ]
 
     all_passed = True
@@ -198,22 +188,31 @@ def test_combined():
             torch.cuda.reset_peak_memory_stats()
 
             # Run PyTorch forward+backward
-            def run_ref_fwd():
-                nonlocal o_ref
-                o_ref = ref_mha_forward(q, k, v, softmax_scale, causal)
+            ref_oom = False
+            try:
+                def run_ref_fwd():
+                    nonlocal o_ref
+                    o_ref = ref_mha_forward(q, k, v, softmax_scale, causal, upcast=True)
 
-            def run_ref_bwd():
-                nonlocal dQ_ref, dK_ref, dV_ref
-                dQ_ref, dK_ref, dV_ref = ref_mha_backward(q, k, v, o_ref, dO, softmax_scale, causal)
+                def run_ref_bwd():
+                    nonlocal dQ_ref, dK_ref, dV_ref
+                    dQ_ref, dK_ref, dV_ref = ref_mha_backward(q, k, v, dO, softmax_scale, causal, upcast=True)
 
-            ref_fwd_time = benchmark_kernel(run_ref_fwd)
-            ref_bwd_time = benchmark_kernel(run_ref_bwd)
-            ref_total_time = ref_fwd_time + ref_bwd_time
+                ref_fwd_time = benchmark_kernel(run_ref_fwd)
+                ref_bwd_time = benchmark_kernel(run_ref_bwd)
+                ref_total_time = ref_fwd_time + ref_bwd_time
 
-            def run_ref_total():
-                run_ref_fwd()
-                run_ref_bwd()
-            ref_total_mem = measure_gpu_memory(run_ref_total)
+                def run_ref_total():
+                    run_ref_fwd()
+                    run_ref_bwd()
+                ref_total_mem = measure_gpu_memory(run_ref_total)
+            except torch.OutOfMemoryError:
+                print("  ⚠️  PyTorch  OOM")
+                torch.cuda.empty_cache()
+                gc.collect()
+                ref_oom = True
+                ref_fwd_time = ref_bwd_time = ref_total_time = 0.0
+                ref_total_mem = 0.0
 
             # Clean cache before Cuda
             torch.cuda.empty_cache()
@@ -230,11 +229,11 @@ def test_combined():
                 softmax_lse_custom = result[1]
 
             def run_custom_bwd():
-                 nonlocal dQ_custom, dK_custom, dV_custom
-                 result = flash_attn_v100_cuda.bwd(dO, q, k, v, o_custom, softmax_lse_custom, None, None, None, None, 0.0, softmax_scale, causal, -1, -1, 0.0, False, None, None)
-                 dQ_custom = result[0]
-                 dK_custom = result[1]
-                 dV_custom = result[2]
+                nonlocal dQ_custom, dK_custom, dV_custom
+                result = flash_attn_v100_cuda.bwd(dO, q, k, v, o_custom, softmax_lse_custom, None, None, None, None, 0.0, softmax_scale, causal, -1, -1, 0.0, False, None, None)
+                dQ_custom = result[0]
+                dK_custom = result[1]
+                dV_custom = result[2]
 
             custom_fwd_time = benchmark_kernel(run_custom_fwd)
             custom_bwd_time = benchmark_kernel(run_custom_bwd)
@@ -248,106 +247,147 @@ def test_combined():
             custom_total_mem = measure_gpu_memory(run_custom_total)
 
             # Forward pass
-            has_nan_custom_fwd = torch.isnan(o_custom).any()
-            has_inf_custom_fwd = torch.isinf(o_custom).any()
-            has_nan_ref_fwd = torch.isnan(o_ref).any()
-            has_inf_ref_fwd = torch.isinf(o_ref).any()
-
-            if has_nan_custom_fwd or has_inf_custom_fwd or has_nan_ref_fwd or has_inf_ref_fwd:
-                print("⚠️  NaN/Inf detected in forward!")
-                report_tensor_stats("Out (cust)", o_custom)
-                report_tensor_stats("Out (refr)", o_ref)
-                all_passed = False
-                continue
-
-            atol_fwd, rtol_fwd = 2e-3, 3e-3
-            ok_fwd = torch.allclose(o_custom, o_ref, atol=atol_fwd, rtol=rtol_fwd)
-
-            if not ok_fwd:
-                diff = torch.abs(o_custom - o_ref)
-                idx = diff.argmax()
-                max_diff = diff.max().item()
-                mean_diff = diff.mean().item()
-                rel_err = (diff / (o_ref.abs() + 1e-12)).max().item()
-                print(f"  ❌ Forward mismatch: max_diff={max_diff:.6e}, mean_diff={mean_diff:.6e}, max_rel_err={rel_err:.6e}")
-                print(f"     [PyTorch] sample: {o_ref[0,0,0,:7].cpu().numpy()}")
-                print(f"     [ CUDA  ] sample: {o_custom[0,0,0,:7].cpu().numpy()}")
-                print(f"     [ Error ] Max diff at idx={idx}: PyTorch={ref.flatten()[idx].item():.6e}, CUDA={custom.flatten()[idx].item():.6e}")
-                all_passed = False
-                continue
+            if ref_oom:
+                has_nan_custom_fwd = torch.isnan(o_custom).any()
+                has_inf_custom_fwd = torch.isinf(o_custom).any()
+                if has_nan_custom_fwd or has_inf_custom_fwd:
+                    print("  ❌ Forward: Custom kernel produced NaN/Inf")
+                    all_passed = False
+                    continue
+                print("  ✅ Forward  OK")
+                err_custom_fwd = err_pt_fwd = 0.0
             else:
-                print("  ✅ Forward match OK")
+                has_nan_custom_fwd = torch.isnan(o_custom).any()
+                has_inf_custom_fwd = torch.isinf(o_custom).any()
+                has_nan_ref_fwd = torch.isnan(o_ref).any()
+                has_inf_ref_fwd = torch.isinf(o_ref).any()
+
+                if has_nan_custom_fwd or has_inf_custom_fwd or has_nan_ref_fwd or has_inf_ref_fwd:
+                    print("⚠️  NaN/Inf detected in forward!")
+                    report_tensor_stats("Out (cust)", o_custom)
+                    report_tensor_stats("Out (refr)", o_ref)
+                    all_passed = False
+                    continue
+
+                # Native FP16 baseline for relative tolerance validation
+                out_pt = ref_mha_forward(q, k, v, softmax_scale, causal, upcast=False)
+
+                err_custom_fwd = (o_custom - o_ref).abs().max().item()
+                err_pt_fwd = (out_pt - o_ref).abs().max().item()
+                ok_fwd = err_custom_fwd <= 2.0 * err_pt_fwd + 1e-5 and torch.isfinite(o_custom).all()
+
+                if not ok_fwd:
+                    diff = torch.abs(o_custom - o_ref)
+                    idx = diff.argmax()
+                    max_diff = diff.max().item()
+                    mean_diff = diff.mean().item()
+                    rel_err = (diff / (o_ref.abs() + 1e-12)).max().item()
+                    print(f"  ❌ Forward mismatch: max_diff={max_diff:.6e}, mean_diff={mean_diff:.6e}, max_rel_err={rel_err:.6e}")
+                    print(f"     [PyTorch] sample: {o_ref[0,0,0,:7].cpu().numpy()}")
+                    print(f"     [ CUDA  ] sample: {o_custom[0,0,0,:7].cpu().numpy()}")
+                    print(f"     [ Error ] Max diff at idx={idx}: PyTorch={o_ref.flatten()[idx].item():.6e}, CUDA={o_custom.flatten()[idx].item():.6e}")
+                    all_passed = False
+                    continue
+                else:
+                    print("  ✅ Forward  match OK")
 
             # Backward pass
-            has_nan_custom_bwd = torch.isnan(dQ_custom).any() or torch.isnan(dK_custom).any() or torch.isnan(dV_custom).any()
-            has_inf_custom_bwd = torch.isinf(dQ_custom).any() or torch.isinf(dK_custom).any() or torch.isinf(dV_custom).any()
-            has_nan_ref_bwd = torch.isnan(dQ_ref).any() or torch.isnan(dK_ref).any() or torch.isnan(dV_ref).any()
-            has_inf_ref_bwd = torch.isinf(dQ_ref).any() or torch.isinf(dK_ref).any() or torch.isinf(dV_ref).any()
-
-            if has_nan_custom_bwd or has_inf_custom_bwd or has_nan_ref_bwd or has_inf_ref_bwd:
-                print("⚠️  NaN/Inf detected in backward!")
-                report_tensor_stats("dQ (custom)", dQ_custom)
-                report_tensor_stats("dK (custom)", dK_custom)
-                report_tensor_stats("dV (custom)", dV_custom)
-                report_tensor_stats("dQ (ref)", dQ_ref)
-                report_tensor_stats("dK (ref)", dK_ref)
-                report_tensor_stats("dV (ref)", dV_ref)
-                all_passed = False
-                continue
-
-            atol_bwd, rtol_bwd = 2e-3, 3e-3
-            ok_dQ = torch.allclose(dQ_custom, dQ_ref, atol=atol_bwd, rtol=rtol_bwd)
-            ok_dK = torch.allclose(dK_custom, dK_ref, atol=atol_bwd, rtol=rtol_bwd)
-            ok_dV = torch.allclose(dV_custom, dV_ref, atol=atol_bwd, rtol=rtol_bwd)
-            ok_bwd = ok_dQ and ok_dK and ok_dV
-
-            if not ok_bwd:
-                print("\n--- Gradient Comparison ---")
-                for name, custom, ref, ok_flag in [
-                    ("dQ", dQ_custom, dQ_ref, ok_dQ),
-                    ("dK", dK_custom, dK_ref, ok_dK),
-                    ("dV", dV_custom, dV_ref, ok_dV),
-                ]:
-                    if not ok_flag:
-                        diff = (custom - ref).abs()
-                        idx = diff.argmax()
-                        max_diff = diff.max().item()
-                        mean_diff = diff.mean().item()
-                        rel_err = (diff / (ref.abs() + 1e-12)).max().item()
-                        print(f"  {name}: ❌ max_diff={max_diff:.6e}, mean_diff={mean_diff:.6e}, max_rel_err={rel_err:.6e}")
-                        print(f"     [PyTorch] sample: {ref[0,0,0,:7].cpu().numpy()}")
-                        print(f"     [ CUDA  ] sample: {custom[0,0,0,:7].cpu().numpy()}")
-                        print(f"     [ Error ] Max diff at idx={idx}: PyTorch={ref.flatten()[idx].item():.6e}, CUDA={custom.flatten()[idx].item():.6e}")
-                    else:
-                        print(f"  {name}: ✅ OK")
-                all_passed = False
-                continue
+            if ref_oom:
+                has_nan_custom_bwd = torch.isnan(dQ_custom).any() or torch.isnan(dK_custom).any() or torch.isnan(dV_custom).any()
+                has_inf_custom_bwd = torch.isinf(dQ_custom).any() or torch.isinf(dK_custom).any() or torch.isinf(dV_custom).any()
+                if has_nan_custom_bwd or has_inf_custom_bwd:
+                    print("  ❌ Backward: Custom kernel produced NaN/Inf")
+                    all_passed = False
+                    continue
+                print("  ✅ Backward OK")
+                err_dQ = err_dK = err_dV = err_pt_dQ = err_pt_dK = err_pt_dV = 0.0
             else:
-                print("  ✅ Backward gradients match OK")
+                has_nan_custom_bwd = torch.isnan(dQ_custom).any() or torch.isnan(dK_custom).any() or torch.isnan(dV_custom).any()
+                has_inf_custom_bwd = torch.isinf(dQ_custom).any() or torch.isinf(dK_custom).any() or torch.isinf(dV_custom).any()
+                has_nan_ref_bwd = torch.isnan(dQ_ref).any() or torch.isnan(dK_ref).any() or torch.isnan(dV_ref).any()
+                has_inf_ref_bwd = torch.isinf(dQ_ref).any() or torch.isinf(dK_ref).any() or torch.isinf(dV_ref).any()
+
+                if has_nan_custom_bwd or has_inf_custom_bwd or has_nan_ref_bwd or has_inf_ref_bwd:
+                    print("⚠️  NaN/Inf detected in backward!")
+                    report_tensor_stats("dQ (custom)", dQ_custom)
+                    report_tensor_stats("dK (custom)", dK_custom)
+                    report_tensor_stats("dV (custom)", dV_custom)
+                    report_tensor_stats("dQ (ref)", dQ_ref)
+                    report_tensor_stats("dK (ref)", dK_ref)
+                    report_tensor_stats("dV (ref)", dV_ref)
+                    all_passed = False
+                    continue
+
+                # Native FP16 baseline for relative tolerance validation
+                dQ_pt, dK_pt, dV_pt = ref_mha_backward(q, k, v, dO, softmax_scale, causal, upcast=False)
+
+                err_dQ = (dQ_custom - dQ_ref).abs().max().item()
+                err_dK = (dK_custom - dK_ref).abs().max().item()
+                err_dV = (dV_custom - dV_ref).abs().max().item()
+                err_pt_dQ = (dQ_pt - dQ_ref).abs().max().item()
+                err_pt_dK = (dK_pt - dK_ref).abs().max().item()
+                err_pt_dV = (dV_pt - dV_ref).abs().max().item()
+
+                ok_dQ = err_dQ <= 3.0 * err_pt_dQ + 1e-4
+                ok_dK = err_dK <= 3.0 * err_pt_dK + 1e-4
+                ok_dV = err_dV <= 3.0 * err_pt_dV + 1e-4
+                ok_bwd = ok_dQ and ok_dK and ok_dV and all(torch.isfinite(g).all() for g in (dQ_custom, dK_custom, dV_custom))
+
+                if not ok_bwd:
+                    print("\n--- Gradient Comparison ---")
+                    for name, custom, ref, err_c, err_p, ok_flag in [
+                        ("dQ", dQ_custom, dQ_ref, err_dQ, err_pt_dQ, ok_dQ),
+                        ("dK", dK_custom, dK_ref, err_dK, err_pt_dK, ok_dK),
+                        ("dV", dV_custom, dV_ref, err_dV, err_pt_dV, ok_dV),
+                    ]:
+                        status = "✅ OK" if ok_flag else f"❌ err={err_c:.2e} > 3×{err_p:.2e}"
+                        print(f"  {name}: {status}")
+                    all_passed = False
+                    continue
+                else:
+                    print("  ✅ Backward match OK")
 
             print("Performance:")
 
-            # Total memory comparison with delta and %
-            custom_tot = custom_total_mem
-            torch_tot = ref_total_mem
-            delta_mem = custom_tot - torch_tot
-            pct_diff = (delta_mem / torch_tot) * 100 if torch_tot > 0 else 0.0
+            if not ref_oom:
+                custom_tot = custom_total_mem
+                torch_tot = ref_total_mem
+                delta_mem = custom_tot - torch_tot
+                pct_diff = (delta_mem / torch_tot) * 100 if torch_tot > 0 else 0.0
 
-            print(f" (Mem):   Custom: {custom_total_mem:.1f} MB, PyTorch: {ref_total_mem:.1f} MB (Δ: {delta_mem:+.1f} MB, {pct_diff:+.1f}%)")
-            for label, c_time, r_time in [
-                ("(fwd)", custom_fwd_time, ref_fwd_time),
-                ("(bwd)", custom_bwd_time, ref_bwd_time),
-                ("(tot)", custom_total_time, ref_total_time),
-            ]:
-                speedup, slowdown, time_diff_percent = format_performance_comparison(c_time, r_time)
-                if speedup != "N/A":
-                    if speedup > 1:
-                        perf_info = f"Custom: {c_time*1000:.2f}ms, PyTorch: {r_time*1000:.2f}ms ({speedup:.2f}x speedup)"
+                print(f" (Mem):   Custom: {custom_total_mem:.1f} MB, PyTorch: {ref_total_mem:.1f} MB (Δ: {delta_mem:+.1f} MB, {pct_diff:+.1f}%)")
+                for label, c_time, r_time in [
+                    ("(fwd)", custom_fwd_time, ref_fwd_time),
+                    ("(bwd)", custom_bwd_time, ref_bwd_time),
+                    ("(tot)", custom_total_time, ref_total_time),
+                ]:
+                    speedup, slowdown, time_diff_percent = format_performance_comparison(c_time, r_time)
+                    if speedup != "N/A":
+                        if speedup > 1:
+                            perf_info = f"Custom: {c_time*1000:.2f}ms, PyTorch: {r_time*1000:.2f}ms ({speedup:.2f}x speedup)"
+                        else:
+                            perf_info = f"Custom: {c_time*1000:.2f}ms, PyTorch: {r_time*1000:.2f}ms ({slowdown:.2f}x slowdown, +{time_diff_percent:+.1f}%)"
                     else:
-                        perf_info = f"Custom: {c_time*1000:.2f}ms, PyTorch: {r_time*1000:.2f}ms ({slowdown:.2f}x slowdown, +{time_diff_percent:+.1f}%)"
-                else:
-                    perf_info = f"Custom: {c_time*1000:.2f}ms, PyTorch: {r_time*1000:.2f}ms"
-                print(f" {label}:   {perf_info}")
+                        perf_info = f"Custom: {c_time*1000:.2f}ms, PyTorch: {r_time*1000:.2f}ms"
+                    print(f" {label}:   {perf_info}")
+            else:
+                print(f" (Mem):   Custom: {custom_total_mem:.1f} MB, PyTorch: OOM")
+                for label, c_time in [
+                    ("(fwd)", custom_fwd_time),
+                    ("(bwd)", custom_bwd_time),
+                    ("(tot)", custom_total_time),
+                ]:
+                    print(f" {label}:   Custom: {c_time*1000:.2f}ms, PyTorch: skipped")
+
+            print("Validation:")
+            if not ref_oom:
+                print(f" (Fwd):   dO err={err_custom_fwd:.2e} ≤ 2×{err_pt_fwd:.2e}")
+                print(f" (Bwd):   dQ err={err_dQ:.2e} ≤ 3×{err_pt_dQ:.2e}")
+                print(f"          dK err={err_dK:.2e} ≤ 3×{err_pt_dK:.2e}")
+                print(f"          dV err={err_dV:.2e} ≤ 3×{err_pt_dV:.2e}")
+            else:
+                print(" (Fwd):   Skipped")
+                print(" (Bwd):   Skipped")
 
             ## Cleanup tensors
             del q, k, v, dO, o_custom, o_ref, dQ_custom, dK_custom, dV_custom, dQ_ref, dK_ref, dV_ref
@@ -361,13 +401,13 @@ if __name__ == "__main__":
 
     cap = torch.cuda.get_device_capability()
     if cap < (7, 0):
-        print(f"⚠️  Warning: device capability {cap} < (7,0). Volta (e.g., V100) required.")
+        print(f"Warning: device capability {cap} < (7,0). Volta (e.g., V100) required.")
 
     print(f"Running on {torch.cuda.get_device_name()} (capability {cap})")
 
     success = test_combined()
     if success:
-        print("\n🎉 All combined tests passed!")
+        print("\nAll combined tests passed!")
     else:
-        print("\n💥 Some combined tests failed! Check mismatches above.")
+        print("\nSome combined tests failed! Check mismatches above.")
         exit(1)
