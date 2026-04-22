@@ -76,7 +76,7 @@ struct KernelConfig {
                     alignas(16) __half dS [ DQ::BLOCK_M * DQ::N_STRIDE ];
                 } reuse_sdOVS;
                     alignas(16) float  dQ [ DQ::BLOCK_M * DQ::D_STRIDE ];
-            } dq;
+            } bdq;
 
             struct DKV_Phase {
                     alignas(16) __half k [ DKV::BLOCK_M * DKV::D_STRIDE ];
@@ -95,7 +95,7 @@ struct KernelConfig {
                 } reuse_dOVS;
                     alignas(16) float dK[ DKV::BLOCK_M * DKV::D_STRIDE ];
                     alignas(16) float dV[ DKV::BLOCK_M * DKV::D_STRIDE ];
-                } dkv;
+            } bdkv;
         } phase;
                     alignas(16) float lse     [ (DQ::BLOCK_M > DKV::BLOCK_N) ? DQ::BLOCK_M : DKV::BLOCK_N ];
                     alignas(16) float row_dot [ (DQ::BLOCK_M > DKV::BLOCK_N) ? DQ::BLOCK_M : DKV::BLOCK_N ];

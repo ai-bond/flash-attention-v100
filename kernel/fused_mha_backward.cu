@@ -107,16 +107,16 @@ flash_attention_backward_kernel(
 
         auto& smem = *reinterpret_cast<typename Config::SmemLayout*>(smem_raw);
 
-        __half* __restrict__ sK            = smem.phase.dq.reuse_kv.k;
-        __half* __restrict__ sV            = smem.phase.dq.reuse_kv.v;
-        __half* __restrict__ sdO           = smem.phase.dq.dO;
-        __half* __restrict__ sQ            = smem.phase.dq.q;
-         float* __restrict__ sS            = smem.phase.dq.s;
-         float* __restrict__ sdOV          = smem.phase.dq.reuse_sdOVS.dOV;
-        __half* __restrict__ sdS           = smem.phase.dq.reuse_sdOVS.dS;
+        __half* __restrict__ sQ            = smem.phase.bdq.q;
+        __half* __restrict__ sK            = smem.phase.bdq.reuse_kv.k;
+        __half* __restrict__ sV            = smem.phase.bdq.reuse_kv.v;
+         float* __restrict__ sS            = smem.phase.bdq.s;
+        __half* __restrict__ sdO           = smem.phase.bdq.dO;
+         float* __restrict__ sdOV          = smem.phase.bdq.reuse_sdOVS.dOV;
+        __half* __restrict__ sdS           = smem.phase.bdq.reuse_sdOVS.dS;
          float* __restrict__ sRowDot       = smem.row_dot;
          float* __restrict__ sLse          = smem.lse;
-         float* __restrict__ sdQ           = smem.phase.dq.dQ;
+         float* __restrict__ sdQ           = smem.phase.bdq.dQ;
 
         // ==================================================================================
         // Load:     Q(dO)  tile from global to sQ(sdO) shared memory
@@ -306,18 +306,18 @@ flash_attention_backward_kernel(
 
         auto& smem = *reinterpret_cast<typename Config::SmemLayout*>(smem_raw);
 
-        __half* __restrict__ sK            = smem.phase.dkv.k;
-        __half* __restrict__ sV            = smem.phase.dkv.v;
-        __half* __restrict__ sdO           = smem.phase.dkv.reuse_qdO.dO;
-        __half* __restrict__ sQ            = smem.phase.dkv.reuse_qdO.q;
-         float* __restrict__ sS            = smem.phase.dkv.reuse_sp.s;
-        __half* __restrict__ sP            = smem.phase.dkv.reuse_sp.p;
-         float* __restrict__ sdOV          = smem.phase.dkv.reuse_dOVS.dOV;
-        __half* __restrict__ sdS           = smem.phase.dkv.reuse_dOVS.dS;
+        __half* __restrict__ sQ            = smem.phase.bdkv.reuse_qdO.q;
+        __half* __restrict__ sK            = smem.phase.bdkv.k;
+        __half* __restrict__ sV            = smem.phase.bdkv.v;
+         float* __restrict__ sS            = smem.phase.bdkv.reuse_sp.s;
+        __half* __restrict__ sdO           = smem.phase.bdkv.reuse_qdO.dO;
+         float* __restrict__ sdOV          = smem.phase.bdkv.reuse_dOVS.dOV;
+        __half* __restrict__ sdS           = smem.phase.bdkv.reuse_dOVS.dS;
+        __half* __restrict__ sP            = smem.phase.bdkv.reuse_sp.p;
          float* __restrict__ sRowDot       = smem.row_dot;
          float* __restrict__ sLse          = smem.lse;
-         float* __restrict__ sdK           = smem.phase.dkv.dK;
-         float* __restrict__ sdV           = smem.phase.dkv.dV;
+         float* __restrict__ sdK           = smem.phase.bdkv.dK;
+         float* __restrict__ sdV           = smem.phase.bdkv.dV;
 
         // ==================================================================================
         // Load:     K(V)  tile from global to sK(sV) shared memory

@@ -32,13 +32,13 @@ flash_attention_forward_kernel(
     const float softmax_scale
 ) {
     using Config = KernelConfig<D>;
-    constexpr int BLOCK_M           = Config::BLOCK_M;
-    constexpr int BLOCK_N           = Config::BLOCK_N;
+    constexpr int BLOCK_M           = Config::DO::BLOCK_M;
+    constexpr int BLOCK_N           = Config::DO::BLOCK_N;
     constexpr int THREADS_PER_BLOCK = Config::THREADS_PER_BLOCK;
-    constexpr int THREADS_PER_ROW   = Config::THREADS_PER_ROW;
-    constexpr int WARPS_PER_BLOCK   = Config::WARPS_PER_BLOCK;
-    constexpr int D_STRIDE          = Config::D_STRIDE;
-    constexpr int N_STRIDE          = Config::N_STRIDE;
+    constexpr int THREADS_PER_ROW   = Config::DO::THREADS_PER_ROW;
+    constexpr int WARPS_PER_BLOCK   = Config::DO::WARPS_PER_BLOCK;
+    constexpr int D_STRIDE          = Config::DO::D_STRIDE;
+    constexpr int N_STRIDE          = Config::DO::N_STRIDE;
 
     // head index (batch * num_heads + head)
     const int batch_head_id = blockIdx.z;
@@ -92,14 +92,14 @@ flash_attention_forward_kernel(
 
     auto& smem = *reinterpret_cast<typename Config::SmemLayout*>(smem_raw);
 
-    __half* __restrict__ sQ      = smem.q;
-    __half* __restrict__ sK      = smem.reuse_kv.k;
-    __half* __restrict__ sV      = smem.reuse_kv.v;
-    float*  __restrict__ sS      = smem.reuse_sp.s;
-    __half* __restrict__ sP      = smem.reuse_sp.p;
-    float*  __restrict__ sO      = smem.o;
+    __half* __restrict__ sQ      = smem.phase.fdo.q;
+    __half* __restrict__ sK      = smem.phase.fdo.reuse_kv.k;
+    __half* __restrict__ sV      = smem.phase.fdo.reuse_kv.v;
+    float*  __restrict__ sS      = smem.phase.fdo.reuse_sp.s;
+    __half* __restrict__ sP      = smem.phase.fdo.reuse_sp.p;
     float*  __restrict__ sRowMax = smem.row_max;
     float*  __restrict__ sRowSum = smem.row_sum;
+    float*  __restrict__ sO      = smem.phase.fdo.o;
 
     if (tid < BLOCK_M) {
         sRowMax[tid] = NEG_INF;
@@ -235,7 +235,7 @@ void launcher_flash_attention_forward(
     const int M = Q.size(2);
     const int N = K.size(2);
 
-    const int grid_x = (M + Config::BLOCK_M - 1) / Config::BLOCK_M;
+    const int grid_x = (M + Config::DO::BLOCK_M - 1) / Config::DO::BLOCK_M;
     const dim3 grid(grid_x, 1, B * H);
     const dim3 block(Config::THREADS_PER_BLOCK);
     const size_t smem = Config::TOTAL_SMEM;
