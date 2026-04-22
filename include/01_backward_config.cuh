@@ -43,8 +43,7 @@ struct KernelConfig {
     struct DQ {
         static constexpr int BLOCK_M            = (D == 16) ? BLOCK_M_DQ_16 : (D == 32) ? BLOCK_M_DQ_32 : (D == 64) ? BLOCK_M_DQ_64 : (D == 128) ? BLOCK_M_DQ_128 : BLOCK_M_DQ_256;
         static constexpr int BLOCK_N            = (D == 16) ? BLOCK_N_DQ_16 : (D == 32) ? BLOCK_N_DQ_32 : (D == 64) ? BLOCK_N_DQ_64 : (D == 128) ? BLOCK_N_DQ_128 : BLOCK_N_DQ_256;
-        static constexpr int WARPS_PER_BLOCK    = WARPS;
-        static constexpr int THREADS_PER_ROW    = (WARPS_PER_BLOCK * MAX_THREADS_PER_WARP) / BLOCK_M;
+        static constexpr int THREADS_PER_ROW    = (WARPS * MAX_THREADS_PER_WARP) / BLOCK_M;
         static constexpr int PAD                = (8 - (D % 32) + 32) % 32;
         static constexpr int D_STRIDE           = D + PAD + (((D + PAD) % 64 == 0) ? 1 : 0);
         static constexpr int N_STRIDE           = BLOCK_N + PAD + (((BLOCK_N + PAD) % 32 == 0) ? 1 : 0);
@@ -52,14 +51,14 @@ struct KernelConfig {
     struct DKV {
         static constexpr int BLOCK_M            = (D == 16) ? BLOCK_M_DKV_16 : (D == 32) ? BLOCK_M_DKV_32 : (D == 64) ? BLOCK_M_DKV_64 : (D == 128) ? BLOCK_M_DKV_128 : BLOCK_M_DKV_256;
         static constexpr int BLOCK_N            = (D == 16) ? BLOCK_N_DKV_16 : (D == 32) ? BLOCK_N_DKV_32 : (D == 64) ? BLOCK_N_DKV_64 : (D == 128) ? BLOCK_N_DKV_128 : BLOCK_N_DKV_256;
-        static constexpr int WARPS_PER_BLOCK    = WARPS;
-        static constexpr int THREADS_PER_ROW    = (WARPS_PER_BLOCK * MAX_THREADS_PER_WARP) / BLOCK_N;
+        static constexpr int THREADS_PER_ROW    = (WARPS * MAX_THREADS_PER_WARP) / BLOCK_N;
         static constexpr int PAD                = 8;
         static constexpr int D_STRIDE           = D + PAD + (((D + PAD) % 64 == 0) ? 1 : 0);
         static constexpr int M_STRIDE           = BLOCK_M + PAD + (((BLOCK_M + PAD) % 32 == 0) ? 1 : 0);
     };
 
-    static constexpr int THREADS_PER_BLOCK  = WARPS * MAX_THREADS_PER_WARP;
+    static constexpr int WARPS_PER_BLOCK        = WARPS;
+    static constexpr int THREADS_PER_BLOCK      = WARPS * MAX_THREADS_PER_WARP;
 
     struct alignas(128) SmemLayout {
         union PhaseMem {

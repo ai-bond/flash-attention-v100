@@ -46,13 +46,10 @@ flash_attention_backward_kernel(
 
         using Config = KernelConfig<D>;
 
-        constexpr int BLOCK_M            = Config::DQ::BLOCK_M;
-        constexpr int BLOCK_N            = Config::DQ::BLOCK_N;
-        constexpr int THREADS_PER_BLOCK  = Config::THREADS_PER_BLOCK;
-        constexpr int THREADS_PER_ROW    = Config::DQ::THREADS_PER_ROW;
-        constexpr int WARPS_PER_BLOCK    = Config::DQ::WARPS_PER_BLOCK;
-        constexpr int D_STRIDE           = Config::DQ::D_STRIDE;
-        constexpr int N_STRIDE           = Config::DQ::N_STRIDE;
+        constexpr int BLOCK_M   = Config::DQ::BLOCK_M;
+        constexpr int BLOCK_N   = Config::DQ::BLOCK_N;
+        constexpr int D_STRIDE  = Config::DQ::D_STRIDE;
+        constexpr int N_STRIDE  = Config::DQ::N_STRIDE;
 
         // head index (batch * num_heads + head)
         const int batch_head_id = blockIdx.z;
@@ -124,23 +121,21 @@ flash_attention_backward_kernel(
         // Layout:   Q[dO]: global[row: BLOCK_M, D] -> shared[row: BLOCK_M, D_STRIDE]
         // Template: DUAL_LOAD=true, SRC_STRIDE=D, DST_STRIDE=D_STRIDE
         // ==================================================================================
-        WMMA_GEMM_LOAD_TILE<true, D, D_STRIDE>(
+        WMMA_GEMM_LOAD_TILE<Config, true, D, D_STRIDE>(
         q_ptr,   sQ,
         dO_ptr,  sdO,
-        valid_q_rows, tid,
-        THREADS_PER_BLOCK);
+        valid_q_rows, tid);
 
         __syncthreads();
 
         // ==================================================================================
         // Compute:  row_dot = sum(O ⊙ dO) [dQ backward pass]
         // Layout:   O[global: total_q, D], dO[shared: valid_q_rows, D_STRIDE] -> sRowDot[shared: valid_q_rows]
-        // Template: TYPE=rowdot_dQ (LSE_OFFSET=0), GLOBAL_STRIDE=D, SMEM_STRIDE=D_STRIDE, FULL_ROWS=BLOCK_Y
+        // Template: TYPE=rowdot_dQ (LSE_OFFSET=0), GLOBAL_STRIDE=D, SMEM_STRIDE=D_STRIDE
         // ==================================================================================
-        WMMA_GEMM_DOT_PRODUCT<GemmType::rowdot_dQ, D, D_STRIDE, BLOCK_M>(
+        WMMA_GEMM_DOT_PRODUCT<Config, GemmType::rowdot_dQ, D, D_STRIDE>(
         o_ptr,   sdO, lse_ptr, sLse,
-        sRowDot, valid_q_rows, 0, tid,
-        THREADS_PER_ROW, THREADS_PER_BLOCK);
+        sRowDot, valid_q_rows, 0, tid);
 
         __syncthreads();
 
@@ -160,11 +155,10 @@ flash_attention_backward_kernel(
             // Layout:   V: global[row: BLOCK_N, D] -> shared[row: BLOCK_N, D_STRIDE]
             // Template: DUAL_LOAD=false, SRC_STRIDE=D, DST_STRIDE=D_STRIDE
             // ==================================================================================
-            WMMA_GEMM_LOAD_TILE<false, D, D_STRIDE>(
+            WMMA_GEMM_LOAD_TILE<Config, false, D, D_STRIDE>(
             v_ptr + start_kv * D, sV,
             nullptr, nullptr,
-            valid_kv_rows, tid,
-            THREADS_PER_BLOCK);
+            valid_kv_rows, tid);
 
             __syncthreads();
 
@@ -173,7 +167,7 @@ flash_attention_backward_kernel(
             // Layout:   dO[row: BLOCK_M, D], V[col: BLOCK_N, D] -> dOV[row: BLOCK_M, col: BLOCK_N]
             // Template: BLOCK_X=BLOCK_M, BLOCK_Y=BLOCK_N
             // ==================================================================================
-            WMMA_GEMM_SCORES<GemmType::dOV_dOVT, D, IS_CAUSAL, BLOCK_M, BLOCK_N, D_STRIDE, N_STRIDE, WARPS_PER_BLOCK>(
+            WMMA_GEMM_SCORES<Config, GemmType::dOV_dOVT, D, IS_CAUSAL, BLOCK_M, BLOCK_N, D_STRIDE, N_STRIDE>(
             sdO, sV, sdOV,
             valid_q_rows, valid_kv_rows,
             0, 0, 1.0f,
@@ -186,11 +180,10 @@ flash_attention_backward_kernel(
             // Layout:   K: global[row: BLOCK_N, D] -> shared[row: BLOCK_N, D_STRIDE]
             // Template: DUAL_LOAD=false, SRC_STRIDE=D, DST_STRIDE=D_STRIDE
             // ==================================================================================
-            WMMA_GEMM_LOAD_TILE<false, D, D_STRIDE>(
-            k_ptr + start_kv * D,   sK,
+            WMMA_GEMM_LOAD_TILE<Config, false, D, D_STRIDE>(
+            k_ptr + start_kv * D, sK,
             nullptr, nullptr,
-            valid_kv_rows, tid,
-            THREADS_PER_BLOCK);
+            valid_kv_rows, tid);
 
             __syncthreads();
 
@@ -199,7 +192,7 @@ flash_attention_backward_kernel(
             // Layout:   Q[row: BLOCK_M, D], K[col: BLOCK_N, D] -> S[row: BLOCK_M, col: BLOCK_N]
             // Template: BLOCK_X=BLOCK_M, BLOCK_Y=BLOCK_N
             // ==================================================================================
-            WMMA_GEMM_SCORES<GemmType::sQ_KT, D, IS_CAUSAL, BLOCK_M, BLOCK_N, D_STRIDE, N_STRIDE, WARPS_PER_BLOCK>(
+            WMMA_GEMM_SCORES<Config, GemmType::sQ_KT, D, IS_CAUSAL, BLOCK_M, BLOCK_N, D_STRIDE, N_STRIDE>(
             sQ, sK, sS,
             valid_q_rows, valid_kv_rows,
             start_q,      start_kv,
@@ -214,13 +207,12 @@ flash_attention_backward_kernel(
             //           LSE[row: BLOCK_M], row_dot[row: BLOCK_M] -> dS[row: BLOCK_M, BLOCK_N]
             // Template: LDS_STRIDE=N_STRIDE, LDO_STRIDE=N_STRIDE, TILE_X=BLOCK_M, TILE_Y=BLOCK_N
             // ==================================================================================
-            WMMA_GEMM_POST_SOFTMAX_GRADIENT<GemmType::compute_dS, N_STRIDE, N_STRIDE, BLOCK_M, BLOCK_N>(
+            WMMA_GEMM_SOFTMAX_GRADIENT<Config, GemmType::compute_dS, N_STRIDE, N_STRIDE, BLOCK_M, BLOCK_N>(
             sS, sdOV, sLse, sRowDot,
             nullptr, sdS,
             valid_q_rows, valid_kv_rows,
             softmax_scale,
-            tid,
-            THREADS_PER_ROW, THREADS_PER_BLOCK);
+            tid);
 
             __syncthreads();
 
@@ -229,7 +221,7 @@ flash_attention_backward_kernel(
             // Layout:   dS[row: BLOCK_M, BLOCK_N], K[row: BLOCK_N, D] -> dQ[row: BLOCK_M, D]
             // Template: BLOCK_X=BLOCK_M, BLOCK_Y=BLOCK_N
             // ==================================================================================
-            WMMA_GEMM_GRADIENTS<GemmType::dQ_dSK, D, BLOCK_M, BLOCK_N, N_STRIDE, D_STRIDE, WARPS_PER_BLOCK>(
+            WMMA_GEMM_GRADIENTS<Config, GemmType::dQ_dSK, D, BLOCK_M, BLOCK_N, N_STRIDE, D_STRIDE>(
             sdS, sK, sdQ,
             valid_q_rows, valid_kv_rows,
             warp_id,      lane_id);
@@ -243,12 +235,11 @@ flash_attention_backward_kernel(
         // Layout:   sdQ[valid_q_rows, D_STRIDE] -> dQ_ptr[valid_q_rows, D]
         // Template: D, D_STRIDE Head dimension and stride
         // ==================================================================================
-        WMMA_GEMM_EPILOGUE<GemmType::write_dQ, D, D_STRIDE>(
+        WMMA_GEMM_EPILOGUE<Config, GemmType::write_dQ, D, D_STRIDE>(
         sdQ,     dQ_ptr,
         nullptr, nullptr,
         nullptr,
-        valid_q_rows, tid,
-        THREADS_PER_BLOCK);
+        valid_q_rows, tid);
     }
     // ===================================================================================
     // PHASE 2: dKV
@@ -258,13 +249,10 @@ flash_attention_backward_kernel(
 
         using Config = KernelConfig<D>;
 
-        constexpr int BLOCK_M            = Config::DKV::BLOCK_M;
-        constexpr int BLOCK_N            = Config::DKV::BLOCK_N;
-        constexpr int THREADS_PER_BLOCK  = Config::THREADS_PER_BLOCK;
-        constexpr int THREADS_PER_ROW    = Config::DKV::THREADS_PER_ROW;
-        constexpr int WARPS_PER_BLOCK    = Config::DKV::WARPS_PER_BLOCK;
-        constexpr int D_STRIDE           = Config::DKV::D_STRIDE;
-        constexpr int M_STRIDE           = Config::DKV::M_STRIDE;
+        constexpr int BLOCK_M   = Config::DKV::BLOCK_M;
+        constexpr int BLOCK_N   = Config::DKV::BLOCK_N;
+        constexpr int D_STRIDE  = Config::DKV::D_STRIDE;
+        constexpr int M_STRIDE  = Config::DKV::M_STRIDE;
 
         // head index (batch * num_heads + head)
         const int batch_head_id = blockIdx.z;
@@ -325,11 +313,10 @@ flash_attention_backward_kernel(
         // Layout:   K[V]: global[row: BLOCK_M, D] -> shared[row: BLOCK_M, D_STRIDE]
         // Template: DUAL_LOAD=true, SRC_STRIDE=D, DST_STRIDE=D_STRIDE
         // ==================================================================================
-        WMMA_GEMM_LOAD_TILE<true, D, D_STRIDE>(
+        WMMA_GEMM_LOAD_TILE<Config, true, D, D_STRIDE>(
         k_ptr,   sK,
         v_ptr,   sV,
-        valid_kv_rows, tid,
-        THREADS_PER_BLOCK);
+        valid_kv_rows, tid);
 
         __syncthreads();
 
@@ -349,11 +336,10 @@ flash_attention_backward_kernel(
             // Layout:   Q: global[row: BLOCK_N, D] -> shared[row: BLOCK_N, D_STRIDE]
             // Template: DUAL_LOAD=false, SRC_STRIDE=D, DST_STRIDE=D_STRIDE
             // ==================================================================================
-            WMMA_GEMM_LOAD_TILE<false, D, D_STRIDE>(
+            WMMA_GEMM_LOAD_TILE<Config, false, D, D_STRIDE>(
             q_ptr + start_q * D, sQ,
             nullptr, nullptr,
-            valid_q_rows, tid,
-            THREADS_PER_BLOCK);
+            valid_q_rows, tid);
 
             __syncthreads();
 
@@ -362,7 +348,7 @@ flash_attention_backward_kernel(
             // Layout:   Q[row: BLOCK_N, D], K[col: BLOCK_M, D] -> S[row: BLOCK_N, col: BLOCK_M]
             // Template: BLOCK_X=BLOCK_N, BLOCK_Y=BLOCK_M
             // ==================================================================================
-            WMMA_GEMM_SCORES<GemmType::sQ_KT, D, IS_CAUSAL, BLOCK_N, BLOCK_M, D_STRIDE, M_STRIDE, WARPS_PER_BLOCK>(
+            WMMA_GEMM_SCORES<Config, GemmType::sQ_KT, D, IS_CAUSAL, BLOCK_N, BLOCK_M, D_STRIDE, M_STRIDE>(
             sQ, sK, sS,
             valid_q_rows, valid_kv_rows,
             start_q,      start_kv,
@@ -376,11 +362,10 @@ flash_attention_backward_kernel(
             // Layout:   dO global[row: BLOCK_N, D] -> shared[row: BLOCK_N, D_STRIDE]
             // Template: DUAL_LOAD=false, SRC_STRIDE=D, DST_STRIDE=D_STRIDE
             // ==================================================================================
-            WMMA_GEMM_LOAD_TILE<false, D, D_STRIDE>(
+            WMMA_GEMM_LOAD_TILE<Config, false, D, D_STRIDE>(
             dO_ptr + start_q * D, sdO,
             nullptr, nullptr,
-            valid_q_rows, tid,
-            THREADS_PER_BLOCK);
+            valid_q_rows, tid);
 
             __syncthreads();
 
@@ -390,11 +375,10 @@ flash_attention_backward_kernel(
             // Template: TYPE=rowdot_dKV (LSE_OFFSET=1), GLOBAL_STRIDE=D, SMEM_STRIDE=D_STRIDE, FULL_ROWS=BLOCK_Y
             // Note:     o_ptr must be pre-offset by caller (o_ptr + start_q*D), lse_ptr loaded with offset
             // ==================================================================================
-            WMMA_GEMM_DOT_PRODUCT<GemmType::rowdot_dKV, D, D_STRIDE, BLOCK_N>(
+            WMMA_GEMM_DOT_PRODUCT<Config, GemmType::rowdot_dKV, D, D_STRIDE>(
             o_ptr + start_q * D, sdO,
             lse_ptr, sLse, sRowDot,
-            valid_q_rows, start_q, tid,
-            THREADS_PER_ROW, THREADS_PER_BLOCK);
+            valid_q_rows, start_q, tid);
 
             __syncthreads();
 
@@ -403,7 +387,7 @@ flash_attention_backward_kernel(
             // Layout:   dO[row: BLOCK_N, D], V[col: BLOCK_M, D] -> dOV[row: BLOCK_N, col: BLOCK_M]
             // Template: BLOCK_X=BLOCK_N, BLOCK_Y=BLOCK_M
             // ==================================================================================
-            WMMA_GEMM_SCORES<GemmType::dOV_dOVT, D, IS_CAUSAL, BLOCK_N, BLOCK_M, D_STRIDE, M_STRIDE, WARPS_PER_BLOCK>(
+            WMMA_GEMM_SCORES<Config, GemmType::dOV_dOVT, D, IS_CAUSAL, BLOCK_N, BLOCK_M, D_STRIDE, M_STRIDE>(
             sdO, sV, sdOV,
             valid_q_rows, valid_kv_rows,
             0, 0, 1.0f,
@@ -417,12 +401,11 @@ flash_attention_backward_kernel(
             //           LSE[row: BLOCK_N], row_dot[row: BLOCK_N] -> P[row: BLOCK_N, BLOCK_M], dS[row: BLOCK_N, BLOCK_M]
             // Template: LDS_STRIDE=M_STRIDE, LDO_STRIDE=BLOCK_M, TILE_X=BLOCK_N, TILE_Y=BLOCK_M
             // ==================================================================================
-            WMMA_GEMM_POST_SOFTMAX_GRADIENT<GemmType::compute_P_dS, M_STRIDE, BLOCK_M, BLOCK_N, BLOCK_M>(
+            WMMA_GEMM_SOFTMAX_GRADIENT<Config, GemmType::compute_P_dS, M_STRIDE, BLOCK_M, BLOCK_N, BLOCK_M>(
             sS, sdOV, sLse, sRowDot,
             sP, sdS,
             valid_q_rows, valid_kv_rows,
-            softmax_scale, tid,
-            THREADS_PER_ROW, THREADS_PER_BLOCK);
+            softmax_scale, tid);
 
             __syncthreads();
 
@@ -431,7 +414,7 @@ flash_attention_backward_kernel(
             // Layout:   P^T[col: BLOCK_M, BLOCK_N], dO[row: BLOCK_N, D] -> dV[row: BLOCK_M, D]
             // Template: BLOCK_X=BLOCK_M, BLOCK_Y=BLOCK_N
             // ==================================================================================
-            WMMA_GEMM_GRADIENTS<GemmType::dV_PTdO, D, BLOCK_M, BLOCK_N, BLOCK_M, D_STRIDE, WARPS_PER_BLOCK>(
+            WMMA_GEMM_GRADIENTS<Config, GemmType::dV_PTdO, D, BLOCK_M, BLOCK_N, BLOCK_M, D_STRIDE>(
             sP, sdO, sdV,
             valid_kv_rows, valid_q_rows,
             warp_id,       lane_id);
@@ -443,11 +426,10 @@ flash_attention_backward_kernel(
             // Layout:   Q: global[row: BLOCK_N, D] -> shared[row: BLOCK_N, D_STRIDE]
             // Template: DUAL_LOAD=false, SRC_STRIDE=D, DST_STRIDE=D_STRIDE
             // ==================================================================================
-            WMMA_GEMM_LOAD_TILE<false, D, D_STRIDE>(
+            WMMA_GEMM_LOAD_TILE<Config, false, D, D_STRIDE>(
             q_ptr + start_q * D, sQ,
             nullptr, nullptr,
-            valid_q_rows, tid,
-            THREADS_PER_BLOCK);
+            valid_q_rows, tid);
 
             __syncthreads();
 
@@ -456,7 +438,7 @@ flash_attention_backward_kernel(
             // Layout:   dS^T[col: BLOCK_M, BLOCK_N], Q[row: BLOCK_N, D] -> dK[row: BLOCK_M, D]
             // Template: BLOCK_X=BLOCK_M, BLOCK_Y=BLOCK_N
             // ==================================================================================
-            WMMA_GEMM_GRADIENTS<GemmType::dK_dSTQ, D, BLOCK_M, BLOCK_N, BLOCK_M, D_STRIDE, WARPS_PER_BLOCK>(
+            WMMA_GEMM_GRADIENTS<Config, GemmType::dK_dSTQ, D, BLOCK_M, BLOCK_N, BLOCK_M, D_STRIDE>(
             sdS, sQ, sdK,
             valid_kv_rows, valid_q_rows,
             warp_id,       lane_id);
@@ -472,12 +454,11 @@ flash_attention_backward_kernel(
         //   sdV[valid_kv_rows, D_STRIDE] -> dV_ptr[valid_kv_rows, D]
         // Template: D, D_STRIDE Head dimension and stride
         // ==================================================================================
-        WMMA_GEMM_EPILOGUE<GemmType::write_dKV, D, D_STRIDE>(
+        WMMA_GEMM_EPILOGUE<Config, GemmType::write_dKV, D, D_STRIDE>(
         sdK,    dK_ptr,
         sdV,    dV_ptr,
         nullptr,
-        valid_kv_rows, tid,
-        THREADS_PER_BLOCK);
+        valid_kv_rows, tid);
     }
 }
 

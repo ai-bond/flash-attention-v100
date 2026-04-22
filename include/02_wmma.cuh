@@ -10,6 +10,7 @@
 // ======================================================================================
 template<typename Config>
 __device__ __forceinline__ void WMMA_GEMM_INIT_SMEM(char* smem_raw) {
+    __ASM_DEBUG_BEGIN(INIT, DO);
     constexpr int UINT4  = Config::TOTAL_SMEM / 16;
     constexpr int STRIDE = Config::THREADS_PER_BLOCK;
     constexpr int ITERS  = (UINT4 + STRIDE - 1) / STRIDE;
@@ -28,41 +29,42 @@ __device__ __forceinline__ void WMMA_GEMM_INIT_SMEM(char* smem_raw) {
         );
         str_ptr += step;
     }
+    __ASM_DEBUG_END(INIT, DO);
 }
 
 // ======================================================================================
-// TILE LOADER UINT4 (Universal: Single or Dual load, with internal casting)
+// TILE LOADER (Single or Dual load, with internal casting)
 // Loads uint4-vectorized tiles from global memory to shared memory with bounds checking.
 // ======================================================================================
-template<bool DUAL_LOAD, int SRC_STRIDE, int DST_STRIDE>
+template<typename Config, bool DUAL_LOAD, int SRC_STRIDE, int DST_STRIDE>
 __device__ __forceinline__ void WMMA_GEMM_LOAD_TILE(
-    const __half* __restrict__ SRC0,
-          __half* __restrict__ DST0,
-    const __half* __restrict__ SRC1,
-          __half* __restrict__ DST1,
+    const __half* __restrict__ GMEM0,
+          __half* __restrict__ SMEM0,
+    const __half* __restrict__ GMEM1,
+          __half* __restrict__ SMEM1,
     int VALID_ROWS,
-    int THREAD_ID,
-    int THREADS_TOTAL
+    int THREAD_ID
 ) {
-    constexpr int src_stride_uint4 = (SRC_STRIDE + 7) >> 3;
-    constexpr int dst_stride_uint4 = (DST_STRIDE + 7) >> 3;
+    constexpr int THREADS_PER_BLOCK = Config::THREADS_PER_BLOCK;
+    constexpr int src_stride_uint4  = (SRC_STRIDE + 7) >> 3;
+    constexpr int dst_stride_uint4  = (DST_STRIDE + 7) >> 3;
 
     const int total_iters   = VALID_ROWS * src_stride_uint4;
 
     if (total_iters == 0) return;
 
-    uint64_t src_base0 = static_cast<uint64_t>(__cvta_generic_to_global(SRC0));
-    uint32_t dst_base0 = static_cast<uint32_t>(__cvta_generic_to_shared(DST0));
+    uint64_t src_base0 = static_cast<uint64_t>(__cvta_generic_to_global(GMEM0));
+    uint32_t dst_base0 = static_cast<uint32_t>(__cvta_generic_to_shared(SMEM0));
 
     uint64_t src_base1 = 0;
     uint32_t dst_base1 = 0;
     if constexpr (DUAL_LOAD) {
-        src_base1 = static_cast<uint64_t>(__cvta_generic_to_global(SRC1));
-        dst_base1 = static_cast<uint32_t>(__cvta_generic_to_shared(DST1));
+        src_base1 = static_cast<uint64_t>(__cvta_generic_to_global(GMEM1));
+        dst_base1 = static_cast<uint32_t>(__cvta_generic_to_shared(SMEM1));
     }
 
     #pragma unroll 2
-    for (int idx = THREAD_ID; idx < total_iters; idx += THREADS_TOTAL) {
+    for (int idx = THREAD_ID; idx < total_iters; idx += THREADS_PER_BLOCK) {
         const int row = idx / src_stride_uint4;
         const int col = idx % src_stride_uint4;
 
@@ -141,7 +143,7 @@ __device__ __forceinline__ void WMMA_GEMM_LOAD_TILE(
 // WMMA_GEMM_SCORES: Compute C = (A @ B) * scale [+(causal mask)]
 // Use for: Q@K^T (forward), dO@V^T (backward pre-softmax)
 // ============================================================================
-template<GemmType TYPE, int D, bool IS_CAUSAL, int BLOCK_X, int BLOCK_Y, int IN_STRIDE, int OUT_STRIDE, int WARPS_PER_BLOCK>
+template<typename Config, GemmType TYPE, int D, bool IS_CAUSAL, int BLOCK_X, int BLOCK_Y, int IN_STRIDE, int OUT_STRIDE>
 __device__ __forceinline__ void WMMA_GEMM_SCORES(
     const __half* __restrict__ SMEM_A,
     const __half* __restrict__ SMEM_B,
@@ -153,11 +155,11 @@ __device__ __forceinline__ void WMMA_GEMM_SCORES(
 ) {
     using namespace nvcuda::wmma;
 
-    constexpr uint8_t bits = static_cast<uint8_t>(TYPE);
+    constexpr bool APPLY_MASK  = static_cast<uint8_t>(TYPE) & 0x1;
+    constexpr bool A_IS_COL    = static_cast<uint8_t>(TYPE) & 0x2;
+    constexpr bool B_IS_COL    = static_cast<uint8_t>(TYPE) & 0x4;
 
-    constexpr bool APPLY_MASK = bits & 0x1;
-    constexpr bool A_IS_COL   = bits & 0x2;
-    constexpr bool B_IS_COL   = bits & 0x4;
+    constexpr int WARPS_PER_BLOCK = Config::WARPS_PER_BLOCK;
 
     constexpr int num_tiles_m = (BLOCK_X + WMMA_M - 1) / WMMA_M;
     constexpr int num_tiles_n = (BLOCK_Y + WMMA_N - 1) / WMMA_N;
@@ -221,7 +223,6 @@ __device__ __forceinline__ void WMMA_GEMM_SCORES(
                 acc_frag.x[i] *= SOFTMAX_SCALE;
             }
         }
-
         store_matrix_sync(SMEM_C + tile_m * OUT_STRIDE + tile_n, acc_frag, OUT_STRIDE, mem_row_major);
     }
 }
@@ -230,7 +231,7 @@ __device__ __forceinline__ void WMMA_GEMM_SCORES(
 // WMMA_GEMM_GRADIENTS: Compute C += A @ B  (Read-Modify-Write accumulation)
 // Use for: P@V, dS@K, P^T@dO, dS^T@Q in backward pass
 // ============================================================================
-template<GemmType TYPE, int D, int BLOCK_X, int BLOCK_Y, int IN_STRIDE, int OUT_STRIDE, int WARPS_PER_BLOCK>
+template<typename Config, GemmType TYPE, int D, int BLOCK_X, int BLOCK_Y, int IN_STRIDE, int OUT_STRIDE>
 __device__ __forceinline__ void WMMA_GEMM_GRADIENTS(
     const __half* __restrict__ SMEM_A,
     const __half* __restrict__ SMEM_B,
@@ -242,10 +243,10 @@ __device__ __forceinline__ void WMMA_GEMM_GRADIENTS(
 ) {
     using namespace nvcuda::wmma;
 
-    constexpr uint8_t bits = static_cast<uint8_t>(TYPE);
+    constexpr bool A_IS_COL    = static_cast<uint8_t>(TYPE) & 0x2;
+    constexpr bool B_IS_COL    = static_cast<uint8_t>(TYPE) & 0x4;
 
-    constexpr bool A_IS_COL   = bits & 0x2;
-    constexpr bool B_IS_COL   = bits & 0x4;
+    constexpr int WARPS_PER_BLOCK = Config::WARPS_PER_BLOCK;
 
     constexpr int num_tiles_m = (BLOCK_X + WMMA_M - 1) / WMMA_M;
     constexpr int num_tiles_n = (D + WMMA_N - 1) / WMMA_N;
@@ -293,7 +294,6 @@ __device__ __forceinline__ void WMMA_GEMM_GRADIENTS(
 
             mma_sync(acc_frag, a_frag, b_frag, acc_frag);
         }
-
         store_matrix_sync(SMEM_C + tile_m * OUT_STRIDE + tile_n, acc_frag, OUT_STRIDE, mem_row_major);
     }
 }
@@ -301,32 +301,29 @@ __device__ __forceinline__ void WMMA_GEMM_GRADIENTS(
 // ============================================================================
 // COMPUTE_ROW_DOT
 // ============================================================================
-template<GemmType TYPE, int GLOBAL_STRIDE, int SMEM_STRIDE, int FULL_ROWS>
+template<typename Config, GemmType TYPE, int GLOBAL_STRIDE, int SMEM_STRIDE>
 __device__ __forceinline__ void WMMA_GEMM_DOT_PRODUCT(
-    const __half* __restrict__ PTR_O,
+    const __half* __restrict__ GMEM_O,
     const __half* __restrict__ SMEM_DO,
-    const  float* __restrict__ PTR_LSE,
+    const  float* __restrict__ GMEM_LSE,
            float* __restrict__ SMEM_LSE,
            float* __restrict__ SMEM_DOT,
     int VALID_ROWS,
     int OFFSET,
-    int THREAD_ID,
-    int THREADS_PER_ROW,
-    int THREADS_PER_BLOCK
+    int THREAD_ID
 ) {
     constexpr int global_blocks = GLOBAL_STRIDE >> 3;
 
     const int total_iters = VALID_ROWS * global_blocks;
     if (total_iters == 0) return;
 
-    uint64_t global_base = static_cast<uint64_t>(__cvta_generic_to_global(PTR_O));
+    uint64_t global_base = static_cast<uint64_t>(__cvta_generic_to_global(GMEM_O));
     uint32_t shared_base = static_cast<uint32_t>(__cvta_generic_to_shared(SMEM_DO));
 
-    constexpr uint8_t bits = static_cast<uint8_t>(TYPE);
-    constexpr bool LSE_OFFSET = bits & 0x1;
+    constexpr bool PHASE           = static_cast<uint8_t>(TYPE) & 0x1;
+    constexpr int  THREADS_PER_ROW = PHASE ? Config::DKV::THREADS_PER_ROW : Config::DQ::THREADS_PER_ROW;
 
-    const int work = (global_blocks + THREADS_PER_ROW - 1) / THREADS_PER_ROW;
-
+    const int work   = (global_blocks + THREADS_PER_ROW - 1) / THREADS_PER_ROW;
     const int row    = THREAD_ID / THREADS_PER_ROW;
     const int thread = THREAD_ID % THREADS_PER_ROW;
 
@@ -386,19 +383,19 @@ __device__ __forceinline__ void WMMA_GEMM_DOT_PRODUCT(
     }
 
     if (THREAD_ID < VALID_ROWS) {
-        if constexpr (LSE_OFFSET) {
-            SMEM_LSE[THREAD_ID] = PTR_LSE[OFFSET + THREAD_ID];
+        if constexpr (PHASE) {
+            SMEM_LSE[THREAD_ID] = GMEM_LSE[OFFSET + THREAD_ID];
         } else {
-            SMEM_LSE[THREAD_ID] = PTR_LSE[THREAD_ID];
+            SMEM_LSE[THREAD_ID] = GMEM_LSE[THREAD_ID];
         }
     }
 }
 
 // ============================================================================
-// WMMA_GEMM_POST_SOFTMAX_GRADIENT
+// WMMA_GEMM_SOFTMAX_GRADIENT
 // ============================================================================
-template<GemmType TYPE, int SMEM_LDS_STRIDE, int SMEM_LDO_STRIDE, int TILE_X, int TILE_Y>
-__device__ __forceinline__ void WMMA_GEMM_POST_SOFTMAX_GRADIENT(
+template<typename Config, GemmType TYPE, int SMEM_LDS_STRIDE, int SMEM_LDO_STRIDE, int TILE_X, int TILE_Y>
+__device__ __forceinline__ void WMMA_GEMM_SOFTMAX_GRADIENT(
     const float* __restrict__ SMEM_S,
     const float* __restrict__ SMEM_DOV,
     const float* __restrict__ SMEM_LSE,
@@ -408,18 +405,16 @@ __device__ __forceinline__ void WMMA_GEMM_POST_SOFTMAX_GRADIENT(
     int VALID_Q_ROWS,
     int VALID_KV_ROWS,
     float SOFTMAX_SCALE,
-    int THREAD_ID,
-    int THREADS_PER_ROW,
-    int THREADS_PER_BLOCK
+    int THREAD_ID
 ) {
-    constexpr int TOTAL_ELEMENTS = TILE_X * TILE_Y;
-    constexpr int TOTAL_PAIRS    = (TOTAL_ELEMENTS + 1) >> 1;
-    
-    constexpr bool IS_SDS_SP     = static_cast<uint8_t>(TYPE) & 0x1;
+    constexpr int  TOTAL_ELEMENTS    = TILE_X * TILE_Y;
+    constexpr int  TOTAL_PAIRS       = (TOTAL_ELEMENTS + 1) >> 1;
+    constexpr bool PHASE             = static_cast<uint8_t>(TYPE) & 0x1;
+    constexpr int  THREADS_PER_BLOCK = Config::THREADS_PER_BLOCK;
 
-    __half2 buf_ds[2] = { 
-        __float22half2_rn(make_float2(0.0f, 0.0f)), 
-        __float22half2_rn(make_float2(0.0f, 0.0f)) 
+    __half2 buf_ds[2] = {
+        __float22half2_rn(make_float2(0.0f, 0.0f)),
+        __float22half2_rn(make_float2(0.0f, 0.0f))
     };
 
     #pragma unroll 1
@@ -464,7 +459,7 @@ __device__ __forceinline__ void WMMA_GEMM_POST_SOFTMAX_GRADIENT(
         const int ldo0 = row0 * SMEM_LDO_STRIDE + col0;
         const int ldo1 = has_pair ? (row1 * SMEM_LDO_STRIDE + col1) : 0;
 
-        if constexpr (!IS_SDS_SP) {
+        if constexpr (!PHASE) {
             const int buf_idx = (i - THREAD_ID) / THREADS_PER_BLOCK;
             if (buf_idx < 2) {
                 buf_ds[buf_idx] = h2_ds;
@@ -497,7 +492,7 @@ __device__ __forceinline__ void WMMA_GEMM_POST_SOFTMAX_GRADIENT(
     // ====================================================================
     // PHASE 2: Flush register buffers to SMEM (dQ path ONLY)
     // ====================================================================
-    if constexpr (!IS_SDS_SP) {
+    if constexpr (!PHASE) {
         const int max_buf = min(2, (TOTAL_PAIRS + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
         #pragma unroll 2
         for (int b = 0; b < max_buf; ++b) {
@@ -534,7 +529,7 @@ __device__ __forceinline__ void WMMA_GEMM_POST_SOFTMAX_GRADIENT(
 // ============================================================================
 // KERNEL_EPILOGUE
 // ============================================================================
-template<GemmType TYPE, int GLOBAL_STRIDE, int SMEM_STRIDE>
+template<typename Config, GemmType TYPE, int GLOBAL_STRIDE, int SMEM_STRIDE>
 __device__ __forceinline__ void WMMA_GEMM_EPILOGUE(
     const float* __restrict__ SMEM0,
          __half* __restrict__ GMEM0,
@@ -542,18 +537,16 @@ __device__ __forceinline__ void WMMA_GEMM_EPILOGUE(
          __half* __restrict__ GMEM1,
     const float* __restrict__ SMEM_DOT,
     int VALID_ROWS,
-    int THREAD_ID,
-    int THREADS_PER_BLOCK
+    int THREAD_ID
 ) {
 
     constexpr int global_chunks = GLOBAL_STRIDE >> 2;
     const int total_iters = VALID_ROWS * global_chunks;
     if (total_iters == 0) return;
 
-    constexpr uint8_t bits = static_cast<uint8_t>(TYPE);
-
-    constexpr bool NORMLZE    = bits & 0x1;
-    constexpr bool DUAL_STORE = bits & 0x2;
+    constexpr int  THREADS_PER_BLOCK = Config::THREADS_PER_BLOCK;
+    constexpr bool NORMLZE    = static_cast<uint8_t>(TYPE) & 0x1;
+    constexpr bool DUAL_STORE = static_cast<uint8_t>(TYPE) & 0x2;
 
     for (int i = THREAD_ID; i < total_iters; i += THREADS_PER_BLOCK) {
         const int row =  i / global_chunks;
@@ -622,10 +615,10 @@ __device__ __forceinline__ void WMMA_GEMM_EPILOGUE(
 }
 
 // ============================================================================
-// ONLINE_SOFTMAX: Online softmax with O-scaling
+// WMMA_GEMM_SOFTMAX: Online softmax with O-scaling
 // ============================================================================
-template<int BLOCK_M, int BLOCK_N, int SCORE_STRIDE, int HEAD_STRIDE, int THREADS_PER_ROW>
-__device__ __forceinline__ void ONLINE_SOFTMAX(
+template<typename Config, int BLOCK_M, int BLOCK_N, int SCORE_STRIDE, int HEAD_STRIDE>
+__device__ __forceinline__ void WMMA_GEMM_SOFTMAX(
     float*  __restrict__ SMEM_S,
     __half* __restrict__ SMEM_P,
     float*  __restrict__ SMEM_O,
@@ -637,6 +630,8 @@ __device__ __forceinline__ void ONLINE_SOFTMAX(
     int BLOCK_ID
 ) {
     if (VALID_Q == 0 || VALID_KV == 0) return;
+
+    constexpr int  THREADS_PER_ROW = Config::DO::THREADS_PER_ROW;
 
     const int row      = THREAD_ID / THREADS_PER_ROW;
     const int thread   = THREAD_ID % THREADS_PER_ROW;

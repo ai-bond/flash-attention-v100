@@ -33,13 +33,10 @@ flash_attention_forward_kernel(
     const float softmax_scale
 ) {
     using Config = KernelConfig<D>;
-    constexpr int BLOCK_M           = Config::DO::BLOCK_M;
-    constexpr int BLOCK_N           = Config::DO::BLOCK_N;
-    constexpr int THREADS_PER_BLOCK = Config::THREADS_PER_BLOCK;
-    constexpr int THREADS_PER_ROW   = Config::DO::THREADS_PER_ROW;
-    constexpr int WARPS_PER_BLOCK   = Config::DO::WARPS_PER_BLOCK;
-    constexpr int D_STRIDE          = Config::DO::D_STRIDE;
-    constexpr int N_STRIDE          = Config::DO::N_STRIDE;
+    constexpr int BLOCK_M   = Config::DO::BLOCK_M;
+    constexpr int BLOCK_N   = Config::DO::BLOCK_N;
+    constexpr int D_STRIDE  = Config::DO::D_STRIDE;
+    constexpr int N_STRIDE  = Config::DO::N_STRIDE;
 
     // head index (batch * num_heads + head)
     const int batch_head_id = blockIdx.z;
@@ -111,11 +108,10 @@ flash_attention_forward_kernel(
     // Layout:   Q: global[row: BLOCK_M, D] -> shared[row: BLOCK_M, D_STRIDE]
     // Template: DUAL_LOAD=false, SRC_STRIDE=D, DST_STRIDE=D_STRIDE
     // ==================================================================================
-    WMMA_GEMM_LOAD_TILE<false, D, D_STRIDE>(
+    WMMA_GEMM_LOAD_TILE<Config, false, D, D_STRIDE>(
     q_ptr,   sQ,
     nullptr, nullptr,
-    valid_q_rows, tid,
-    THREADS_PER_BLOCK);
+    valid_q_rows, tid);
 
     __syncthreads();
 
@@ -135,11 +131,10 @@ flash_attention_forward_kernel(
         // Layout:   K: global[row: BLOCK_N, D] -> shared[row: BLOCK_N, D_STRIDE]
         // Template: DUAL_LOAD=false, SRC_STRIDE=D, DST_STRIDE=D_STRIDE
         // ==================================================================================
-        WMMA_GEMM_LOAD_TILE<false, D, D_STRIDE>(
+        WMMA_GEMM_LOAD_TILE<Config, false, D, D_STRIDE>(
         k_ptr + start_kv * D, sK,
         nullptr, nullptr,
-        valid_kv_rows, tid,
-        THREADS_PER_BLOCK);
+        valid_kv_rows, tid);
 
         __syncthreads();
 
@@ -148,7 +143,7 @@ flash_attention_forward_kernel(
         // Layout:   Q[row: BLOCK_M, D], K[col: BLOCK_N, D] -> S[row: BLOCK_M, col: BLOCK_N]
         // Template: BLOCK_X=BLOCK_M, BLOCK_Y=BLOCK_N
         // ==================================================================================
-        WMMA_GEMM_SCORES<GemmType::sQ_KT, D, IS_CAUSAL, BLOCK_M, BLOCK_N, D_STRIDE, N_STRIDE, WARPS_PER_BLOCK>(
+        WMMA_GEMM_SCORES<Config, GemmType::sQ_KT, D, IS_CAUSAL, BLOCK_M, BLOCK_N, D_STRIDE, N_STRIDE>(
         sQ, sK, sS,
         valid_q_rows, valid_kv_rows,
         start_q,      start_kv,
@@ -160,9 +155,9 @@ flash_attention_forward_kernel(
         // ==================================================================================
         // Compute:  Online Softmax + O-scaling
         // Layout:   S[BLOCK_M, BLOCK_N] -> P[BLOCK_M, BLOCK_N], O[BLOCK_M, D] scaled
-        // Template: BLOCK_M, BLOCK_N, N_STRIDE, D_STRIDE, THREADS_PER_ROW, FULL_ROWS
+        // Template: BLOCK_M, BLOCK_N, N_STRIDE, D_STRIDE
         // ==================================================================================
-        ONLINE_SOFTMAX<BLOCK_M, BLOCK_N, N_STRIDE, D_STRIDE, THREADS_PER_ROW>(
+        WMMA_GEMM_SOFTMAX<Config, BLOCK_M, BLOCK_N, N_STRIDE, D_STRIDE>(
         sS, sP, sO,
         sRowMax, sRowSum,
         valid_q_rows, valid_kv_rows,
@@ -175,11 +170,10 @@ flash_attention_forward_kernel(
         // Layout:   V: global[row: BLOCK_N, D] -> shared[row: BLOCK_N, D_STRIDE]
         // Template: DUAL_LOAD=false, SRC_STRIDE=D, DST_STRIDE=D_STRIDE
         // ==================================================================================
-        WMMA_GEMM_LOAD_TILE<false, D, D_STRIDE>(
+        WMMA_GEMM_LOAD_TILE<Config, false, D, D_STRIDE>(
         v_ptr + start_kv * D, sV,
         nullptr, nullptr,
-        valid_kv_rows, tid,
-        THREADS_PER_BLOCK);
+        valid_kv_rows, tid);
 
         __syncthreads();
 
@@ -188,7 +182,7 @@ flash_attention_forward_kernel(
         // Layout:   P[row: BLOCK_M, BLOCK_N], V[row: BLOCK_N, D] -> dO[row: BLOCK_M, D]
         // Template: BLOCK_X=BLOCK_M, BLOCK_Y=BLOCK_N
         // ==================================================================================
-        WMMA_GEMM_GRADIENTS<GemmType::dO_PV, D, BLOCK_M, BLOCK_N, N_STRIDE, D_STRIDE, WARPS_PER_BLOCK>(
+        WMMA_GEMM_GRADIENTS<Config, GemmType::dO_PV, D, BLOCK_M, BLOCK_N, N_STRIDE, D_STRIDE>(
         sP, sV, sO,
         valid_q_rows, valid_kv_rows,
         warp_id,      lane_id);
@@ -202,12 +196,11 @@ flash_attention_forward_kernel(
     // Layout:   sO[valid_q_rows, D_STRIDE] -> out_ptr[valid_q_rows, D]
     // Template  D, D_STRIDE  : Head dimension and shared memory stride
     // ==================================================================================
-    WMMA_GEMM_EPILOGUE<GemmType::write_dO, D, D_STRIDE>(
+    WMMA_GEMM_EPILOGUE<Config, GemmType::write_dO, D, D_STRIDE>(
     sO,      out_ptr,
     nullptr, nullptr,
     sRowSum,
-    valid_q_rows, tid,
-    THREADS_PER_BLOCK);
+    valid_q_rows, tid);
 
     if (tid < valid_q_rows) {
         const float sum = fmaxf(sRowSum[tid], 1e-24f);
