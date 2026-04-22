@@ -10,17 +10,23 @@
 // ======================================================================================
 template<typename Config>
 __device__ __forceinline__ void WMMA_GEMM_INIT_SMEM(char* smem_raw) {
-    constexpr int N_U4 = Config::TOTAL_SMEM / 16;
-    const int tid = threadIdx.x;
-    const int stride = blockDim.x;
+    constexpr int UINT4  = Config::TOTAL_SMEM / 16;
+    constexpr int STRIDE = Config::THREADS_PER_BLOCK;
+    constexpr int ITERS  = (UINT4 + STRIDE - 1) / STRIDE;
 
-    uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_raw));
+    uint32_t base    = static_cast<uint32_t>(__cvta_generic_to_shared(smem_raw));
+    uint32_t str_ptr = base + (threadIdx.x << 4);
+    uint32_t end_ptr = base + (UINT4 << 4);
+    constexpr uint32_t step = STRIDE << 4;
 
-    #pragma unroll 4
-    for (int i = tid; i < N_U4; i += stride) {
-        asm volatile("st.shared.v4.u32 [%0], {0x0, 0x0, 0x0, 0x0};"
-                     :: "r"(addr + (i << 4))
-                     : "memory");
+    #pragma unroll
+    for (int i = 0; i < ITERS; ++i) {
+        asm volatile(
+            "setp.lt.u32 %%p0, %0, %1;\n\t"
+            "@%%p0 st.shared.v4.u32 [%0], {0, 0, 0, 0};\n\t"
+            :: "r"(str_ptr), "r"(end_ptr)
+        );
+        str_ptr += step;
     }
 }
 

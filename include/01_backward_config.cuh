@@ -101,5 +101,5 @@ struct KernelConfig {
                     alignas(16) float row_dot [ (DQ::BLOCK_M > DKV::BLOCK_N) ? DQ::BLOCK_M : DKV::BLOCK_N ];
     };
 
-    static constexpr size_t TOTAL_SMEM = ((sizeof(SmemLayout) + 127) & ~size_t(127));
+    static constexpr int TOTAL_SMEM = static_cast<int>(((sizeof(SmemLayout) + 127) & ~size_t(127)));
 };
