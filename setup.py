@@ -20,7 +20,7 @@ def get_ext_modules():
     except ImportError as e:
         raise RuntimeError(
             "torch is required to build flash_attn_v100. "
-            "Please install torch >= 2.5 first (e.g., `pip install torch --index-url https://download.pytorch.org/whl/cu118`)."
+            "Please install torch >= 2.10 first (e.g., `pip install torch==2.10.0+cu129 --index-url https://download.pytorch.org/whl/cu129`)."
         ) from e
 
     nvcc_threads = int(os.environ.get("NVCC_THREADS", 4))
@@ -37,6 +37,15 @@ def get_ext_modules():
         "-Wno-deprecated-gpu-targets",
         f"--threads={nvcc_threads}",
     ]
+
+    if os.environ.get("ATTENTION_DEBUG"):
+        nvcc_flags.extend([
+            "-g",
+            "-Xptxas", "-v",
+            "--keep",
+            "--keep-dir", str(this_dir / "build"),
+        ])
+        (this_dir / "build").mkdir(exist_ok=True)
 
     return [
         CUDAExtension(
@@ -71,32 +80,14 @@ class CopyAttention(build_py):
 class InstallAttention(install):
     def run(self):
         install.run(self)
-
         import site
-        site_packages = site.getsitepackages()[0]
-
-        dst_dir = os.path.join(site_packages, 'flash_attn-2.8.3.dist-info')
-        if os.path.exists(dst_dir):
-            shutil.rmtree(dst_dir)
-            print(f"Removed existing: {dst_dir}")
-        os.makedirs(dst_dir, exist_ok=True)
-
-        metadata = """\
-Metadata-Version: 2.4
-Name: flash-attn
-Version: 2.8.3
-Summary: Flash Attention for Tesla V100
-License-Expression: BSD-3-Clause
-Requires-Python: >=3.10
-Description-Content-Type: text/markdown
-"""
-        with open(os.path.join(dst_dir, 'METADATA'), 'w') as f:
-            f.write(metadata)
-
-        with open(os.path.join(dst_dir, 'top_level.txt'), 'w') as f:
+        dst = os.path.join(site.getsitepackages()[0], 'flash_attn-2.8.3.dist-info')
+        if os.path.exists(dst): shutil.rmtree(dst)
+        os.makedirs(dst, exist_ok=True)
+        with open(os.path.join(dst, 'METADATA'), 'w') as f:
+            f.write("Metadata-Version: 2.4\nName: flash-attn\nVersion: 2.8.3\n")
+        with open(os.path.join(dst, 'top_level.txt'), 'w') as f:
             f.write('flash_attn\n')
-
-        print(f"Created: {dst_dir}")
 
 def get_cmdclass():
     try:
@@ -104,7 +95,7 @@ def get_cmdclass():
     except ImportError as e:
         raise RuntimeError(
             "torch is required to build flash_attn_v100. "
-            "Please install torch >= 2.5 first."
+            "Please install torch >= 2.10 first (e.g., `pip install torch==2.10.0+cu129 --index-url https://download.pytorch.org/whl/cu129`)."
         ) from e
 
     class BuildAttention(BuildExtension):
@@ -140,8 +131,8 @@ def get_cmdclass():
 
             if not torch.cuda.is_available():
                 raise RuntimeError("CUDA is required but not available.")
-            if parse(torch.version.cuda) < parse("11.6"):
-                raise RuntimeError(f"CUDA version {torch.version.cuda} < 11.6 is not supported. Please use CUDA ≥ 11.6 (e.g., PyTorch built with CUDA 11.8/12.x).")
+            if parse(torch.version.cuda) < parse("12.9"):
+                raise RuntimeError(f"CUDA version {torch.version.cuda} < 12.9 is not supported.")
             super().build_extensions()
 
     return {"build_ext": BuildAttention, "build_py": CopyAttention, 'install': InstallAttention}
