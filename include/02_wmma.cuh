@@ -10,13 +10,12 @@
 // ======================================================================================
 template<typename Config>
 __device__ __forceinline__ void WMMA_GEMM_INIT_SMEM(char* smem_raw) {
-    __ASM_DEBUG_BEGIN(INIT, DO);
     constexpr int UINT4  = Config::TOTAL_SMEM / 16;
     constexpr int STRIDE = Config::THREADS_PER_BLOCK;
     constexpr int ITERS  = (UINT4 + STRIDE - 1) / STRIDE;
 
     uint32_t base    = static_cast<uint32_t>(__cvta_generic_to_shared(smem_raw));
-    uint32_t str_ptr = base + (threadIdx.x << 4);
+    uint32_t str_ptr = base + ((threadIdx.x ^ (threadIdx.x >> 3)) << 4);
     uint32_t end_ptr = base + (UINT4 << 4);
     constexpr uint32_t step = STRIDE << 4;
 
@@ -29,7 +28,6 @@ __device__ __forceinline__ void WMMA_GEMM_INIT_SMEM(char* smem_raw) {
         );
         str_ptr += step;
     }
-    __ASM_DEBUG_END(INIT, DO);
 }
 
 // ======================================================================================
