@@ -40,12 +40,19 @@ def get_ext_modules():
 
     if os.environ.get("ATTENTION_DEBUG"):
         nvcc_flags.extend([
+            "-DKERNEL_DEBUG",
             "-g",
             "-Xptxas", "-v",
             "--keep",
             "--keep-dir", str(this_dir / "build"),
         ])
         (this_dir / "build").mkdir(exist_ok=True)
+
+    if os.environ.get("MMA_NATIVE"):
+        nvcc_flags.extend(["-DMMA_NATIVE"])
+
+    if os.environ.get("MMA_884"):
+        nvcc_flags.extend(["-DMMA_884"])
 
     return [
         CUDAExtension(

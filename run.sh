@@ -3,7 +3,13 @@
 set -e
 
 DEBUG=0
-for arg in "$@"; do [[ "$arg" == "--debug" ]] && DEBUG=1; done
+MMA_MODE=""
+
+for arg in "$@"; do 
+    [[ "$arg" == "--debug" ]] && DEBUG=1
+    [[ "$arg" == "--mma-native" ]] && MMA_MODE="native"
+    [[ "$arg" == "--mma-884" ]] && MMA_MODE="884"
+done
 
 clear
 rm -rf ./build
@@ -11,6 +17,17 @@ rm -rf ./build
 if [ "$DEBUG" -eq 1 ]; then
     export ATTENTION_DEBUG=1
     mkdir -p ./build
+fi
+
+if [ -n "$MMA_MODE" ]; then
+    export MMA_MODE="$MMA_MODE"
+    echo "MMA mode set to: $MMA_MODE"
+
+    if [ "$MMA_MODE" == "native" ]; then
+        export MMA_NATIVE=1
+    elif [ "$MMA_MODE" == "884" ]; then
+        export MMA_884=1
+    fi
 fi
 
 pip install . --no-build-isolation -v

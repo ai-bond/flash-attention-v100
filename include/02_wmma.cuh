@@ -1,9 +1,20 @@
+// ======================================================================================
+// * Copyright (c) 2025, D.Skryabin / tg @ai_bond007 SPDX-License: BSD-3-Clause
+// ======================================================================================
+
 #pragma once
 
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
-#include <mma.h>
+
+#ifdef MMA_NATIVE
+    #include <mma.h>
+#elif defined(MMA_884)
+    #include "fused_mma_m8n8k4.h"
+#else
+    #include "fused_mma_m16n16k16.h"
+#endif
 
 // ======================================================================================
 // INIT SMEM LAYOUT
@@ -151,8 +162,12 @@ __device__ __forceinline__ void WMMA_GEMM_SCORES(
     float SOFTMAX_SCALE,
     int WARP_ID,  int LANE_ID
 ) {
-    using namespace nvcuda::wmma;
 
+#ifdef MMA_NATIVE
+    using namespace nvcuda::wmma;
+#else
+    using namespace volta::wmma;
+#endif
     constexpr bool APPLY_MASK  = static_cast<uint8_t>(TYPE) & 0x1;
     constexpr bool A_IS_COL    = static_cast<uint8_t>(TYPE) & 0x2;
     constexpr bool B_IS_COL    = static_cast<uint8_t>(TYPE) & 0x4;
@@ -239,8 +254,11 @@ __device__ __forceinline__ void WMMA_GEMM_GRADIENTS(
     int WARP_ID,
     int LANE_ID
 ) {
+#ifdef MMA_NATIVE
     using namespace nvcuda::wmma;
-
+#else
+    using namespace volta::wmma;
+#endif
     constexpr bool A_IS_COL    = static_cast<uint8_t>(TYPE) & 0x2;
     constexpr bool B_IS_COL    = static_cast<uint8_t>(TYPE) & 0x4;
 

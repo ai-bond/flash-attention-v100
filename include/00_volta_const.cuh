@@ -1,11 +1,22 @@
+// ======================================================================================
+// * Copyright (c) 2025, D.Skryabin / tg @ai_bond007 SPDX-License: BSD-3-Clause
+// ======================================================================================
+
 #pragma once
 
-// ============================================================================
+// ======================================================================================
 // VOLTA SM70 WMMA CONSTANTS
-// ============================================================================
-#define WMMA_M 16
-#define WMMA_N 16
-#define WMMA_K 16
+// ======================================================================================
+
+#ifdef MMA_884
+    #define WMMA_M 8
+    #define WMMA_N 8
+    #define WMMA_K 4
+#else
+    #define WMMA_M 16
+    #define WMMA_N 16
+    #define WMMA_K 16
+#endif
 
 #define NEG_INF                 (-1e30f)
 
@@ -24,14 +35,14 @@
 #define MAX_REG_PER_BLOCK       65536
 #define MAX_REG_BUFFER          65536
 
-// ============================================================================
+// ======================================================================================
 // GEMM OPERATION
 // Bit 0 (0x1): CONTEXT-DEPENDENT FLAG
 //  * In WMMA_GEMM_SCORES:    APPLY_MASK (1=apply causal mask to output, 0=no mask)
 //  * In WMMA_GEMM_GRADIENTS: ACCUMULATE (1=C += A@B, 0=C = A@B / overwrite)
 // Bit 1 (0x2): A_IS_COL   (1=load A as col_major / interpret as A^T, 0=row_major)
 // Bit 2 (0x4): B_IS_COL   (1=load B as col_major / interpret as B^T, 0=row_major)
-// ============================================================================
+// ======================================================================================
 enum class GemmType : uint8_t {
     sQ_KT        = (1<<0) | (0<<1) | (1<<2),  // 0b101 = 5:    Q(row) @  K(col)^T, APPLY_MASK=1, A=row, B=col
     dOV_dOVT     = (0<<0) | (0<<1) | (1<<2),  // 0b100 = 4:   dO(row) @  V(col)^T, APPLY_MASK=0, A=row, B=col
