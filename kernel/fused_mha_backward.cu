@@ -31,7 +31,8 @@ flash_attention_backward_kernel(
           __half* __restrict__ dK,
           __half* __restrict__ dV,
     const int B,
-    const int H,
+    const int H_Q,
+    const int H_K,
     const int M,
     const int N,
     const int grid_dq_limit,
@@ -51,9 +52,8 @@ flash_attention_backward_kernel(
         constexpr int D_STRIDE  = Config::DQ::D_STRIDE;
         constexpr int N_STRIDE  = Config::DQ::N_STRIDE;
 
-        // head index (batch * num_heads + head)
         const int batch_head_id = blockIdx.z;
-        if (batch_head_id >= B * H) return;
+        if (batch_head_id >= B * H_Q) return;
 
         const int block_idx = blockIdx.x;
         const int start_q   = block_idx * BLOCK_M;
@@ -84,11 +84,13 @@ flash_attention_backward_kernel(
         const int lane_id      = tid & 31;
 
         // ==================================================================================
-        // Layout: [B, H, M/N, D] linear offset: batch_head_id * (M/N) * D + start_* * D
+        // Layout:
+        //   Q/Out/LSE: [B, H_Q, M, D] offset follows batch_head_id (Q-head space)
+        //   K/V:       [B, H_K, N, D] mapped via batch_head_id % H_Q / (H_Q / H_K)
         // ==================================================================================
         const __half* __restrict__ q_ptr   = Q           + (size_t)batch_head_id * M * D + start_q * D;
-        const __half* __restrict__ k_ptr   = K           + (size_t)batch_head_id * N * D;
-        const __half* __restrict__ v_ptr   = V           + (size_t)batch_head_id * N * D;
+        const __half* __restrict__ k_ptr   = K           + (size_t)((batch_head_id / H_Q) * H_K + (batch_head_id % H_Q) / (H_Q / H_K)) * N * D;
+        const __half* __restrict__ v_ptr   = V           + (size_t)((batch_head_id / H_Q) * H_K + (batch_head_id % H_Q) / (H_Q / H_K)) * N * D;
         const __half* __restrict__ o_ptr   = O           + (size_t)batch_head_id * M * D + start_q * D;
         const __half* __restrict__ dO_ptr  = dO          + (size_t)batch_head_id * M * D + start_q * D;
               __half* __restrict__ dQ_ptr  = dQ          + (size_t)batch_head_id * M * D + start_q * D;
@@ -254,9 +256,8 @@ flash_attention_backward_kernel(
         constexpr int D_STRIDE  = Config::DKV::D_STRIDE;
         constexpr int M_STRIDE  = Config::DKV::M_STRIDE;
 
-        // head index (batch * num_heads + head)
         const int batch_head_id = blockIdx.z;
-        if (batch_head_id >= B * H) return;
+        if (batch_head_id >= B * H_K) return;
 
         const int block_idx = blockIdx.x;
         const int start_kv  = block_idx * BLOCK_M;
@@ -266,23 +267,19 @@ flash_attention_backward_kernel(
         const int valid_kv_rows = min(BLOCK_M, N - start_kv);
 
         // ==================================================================================
-        // Init:   thread/warp/lane IDs for WMMA coordination
+        // Init:    thread/warp/lane IDs for WMMA coordination
         // ==================================================================================
         const int tid          = threadIdx.x;
         const int warp_id      = tid >> 5;
         const int lane_id      = tid & 31;
 
         // ==================================================================================
-        // Layout: [B, H, M/N, D] linear offset: batch_head_id * (M/N) * D + start_* * D
+        // Layout:   [B, H_K, N, D] offset follows batch_head_id (KV-head space)
         // ==================================================================================
-        const __half* __restrict__   q_ptr = Q           + (size_t)batch_head_id * M * D;
-        const __half* __restrict__   k_ptr = K           + (size_t)batch_head_id * N * D + start_kv * D;
-        const __half* __restrict__   v_ptr = V           + (size_t)batch_head_id * N * D + start_kv * D;
-        const __half* __restrict__   o_ptr = O           + (size_t)batch_head_id * M * D;
-        const __half* __restrict__  dO_ptr = dO          + (size_t)batch_head_id * M * D;
-        const  float* __restrict__ lse_ptr = softmax_lse + (size_t)batch_head_id * M;
-              __half* __restrict__  dK_ptr = dK          + (size_t)batch_head_id * N * D + start_kv * D;
-              __half* __restrict__  dV_ptr = dV          + (size_t)batch_head_id * N * D + start_kv * D;
+        const __half* __restrict__ k_ptr  = K  + ((size_t)((batch_head_id / H_K) * H_K + (batch_head_id % H_K)) * N * D) + start_kv * D;
+        const __half* __restrict__ v_ptr  = V  + ((size_t)((batch_head_id / H_K) * H_K + (batch_head_id % H_K)) * N * D) + start_kv * D;
+              __half* __restrict__ dK_ptr = dK + ((size_t)((batch_head_id / H_K) * H_K + (batch_head_id % H_K)) * N * D) + start_kv * D;
+              __half* __restrict__ dV_ptr = dV + ((size_t)((batch_head_id / H_K) * H_K + (batch_head_id % H_K)) * N * D) + start_kv * D;
 
         // ==================================================================================
         // Init:   shared memory with zero-fill union regions to avoid stale data
@@ -321,131 +318,144 @@ flash_attention_backward_kernel(
         __syncthreads();
 
         // ==================================================================================
-        // MAIN LOOP (iterates over Q blocks for current K/V block)
+        // Q-HEADS LOOP (Iterate over Q-head groups sharing this KV-head)
         // ==================================================================================
-        for (int block = 0; block < num_q_tiles; ++block) {
-            const int start_q = block * BLOCK_N;
-            if (start_q >= M) break;
-            const int valid_q_rows = min(BLOCK_N, M - start_q);
-
-            // Early skip per tile
-            if constexpr (IS_CAUSAL) { if (start_kv >= start_q + valid_q_rows) continue; }
+        for (int group = 0; group < (H_Q / H_K); ++group) {
 
             // ==================================================================================
-            // Load:     Q tile from global to sQ(reuse) shared memory
-            // Layout:   Q: global[row: BLOCK_N, D] -> shared[row: BLOCK_N, D_STRIDE]
-            // Template: DUAL_LOAD=false, SRC_STRIDE=D, DST_STRIDE=D_STRIDE
+            // Layout:    [B, H_Q, M, D] -> offset computed from KV-head + group index
             // ==================================================================================
-            WMMA_GEMM_LOAD_TILE<Config, false, D, D_STRIDE>(
-            q_ptr + start_q * D, sQ,
-            nullptr, nullptr,
-            valid_q_rows, tid);
-
-            __syncthreads();
+            const __half* __restrict__ q_ptr   = Q           + (size_t)((batch_head_id / H_K) * H_Q + (((batch_head_id % H_K) * (H_Q / H_K)) + group)) * M * D;
+            const __half* __restrict__ o_ptr   = O           + (size_t)((batch_head_id / H_K) * H_Q + (((batch_head_id % H_K) * (H_Q / H_K)) + group)) * M * D;
+            const __half* __restrict__ dO_ptr  = dO          + (size_t)((batch_head_id / H_K) * H_Q + (((batch_head_id % H_K) * (H_Q / H_K)) + group)) * M * D;
+            const  float* __restrict__ lse_ptr = softmax_lse + (size_t)((batch_head_id / H_K) * H_Q + (((batch_head_id % H_K) * (H_Q / H_K)) + group)) * M;
 
             // ==================================================================================
-            // Compute:  S = Q @ K^T
-            // Layout:   Q[row: BLOCK_N, D], K[col: BLOCK_M, D] -> S[row: BLOCK_N, col: BLOCK_M]
-            // Template: BLOCK_X=BLOCK_N, BLOCK_Y=BLOCK_M
+            // Q-TILES LOOP (Iterate over Q-tiles for the current Q-head)
             // ==================================================================================
-            WMMA_GEMM_SCORES<Config, GemmType::sQ_KT, D, IS_CAUSAL, BLOCK_N, BLOCK_M, D_STRIDE, M_STRIDE>(
-            sQ, sK, sS,
-            valid_q_rows, valid_kv_rows,
-            start_q,      start_kv,
-            softmax_scale,
-            warp_id,      lane_id);
+            for (int block = 0; block < num_q_tiles; ++block) {
+                const int start_q = block * BLOCK_N;
+                if (start_q >= M) break;
+                const int valid_q_rows = min(BLOCK_N, M - start_q);
 
-            __syncthreads();
+                // Early skip per tile
+                if constexpr (IS_CAUSAL) { if (start_kv >= start_q + valid_q_rows) continue; }
 
-            // ==================================================================================
-            // Load:     dO tile from global to sdO(reuse) shared memory
-            // Layout:   dO global[row: BLOCK_N, D] -> shared[row: BLOCK_N, D_STRIDE]
-            // Template: DUAL_LOAD=false, SRC_STRIDE=D, DST_STRIDE=D_STRIDE
-            // ==================================================================================
-            WMMA_GEMM_LOAD_TILE<Config, false, D, D_STRIDE>(
-            dO_ptr + start_q * D, sdO,
-            nullptr, nullptr,
-            valid_q_rows, tid);
+                // ==================================================================================
+                // Load:     Q tile from global to sQ(reuse) shared memory
+                // Layout:   Q: global[row: BLOCK_N, D] -> shared[row: BLOCK_N, D_STRIDE]
+                // Template: DUAL_LOAD=false, SRC_STRIDE=D, DST_STRIDE=D_STRIDE
+                // ==================================================================================
+                WMMA_GEMM_LOAD_TILE<Config, false, D, D_STRIDE>(
+                q_ptr + start_q * D, sQ,
+                nullptr, nullptr,
+                valid_q_rows, tid);
 
-            __syncthreads();
+                __syncthreads();
 
-            // ==================================================================================
-            // Compute:  row_dot = sum(O ⊙ dO) [dK/dV backward pass]
-            // Layout:   O[global: valid_q_rows, D] (pre-offset = start_q*D), dO[shared: valid_q_rows, D_STRIDE] -> sRowDot[shared]
-            // Template: TYPE=rowdot_dKV (LSE_OFFSET=1), GLOBAL_STRIDE=D, SMEM_STRIDE=D_STRIDE, FULL_ROWS=BLOCK_Y
-            // Note:     o_ptr must be pre-offset by caller (o_ptr + start_q*D), lse_ptr loaded with offset
-            // ==================================================================================
-            WMMA_GEMM_DOT_PRODUCT<Config, GemmType::rowdot_dKV, D, D_STRIDE>(
-            o_ptr + start_q * D, sdO,
-            lse_ptr, sLse, sRowDot,
-            valid_q_rows, start_q, tid);
+                // ==================================================================================
+                // Compute:  S = Q @ K^T
+                // Layout:   Q[row: BLOCK_N, D], K[col: BLOCK_M, D] -> S[row: BLOCK_N, col: BLOCK_M]
+                // Template: BLOCK_X=BLOCK_N, BLOCK_Y=BLOCK_M
+                // ==================================================================================
+                WMMA_GEMM_SCORES<Config, GemmType::sQ_KT, D, IS_CAUSAL, BLOCK_N, BLOCK_M, D_STRIDE, M_STRIDE>(
+                sQ, sK, sS,
+                valid_q_rows, valid_kv_rows,
+                start_q,      start_kv,
+                softmax_scale,
+                warp_id,      lane_id);
 
-            __syncthreads();
+                __syncthreads();
 
-            // ==================================================================================
-            // Compute:  dOV = dO @ V^T
-            // Layout:   dO[row: BLOCK_N, D], V[col: BLOCK_M, D] -> dOV[row: BLOCK_N, col: BLOCK_M]
-            // Template: BLOCK_X=BLOCK_N, BLOCK_Y=BLOCK_M
-            // ==================================================================================
-            WMMA_GEMM_SCORES<Config, GemmType::dOV_dOVT, D, IS_CAUSAL, BLOCK_N, BLOCK_M, D_STRIDE, M_STRIDE>(
-            sdO, sV, sdOV,
-            valid_q_rows, valid_kv_rows,
-            0, 0, 1.0f,
-            warp_id, lane_id);
+                // ==================================================================================
+                // Load:     dO tile from global to sdO(reuse) shared memory
+                // Layout:   dO global[row: BLOCK_N, D] -> shared[row: BLOCK_N, D_STRIDE]
+                // Template: DUAL_LOAD=false, SRC_STRIDE=D, DST_STRIDE=D_STRIDE
+                // ==================================================================================
+                WMMA_GEMM_LOAD_TILE<Config, false, D, D_STRIDE>(
+                dO_ptr + start_q * D, sdO,
+                nullptr, nullptr,
+                valid_q_rows, tid);
 
-            __syncthreads();
+                __syncthreads();
 
-            // ==================================================================================
-            // Compute:  P = exp(S - lse), dS = P * (dOV - row_dot) * scale
-            // Layout:   S[row: BLOCK_N, BLOCK_M], dOV[row: BLOCK_N, BLOCK_M],
-            //           LSE[row: BLOCK_N], row_dot[row: BLOCK_N] -> P[row: BLOCK_N, BLOCK_M], dS[row: BLOCK_N, BLOCK_M]
-            // Template: LDS_STRIDE=M_STRIDE, LDO_STRIDE=BLOCK_M, TILE_X=BLOCK_N, TILE_Y=BLOCK_M
-            // ==================================================================================
-            WMMA_GEMM_SOFTMAX_GRADIENT<Config, GemmType::compute_P_dS, M_STRIDE, BLOCK_M, BLOCK_N, BLOCK_M>(
-            sS, sdOV, sLse, sRowDot,
-            sP, sdS,
-            valid_q_rows, valid_kv_rows,
-            softmax_scale, tid);
+                // ==================================================================================
+                // Compute:  row_dot = sum(O ⊙ dO) [dK/dV backward pass]
+                // Layout:   O[global: valid_q_rows, D] (pre-offset = start_q*D), dO[shared: valid_q_rows, D_STRIDE] -> sRowDot[shared]
+                // Template: TYPE=rowdot_dKV (LSE_OFFSET=1), GLOBAL_STRIDE=D, SMEM_STRIDE=D_STRIDE, FULL_ROWS=BLOCK_Y
+                // Note:     o_ptr must be pre-offset by caller (o_ptr + start_q*D), lse_ptr loaded with offset
+                // ==================================================================================
+                WMMA_GEMM_DOT_PRODUCT<Config, GemmType::rowdot_dKV, D, D_STRIDE>(
+                o_ptr + start_q * D, sdO,
+                lse_ptr, sLse, sRowDot,
+                valid_q_rows, start_q, tid);
 
-            __syncthreads();
+                __syncthreads();
 
-            // ==================================================================================
-            // Compute:  dV += P^T @ dO
-            // Layout:   P^T[col: BLOCK_M, BLOCK_N], dO[row: BLOCK_N, D] -> dV[row: BLOCK_M, D]
-            // Template: BLOCK_X=BLOCK_M, BLOCK_Y=BLOCK_N
-            // ==================================================================================
-            WMMA_GEMM_GRADIENTS<Config, GemmType::dV_PTdO, D, BLOCK_M, BLOCK_N, BLOCK_M, D_STRIDE>(
-            sP, sdO, sdV,
-            valid_kv_rows, valid_q_rows,
-            warp_id,       lane_id);
+                // ==================================================================================
+                // Compute:  dOV = dO @ V^T
+                // Layout:   dO[row: BLOCK_N, D], V[col: BLOCK_M, D] -> dOV[row: BLOCK_N, col: BLOCK_M]
+                // Template: BLOCK_X=BLOCK_N, BLOCK_Y=BLOCK_M
+                // ==================================================================================
+                WMMA_GEMM_SCORES<Config, GemmType::dOV_dOVT, D, IS_CAUSAL, BLOCK_N, BLOCK_M, D_STRIDE, M_STRIDE>(
+                sdO, sV, sdOV,
+                valid_q_rows, valid_kv_rows,
+                0, 0, 1.0f,
+                warp_id, lane_id);
 
-            __syncthreads();
+                __syncthreads();
 
-            // ==================================================================================
-            // Load:     Q tile from global to sQ(reuse) shared memory
-            // Layout:   Q: global[row: BLOCK_N, D] -> shared[row: BLOCK_N, D_STRIDE]
-            // Template: DUAL_LOAD=false, SRC_STRIDE=D, DST_STRIDE=D_STRIDE
-            // ==================================================================================
-            WMMA_GEMM_LOAD_TILE<Config, false, D, D_STRIDE>(
-            q_ptr + start_q * D, sQ,
-            nullptr, nullptr,
-            valid_q_rows, tid);
+                // ==================================================================================
+                // Compute:  P = exp(S - lse), dS = P * (dOV - row_dot) * scale
+                // Layout:   S[row: BLOCK_N, BLOCK_M], dOV[row: BLOCK_N, BLOCK_M],
+                //           LSE[row: BLOCK_N], row_dot[row: BLOCK_N] -> P[row: BLOCK_N, BLOCK_M], dS[row: BLOCK_N, BLOCK_M]
+                // Template: LDS_STRIDE=M_STRIDE, LDO_STRIDE=BLOCK_M, TILE_X=BLOCK_N, TILE_Y=BLOCK_M
+                // ==================================================================================
+                WMMA_GEMM_SOFTMAX_GRADIENT<Config, GemmType::compute_P_dS, M_STRIDE, BLOCK_M, BLOCK_N, BLOCK_M>(
+                sS, sdOV, sLse, sRowDot,
+                sP, sdS,
+                valid_q_rows, valid_kv_rows,
+                softmax_scale, tid);
 
-            __syncthreads();
+                __syncthreads();
 
-            // ==================================================================================
-            // Compute:  dK += dS^T @ Q
-            // Layout:   dS^T[col: BLOCK_M, BLOCK_N], Q[row: BLOCK_N, D] -> dK[row: BLOCK_M, D]
-            // Template: BLOCK_X=BLOCK_M, BLOCK_Y=BLOCK_N
-            // ==================================================================================
-            WMMA_GEMM_GRADIENTS<Config, GemmType::dK_dSTQ, D, BLOCK_M, BLOCK_N, BLOCK_M, D_STRIDE>(
-            sdS, sQ, sdK,
-            valid_kv_rows, valid_q_rows,
-            warp_id,       lane_id);
+                // ==================================================================================
+                // Compute:  dV += P^T @ dO
+                // Layout:   P^T[col: BLOCK_M, BLOCK_N], dO[row: BLOCK_N, D] -> dV[row: BLOCK_M, D]
+                // Template: BLOCK_X=BLOCK_M, BLOCK_Y=BLOCK_N
+                // ==================================================================================
+                WMMA_GEMM_GRADIENTS<Config, GemmType::dV_PTdO, D, BLOCK_M, BLOCK_N, BLOCK_M, D_STRIDE>(
+                sP, sdO, sdV,
+                valid_kv_rows, valid_q_rows,
+                warp_id,       lane_id);
 
-            __syncthreads();
+                __syncthreads();
 
-        } // END MAIN LOOP
+                // ==================================================================================
+                // Load:     Q tile from global to sQ(reuse) shared memory
+                // Layout:   Q: global[row: BLOCK_N, D] -> shared[row: BLOCK_N, D_STRIDE]
+                // Template: DUAL_LOAD=false, SRC_STRIDE=D, DST_STRIDE=D_STRIDE
+                // ==================================================================================
+                WMMA_GEMM_LOAD_TILE<Config, false, D, D_STRIDE>(
+                q_ptr + start_q * D, sQ,
+                nullptr, nullptr,
+                valid_q_rows, tid);
+
+                __syncthreads();
+
+                // ==================================================================================
+                // Compute:  dK += dS^T @ Q
+                // Layout:   dS^T[col: BLOCK_M, BLOCK_N], Q[row: BLOCK_N, D] -> dK[row: BLOCK_M, D]
+                // Template: BLOCK_X=BLOCK_M, BLOCK_Y=BLOCK_N
+                // ==================================================================================
+                WMMA_GEMM_GRADIENTS<Config, GemmType::dK_dSTQ, D, BLOCK_M, BLOCK_N, BLOCK_M, D_STRIDE>(
+                sdS, sQ, sdK,
+                valid_kv_rows, valid_q_rows,
+                warp_id,       lane_id);
+
+                __syncthreads();
+            } // END Q-TILES LOOP
+        } // END Q-HEADS LOOP
 
         // ==================================================================================
         // Compute:  Store gradients dK + dV without normalization
@@ -482,16 +492,17 @@ void launcher_flash_attention_backward(
 ) {
     using Config = KernelConfig<D>;
 
-    const int B = Q.size(0);
-    const int H = Q.size(1);
-    const int M = Q.size(2);
-    const int N = K.size(2);
+    const int B   = Q.size(0);
+    const int H_Q = Q.size(1);
+    const int H_K = K.size(1);
+    const int M   = Q.size(2);
+    const int N   = K.size(2);
 
     const int grid_dq  = (M + Config::DQ::BLOCK_M - 1) /  Config::DQ::BLOCK_M;
     const int grid_dkv = (N + Config::DKV::BLOCK_M - 1) / Config::DKV::BLOCK_M;
-
     const int grid_max = (grid_dq > grid_dkv) ? grid_dq : grid_dkv;
-    const dim3 grid(grid_max, 2, B * H);
+
+    const dim3 grid(grid_max, 2, B * H_Q);
     const dim3 block(Config::THREADS_PER_BLOCK);
     const size_t smem = Config::TOTAL_SMEM;
 
@@ -514,7 +525,7 @@ void launcher_flash_attention_backward(
             reinterpret_cast<__half*>(dQ.data_ptr()),
             reinterpret_cast<__half*>(dK.data_ptr()),
             reinterpret_cast<__half*>(dV.data_ptr()),
-            B, H, M, N, grid_dq, grid_dkv, softmax_scale
+            B, H_Q, H_K, M, N, grid_dq, grid_dkv, softmax_scale
         );
     } else {
         flash_attention_backward_kernel<D, false><<<grid, block, smem, stream>>>(
@@ -527,7 +538,7 @@ void launcher_flash_attention_backward(
             reinterpret_cast<__half*>(dQ.data_ptr()),
             reinterpret_cast<__half*>(dK.data_ptr()),
             reinterpret_cast<__half*>(dV.data_ptr()),
-            B, H, M, N, grid_dq, grid_dkv, softmax_scale
+            B, H_Q, H_K, M, N, grid_dq, grid_dkv, softmax_scale
         );
     }
 }
@@ -575,9 +586,11 @@ std::vector<at::Tensor> flash_attention_backward(
     TORCH_CHECK(softmax_lse.dtype() == torch::kFloat32, "softmax_lse must be fp32");
 
     const auto sizes = q.sizes();
-    const int B = sizes[0], H = sizes[1], M = sizes[2], D = sizes[3];
-    const int N = k.size(2);
+    const int B      = sizes[0], H_Q = sizes[1], M = sizes[2], D = sizes[3];
+    const int H_K    = k.size(1);
+    const int N      = k.size(2);
     TORCH_CHECK(D <= 256 && D % 8 == 0 && D % 2 == 0, "D must be even, <=256, multiple of 8");
+    TORCH_CHECK(H_Q % H_K == 0, "H_Q must be divisible by H_K for GQA/MQA");
 
     // Internal tensors
     at::Tensor dq_fp16 = dq_.has_value() ? dq_.value() : torch::empty_like(q);
@@ -588,7 +601,7 @@ std::vector<at::Tensor> flash_attention_backward(
     TORCH_CHECK(dk_fp16.dtype() == torch::kFloat16, "dk must be fp16");
     TORCH_CHECK(dv_fp16.dtype() == torch::kFloat16, "dv must be fp16");
 
-    auto dsoftmax_sum = torch::empty({B, H, M}, torch::dtype(torch::kFloat32).device(q.device()));
+    auto dsoftmax_sum = torch::empty({B, H_Q, M}, torch::dtype(torch::kFloat32).device(q.device()));
 
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     auto props  = at::cuda::getCurrentDeviceProperties();
@@ -596,21 +609,11 @@ std::vector<at::Tensor> flash_attention_backward(
     TORCH_CHECK(sm70, "Kernel supports only Volta GPUs.");
 
     switch (D) {
-        case 16:
-            launcher_flash_attention_backward<16>(q, k, v, out, const_cast<at::Tensor&>(dout),  softmax_lse, dq_fp16, dk_fp16, dv_fp16, softmax_scale, is_causal, stream);
-            break;
-        case 32:
-            launcher_flash_attention_backward<32>(q, k, v, out, const_cast<at::Tensor&>(dout),  softmax_lse, dq_fp16, dk_fp16, dv_fp16, softmax_scale, is_causal, stream);
-            break;
-        case 64:
-            launcher_flash_attention_backward<64>(q, k, v, out, const_cast<at::Tensor&>(dout),  softmax_lse, dq_fp16, dk_fp16, dv_fp16, softmax_scale, is_causal, stream);
-            break;
-        case 128:
-            launcher_flash_attention_backward<128>(q, k, v, out, const_cast<at::Tensor&>(dout), softmax_lse, dq_fp16, dk_fp16, dv_fp16, softmax_scale, is_causal, stream);
-            break;
-        case 256:
-            launcher_flash_attention_backward<256>(q, k, v, out, const_cast<at::Tensor&>(dout), softmax_lse, dq_fp16, dk_fp16, dv_fp16, softmax_scale, is_causal, stream);
-            break;
+        case 16:  launcher_flash_attention_backward<16>(q, k, v, out, const_cast<at::Tensor&>(dout), softmax_lse, dq_fp16, dk_fp16, dv_fp16, softmax_scale, is_causal, stream);  break;
+        case 32:  launcher_flash_attention_backward<32>(q, k, v, out, const_cast<at::Tensor&>(dout), softmax_lse, dq_fp16, dk_fp16, dv_fp16, softmax_scale, is_causal, stream);  break;
+        case 64:  launcher_flash_attention_backward<64>(q, k, v, out, const_cast<at::Tensor&>(dout), softmax_lse, dq_fp16, dk_fp16, dv_fp16, softmax_scale, is_causal, stream);  break;
+        case 128: launcher_flash_attention_backward<128>(q, k, v, out, const_cast<at::Tensor&>(dout), softmax_lse, dq_fp16, dk_fp16, dv_fp16, softmax_scale, is_causal, stream); break;
+        case 256: launcher_flash_attention_backward<256>(q, k, v, out, const_cast<at::Tensor&>(dout), softmax_lse, dq_fp16, dk_fp16, dv_fp16, softmax_scale, is_causal, stream); break;
         default: TORCH_CHECK(false, "Unsupported D: ", D);
     }
     return {dq_fp16, dk_fp16, dv_fp16, dsoftmax_sum};

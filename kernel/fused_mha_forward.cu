@@ -27,7 +27,8 @@ flash_attention_forward_kernel(
           __half* __restrict__ Out,
            float* __restrict__ softmax_lse,
     const int B,
-    const int H,
+    const int H_Q,
+    const int H_K,
     const int M,
     const int N,
     const float softmax_scale
@@ -38,9 +39,8 @@ flash_attention_forward_kernel(
     constexpr int D_STRIDE  = Config::DO::D_STRIDE;
     constexpr int N_STRIDE  = Config::DO::N_STRIDE;
 
-    // head index (batch * num_heads + head)
     const int batch_head_id = blockIdx.z;
-    if (batch_head_id >= B * H) return;
+    if (batch_head_id >= B * H_Q) return;
 
     const int block_idx = blockIdx.x;
     const int start_q = block_idx * BLOCK_M;
@@ -71,11 +71,13 @@ flash_attention_forward_kernel(
     const int lane_id = tid & 31;
 
     // ==================================================================================
-    // Layout: [B, H, M/N, D] linear offset: batch_head_id * (M/N) * D + start_* * D
+    // Layout:
+    //   Q/Out/LSE: [B, H_Q, M, D] offset follows batch_head_id (Q-head space)
+    //   K/V:       [B, H_K, N, D] mapped via batch_head_id % H_Q / (H_Q / H_K)
     // ==================================================================================
     const __half* __restrict__ q_ptr           = Q +           (size_t)batch_head_id * M * D + start_q * D;
-    const __half* __restrict__ k_ptr           = K +           (size_t)batch_head_id * N * D;
-    const __half* __restrict__ v_ptr           = V +           (size_t)batch_head_id * N * D;
+    const __half* __restrict__ k_ptr           = K +           (size_t)((batch_head_id / H_Q) * H_K + (batch_head_id % H_Q) / (H_Q / H_K)) * N * D;
+    const __half* __restrict__ v_ptr           = V +           (size_t)((batch_head_id / H_Q) * H_K + (batch_head_id % H_Q) / (H_Q / H_K)) * N * D;
           __half* __restrict__ out_ptr         = Out +         (size_t)batch_head_id * M * D + start_q * D;
            float* __restrict__ softmax_lse_ptr = softmax_lse + (size_t)batch_head_id * M + start_q;
 
@@ -224,13 +226,14 @@ void launcher_flash_attention_forward(
 ) {
     using Config = KernelConfig<D>;
 
-    const int B = Q.size(0);
-    const int H = Q.size(1);
-    const int M = Q.size(2);
-    const int N = K.size(2);
+    const int B   = Q.size(0);
+    const int H_Q = Q.size(1);
+    const int H_K = K.size(1);
+    const int M   = Q.size(2);
+    const int N   = K.size(2);
 
     const int grid_x = (M + Config::DO::BLOCK_M - 1) / Config::DO::BLOCK_M;
-    const dim3 grid(grid_x, 1, B * H);
+    const dim3 grid(grid_x, 1, B * H_Q);
     const dim3 block(Config::THREADS_PER_BLOCK);
     const size_t smem = Config::TOTAL_SMEM;
 
@@ -249,7 +252,7 @@ void launcher_flash_attention_forward(
             reinterpret_cast<const __half*>(V.data_ptr()),
             reinterpret_cast<__half*>(Out.data_ptr()),
             softmax_lse.data_ptr<float>(),
-            B, H, M, N, softmax_scale
+            B, H_Q, H_K, M, N, softmax_scale
         );
     } else {
         flash_attention_forward_kernel<D, false><<<grid, block, smem, stream>>>(
@@ -258,7 +261,7 @@ void launcher_flash_attention_forward(
             reinterpret_cast<const __half*>(V.data_ptr()),
             reinterpret_cast<__half*>(Out.data_ptr()),
             softmax_lse.data_ptr<float>(),
-            B, H, M, N, softmax_scale
+            B, H_Q, H_K, M, N, softmax_scale
         );
     }
 }
@@ -298,14 +301,16 @@ std::vector<at::Tensor> flash_attention_forward(
     TORCH_CHECK(q.stride(-1) == 1 && k.stride(-1) == 1 && v.stride(-1) == 1, "Last dim must be contiguous");
 
     const auto sizes = q.sizes();
-    const int B = sizes[0], H = sizes[1], M = sizes[2], D = sizes[3];
-    const int N = k.size(2);
+    const int B      = sizes[0], H_Q = sizes[1], M = sizes[2], D = sizes[3];
+    const int H_K    = k.size(1);
+    const int N      = k.size(2);
     TORCH_CHECK(D <= 256 && D % 8 == 0 && D % 2 == 0, "D must be even, <=256, multiple of 8");
+    TORCH_CHECK(H_Q % H_K == 0, "H_Q must be divisible by H_K for GQA/MQA");
 
     // Out tensors
     at::Tensor out_fp16 = out_.has_value() ? out_.value() : torch::empty_like(q);
     TORCH_CHECK(out_fp16.dtype() == torch::kFloat16, "out must be fp16");
-    auto softmax_lse = torch::empty({B, H, M}, torch::dtype(torch::kFloat32).device(q.device()));
+    auto softmax_lse = torch::empty({B, H_Q, M}, torch::dtype(torch::kFloat32).device(q.device()));
     TORCH_CHECK(softmax_lse.dtype() == torch::kFloat32, "softmax_lse must be fp32");
 
     auto stream = at::cuda::getCurrentCUDAStream().stream();
