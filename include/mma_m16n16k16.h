@@ -1,5 +1,5 @@
 // ======================================================================================
-// * Copyright (c) 2025, D.Skryabin / tg @ai_bond007 SPDX-License: BSD-3-Clause
+// * Copyright (c) 2026, D.Skryabin / tg @ai_bond007 SPDX-License: BSD-3-Clause
 // ======================================================================================
 // * Volta WMMA (sm_70) production wrapper for FlashAttention-2.
 // * Replaces nvcuda::wmma with explicit PTX for full control over
@@ -12,10 +12,6 @@
 // * 5. ALIGNMENT:       Base pointers require 16B alignment. ldm in elements.
 // * 6. THREAD MAPPING:  Hardware-fixed distribution. Do not shuffle fragments.
 // ======================================================================================
-
-#ifndef FUSED_MMA_M16N16K16_H
-#define FUSED_MMA_M16N16K16_H
-
 #pragma once
 
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ != 700)
@@ -28,9 +24,9 @@
 namespace volta {
 namespace wmma {
 
-// ============================================================================
+// ======================================================================================
 // TYPE TAGS
-// ============================================================================
+// ======================================================================================
 struct row_major {};
 struct col_major {};
 struct matrix_a {};
@@ -42,9 +38,9 @@ enum layout_t {
     mem_col_major
 };
 
-// ============================================================================
+// ======================================================================================
 // FRAGMENT DECLARATIONS
-// ============================================================================
+// ======================================================================================
 template <typename Use, int M, int N, int K, typename T, typename Layout = void>
 struct fragment;
 
@@ -54,14 +50,14 @@ template <> struct fragment<matrix_b, 16, 16, 16, half, row_major> { uint32_t x[
 template <> struct fragment<matrix_b, 16, 16, 16, half, col_major> { uint32_t x[8]; static constexpr int num_elements = 16; };
 template <> struct fragment<accumulator, 16, 16, 16, float>        { float x[8];    static constexpr int num_elements = 8;  };
 
-// ============================================================================
+// ======================================================================================
 // FILL: accumulator m16n16k16
-// ============================================================================
+// ======================================================================================
 // Data per lane:   8 floats (full accumulator fragment)
 // Lane mapping:    Uniform broadcast across all 32 lanes
 // Replication:     N/A (scalar initialization)
 // Memory access:   N/A (register-only operation)
-// ============================================================================
+// ======================================================================================
 template <int M, int N, int K>
 __device__ __forceinline__ void fill_fragment(fragment<accumulator, M, N, K, float>& frag, float value) {
     asm volatile(
@@ -81,15 +77,15 @@ __device__ __forceinline__ void fill_fragment(fragment<accumulator, M, N, K, flo
     );
 }
 
-// ============================================================================
+// ======================================================================================
 // LOAD: matrix_a m16n16k16 (ROW MAJOR)
-// ============================================================================
+// ======================================================================================
 // Data per lane:   1 complete row (16 contiguous halves = 8 uint32_t)
 // Lane mapping:    r_base = (lid & 3) + ((lid >> 4) & 1) * 4 + ((lid >> 2) & 1) * 8
 // Replication:     Bit 3 ignored L0-7 & L16-23 duplicate rows 0-7.
 //                  L8-15 & L24-31 duplicate rows 8-15. (Hardware 2x crossbar routing)
 // Memory access:   Contiguous row storage 2x ld.shared.v4.u32 (128-bit loads).
-// ============================================================================
+// ======================================================================================
 __device__ __forceinline__ void load_matrix_sync(
     fragment<matrix_a, 16, 16, 16, half, row_major>& frag,
     const half* __restrict__ smem_ptr, unsigned ldm) {
@@ -121,14 +117,14 @@ __device__ __forceinline__ void load_matrix_sync(
     );
 }
 
-// ============================================================================
+// ======================================================================================
 // LOAD: matrix_a m16n16k16 (COL MAJOR)
-// ============================================================================
+// ======================================================================================
 // Data per lane:   4 vertical chunks of 4 halves (16 halves total)
 // Lane mapping:    c_base = lid & 3 r_base = ((lid >> 2) & 1) * 8 + ((lid >> 4) & 1) * 4
 // Replication:     Bit 3 ignored L0==L8, L4==L12, etc. (2x crossbar replication)
 // Memory access:   Strided columns base + k*(4*ldm). Vectorized via ld.shared.v2.u32.
-// ============================================================================
+// ======================================================================================
 __device__ __forceinline__ void load_matrix_sync(
     fragment<matrix_a, 16, 16, 16, half, col_major>& frag,
     const half* __restrict__ smem_ptr, unsigned ldm) {
@@ -170,14 +166,14 @@ __device__ __forceinline__ void load_matrix_sync(
     );
 }
 
-// ============================================================================
+// ======================================================================================
 // LOAD: matrix_b m16n16k16 (ROW MAJOR)
-// ============================================================================
+// ======================================================================================
 // Data per lane:   4 contiguous chunks of 4 halves (16 halves total)
 // Lane mapping:    r_base = lid & 3 c_base = ((lid >> 3) & 1) * 8 + ((lid >> 4) & 1) * 4 (bits 3 & 4 swapped)
 // Replication:     Bit 2 ignored L0==L4, L8==L12, etc. (2x crossbar replication)
 // Memory access:   Strided rows base + k*(4*ldm). Vectorized via ld.shared.v2.u32.
-// ============================================================================
+// ======================================================================================
 __device__ __forceinline__ void load_matrix_sync(
     fragment<matrix_b, 16, 16, 16, half, row_major>& frag,
     const half* __restrict__ smem_ptr, unsigned ldm) {
@@ -220,15 +216,15 @@ __device__ __forceinline__ void load_matrix_sync(
     );
 }
 
-// ============================================================================
+// ======================================================================================
 // LOAD: matrix_b m16n16k16 (COL MAJOR)
-// ============================================================================
+// ======================================================================================
 // Data per lane:   1 complete column (16 contiguous halves = 8 uint32_t)
 // Lane mapping:    g = lid >> 2 idx = ((g >> 2) & 1) | (g & 2) c_base = (lid & 3) + (idx << 2)
 // Replication:     L0-3 & L4-7 duplicate cols 0-3. Pattern repeats per column group.
 //                  (Hardware 2x crossbar replication via lane grouping)
 // Memory access:   Contiguous column storage 2x ld.shared.v4.u32 (128-bit loads).
-// ============================================================================
+// ======================================================================================
 __device__ __forceinline__ void load_matrix_sync(
     fragment<matrix_b, 16, 16, 16, half, col_major>& frag,
     const half* __restrict__ smem_ptr, unsigned ldm) {
@@ -267,15 +263,15 @@ __device__ __forceinline__ void load_matrix_sync(
     );
 }
 
-// ============================================================================
+// ======================================================================================
 // LOAD: accumulator m16n16k16 (ROW & COL MAJOR)
-// ============================================================================
+// ======================================================================================
 // Data per lane:   8 floats total, distributed as 4 contiguous pairs.
 // Lane mapping:    r_base = ((lid>>2)&1)*8 + ((lid>>4)&1)*4 + (lid&1) c_base = ((lid>>3)&1)*8 + ((lid>>1)&1)*2
 // Replication:     Hardware 2x crossbar duplication via ignored lane bits.
 // Memory access:   ROW: Pairs row-contiguous. Stride=2*ldm*4B. Optimal: 4x v2.
 //                  COL: Pairs col-contiguous. Elements strided by ldm. Optimal: 8x scalar.
-// ============================================================================
+// ======================================================================================
 __device__ __forceinline__ void load_matrix_sync(
     fragment<accumulator, 16, 16, 16, float>& frag,
     const float* __restrict__ smem_ptr, unsigned ldm, layout_t layout) {
@@ -369,15 +365,15 @@ __device__ __forceinline__ void load_matrix_sync(
     }
 }
 
-// ============================================================================
+// ======================================================================================
 // STORE: accumulator m16n16k16 (ROW & COL MAJOR)
-// ============================================================================
+// ======================================================================================
 // Data per lane:   8 floats total, distributed as 4 contiguous pairs.
 // Lane mapping:    r_base = ((lid>>2)&1)*8 + ((lid>>4)&1)*4 + (lid&1) c_base = ((lid>>3)&1)*8 + ((lid>>1)&1)*2
 // Replication:     Hardware 2x crossbar duplication via ignored lane bits.
 // Memory access:   ROW: Pairs row-contiguous. Stride=2*ldm*4B. Optimal: 4x v2.
 //                  COL: Pairs col-contiguous. Elements strided by ldm. Optimal: 8x scalar.
-// ============================================================================
+// ======================================================================================
 __device__ __forceinline__ void store_matrix_sync(
     float* __restrict__ smem_ptr,
     const fragment<accumulator, 16, 16, 16, float>& frag,
@@ -475,16 +471,16 @@ __device__ __forceinline__ void store_matrix_sync(
     }
 }
 
-// ============================================================================
+// ======================================================================================
 // MMA_SYNC: m16n16k16 (ALL LAYOUTS)
-// ============================================================================
+// ======================================================================================
 // Data per lane:   D = C + A @ B (8 floats accumulated in-place)
 // Lane mapping:    Hardware-fixed crossbar routing. Fragments must match load layout.
 // Replication:     Handled implicitly by TC crossbar. No manual shuffling allowed.
 // Memory access:   N/A (register-only operation)
 // Optimization:    Uses f32 accumulation for attention numerical stability.
 //                  Constraint indices strictly match HMMA.884 operand order.
-// ============================================================================
+// ======================================================================================
 #define WMMA_MMA_F32(M, N, K, ALAY, BLAY) \
 __device__ __forceinline__ void mma_sync( \
     fragment<accumulator, M, N, K, float>& d, \
@@ -517,5 +513,3 @@ WMMA_MMA_F32(16, 16, 16, col, row)
 
 } // namespace wmma
 } // namespace volta
-
-#endif // FUSED_MMA_M16N16K16_H

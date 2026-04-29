@@ -1,7 +1,6 @@
 // ======================================================================================
-// * Copyright (c) 2025, D.Skryabin / tg @ai_bond007 SPDX-License: BSD-3-Clause
+// * Copyright (c) 2026, D.Skryabin / tg @ai_bond007 SPDX-License: BSD-3-Clause
 // ======================================================================================
-
 #pragma once
 
 // ======================================================================================
@@ -17,7 +16,7 @@
 #define BLOCK_N_64  128
 
 #define BLOCK_M_128 32
-#define BLOCK_N_128 176
+#define BLOCK_N_128 160
 
 #define BLOCK_M_256 32
 #define BLOCK_N_256 64
@@ -33,9 +32,9 @@ struct KernelConfig {
         static constexpr int BLOCK_M = (D == 16) ? BLOCK_M_16 : (D == 32) ? BLOCK_M_32 : (D == 64) ? BLOCK_M_64 : (D == 128) ? BLOCK_M_128 : BLOCK_M_256;
         static constexpr int BLOCK_N = (D == 16) ? BLOCK_N_16 : (D == 32) ? BLOCK_N_32 : (D == 64) ? BLOCK_N_64 : (D == 128) ? BLOCK_N_128 : BLOCK_N_256;
         static constexpr int THREADS_PER_ROW   = (WARPS * MAX_THREADS_PER_WARP) / BLOCK_M;
-        static constexpr int PAD               = (8 - (D % 32) + 32) % 32;
-        static constexpr int D_STRIDE          = D + PAD + (((D + PAD) % 64 == 0) ? 1 : 0);
-        static constexpr int N_STRIDE          = BLOCK_N + PAD + (((BLOCK_N + PAD) % 32 == 0) ? 1 : 0);
+        static constexpr int PAD               = (D >= 64) ? 16 : 8;
+        static constexpr int D_STRIDE          = ((D + PAD) % 8 == 0 ? (D + PAD) : (D + PAD) + (8 - (D + PAD) % 8));
+        static constexpr int N_STRIDE          = ((BLOCK_N + PAD) % 8 == 0 ? (BLOCK_N + PAD) : (BLOCK_N + PAD) + (8 - (BLOCK_N + PAD) % 8));
     };
 
     static constexpr int WARPS_PER_BLOCK       = WARPS;

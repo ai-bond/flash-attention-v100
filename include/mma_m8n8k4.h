@@ -1,5 +1,5 @@
 // ======================================================================================
-// * Copyright (c) 2025, D.Skryabin / tg @ai_bond007 SPDX-License: BSD-3-Clause
+// * Copyright (c) 2026, D.Skryabin / tg @ai_bond007 SPDX-License: BSD-3-Clause
 // ======================================================================================
 // * Volta HMMA m8n8k4 wrapper for FlashAttention-2 forward and backward passes.
 // *
@@ -32,10 +32,6 @@
 // *    Uses f32 accumulation (.f32.f16.f16.f32) for numerical stability in attention.
 // *    The f16 accumulation variant is unsupported for this shape and precision profile.
 // ======================================================================================
-
-#ifndef FUSED_MMA_M8N8K4_H
-#define FUSED_MMA_M8N8K4_H
-
 #pragma once
 
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ != 700)
@@ -426,7 +422,7 @@ __device__ __forceinline__ void store_matrix_sync(
             "add.u32 addr, addr, %8;\n\t"
             "st.shared.v2.f32 [addr], {%6, %7};\n\t"
             "}"
-            : 
+            :
             : "f"(frag.x[0]), "f"(frag.x[1]), "f"(frag.x[2]), "f"(frag.x[3]),
               "f"(frag.x[4]), "f"(frag.x[5]), "f"(frag.x[6]), "f"(frag.x[7]),
               "r"(smem_addr), "r"(ldm)
@@ -458,7 +454,7 @@ __device__ __forceinline__ void store_matrix_sync(
             "add.u32 r, r0, 2; add.u32 c, c0, 5;\n\t"
             "mad.lo.u32 addr, c, %9, r; shl.b32 addr, addr, 2; add.u32 addr, addr, %8; st.shared.f32 [addr], %7;\n\t"
             "}"
-            : 
+            :
             : "f"(frag.x[0]), "f"(frag.x[1]), "f"(frag.x[2]), "f"(frag.x[3]),
               "f"(frag.x[4]), "f"(frag.x[5]), "f"(frag.x[6]), "f"(frag.x[7]),
               "r"(smem_addr), "r"(ldm)
@@ -507,5 +503,3 @@ WMMA_MMA_F32_F32(row, row)
 
 } // namespace wmma
 } // namespace volta
-
-#endif // FUSED_MMA_M8N8K4_H
