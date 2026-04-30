@@ -112,7 +112,8 @@ __device__ __forceinline__ void WMMA_GEMM_SCORES(
                     float val = acc_frag.x[i] * SOFTMAX_SCALE;
                     if (!is_masked) {
                         if constexpr (IS_ALIBI) {
-                            val = __fmaf_rn(ALIBI_SLOPE, static_cast<float>(global_m - (global_n - SEQLEN)), val);
+                            // A bias of (-alibi_slope * |i + seqlen_k - seqlen_q - j|)
+                            val = __fmaf_rn(-ALIBI_SLOPE, fabsf(static_cast<float>(global_m - (global_n - SEQLEN))), val);
                         }
                         if constexpr (IS_SOFTCAP) {
                             val = __fmul_rn(SOFTCAP, __tanhf(__fmul_rn(val, softcap_rcp)));
