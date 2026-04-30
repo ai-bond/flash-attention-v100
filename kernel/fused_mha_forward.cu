@@ -62,6 +62,7 @@ flash_attention_forward_kernel(
 
     int num_kv_tiles = (N + BLOCK_N - 1) / BLOCK_N;
     const int valid_q_rows = min(BLOCK_M, M - start_q);
+    const int seqlen_offset = N - M;
 
     // ==================================================================================
     // Trim iteration count for causal attention: K/V blocks beyond Q position are skipped
@@ -69,7 +70,7 @@ flash_attention_forward_kernel(
     //           num_kv_tiles = min(original, ceil((max_key_pos + 1) / BLOCK_N))
     // ==================================================================================
     if constexpr (IS_CAUSAL) {
-        const int max_key_pos = start_q + valid_q_rows - 1;
+        const int max_key_pos = start_q + valid_q_rows - 1 + seqlen_offset;
         if (max_key_pos < 0) {
             num_kv_tiles = 0;
         } else {
@@ -141,7 +142,7 @@ flash_attention_forward_kernel(
         const int valid_kv_rows = min(BLOCK_N, N - start_kv);
 
         // Early skip per tile
-        if constexpr (IS_CAUSAL) { if (start_kv >= start_q + valid_q_rows) continue; }
+        if constexpr (IS_CAUSAL) { if (start_kv >= start_q + valid_q_rows + seqlen_offset) continue; }
 
         // ==================================================================================
         // Load:     K tile from global to sK(reuse) shared memory
@@ -164,6 +165,7 @@ flash_attention_forward_kernel(
         sQ, sK, sS,
         valid_q_rows,  valid_kv_rows,
         start_q,       start_kv,
+        seqlen_offset,
         softmax_scale, softcap, alibi_slope, window_left, window_right,
         warp_id,       lane_id);
 

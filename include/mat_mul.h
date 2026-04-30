@@ -27,7 +27,7 @@ __device__ __forceinline__ void WMMA_GEMM_SCORES(
            float* __restrict__ SMEM_C,
     int VALID_M,   int VALID_N,
     int GLOBAL_M,  int GLOBAL_N,
-    float SOFTMAX_SCALE,
+    int SEQLEN,    float SOFTMAX_SCALE,
     float SOFTCAP, float ALIBI_SLOPE,
     int WIN_L,     int WIN_R,
     int WARP_ID,   int LANE_ID
@@ -92,7 +92,7 @@ __device__ __forceinline__ void WMMA_GEMM_SCORES(
                     const int global_n = GLOBAL_N + tile_n + col;
                     const bool in_bounds = (global_m < GLOBAL_M + VALID_M) && (global_n < GLOBAL_N + VALID_N);
 
-                    acc_frag.x[i] = in_bounds ? ((global_n > global_m) ? NEG_INF : acc_frag.x[i] * SOFTMAX_SCALE) : NEG_INF;
+                    acc_frag.x[i] = in_bounds ? (((global_n - SEQLEN) > global_m) ? NEG_INF : acc_frag.x[i] * SOFTMAX_SCALE) : NEG_INF;
                 }
             } else {
                 const float softcap_rcp = IS_SOFTCAP ? (1.0f / SOFTCAP) : 0.0f;
@@ -103,16 +103,16 @@ __device__ __forceinline__ void WMMA_GEMM_SCORES(
                     const int global_m = GLOBAL_M + tile_m + row;
                     const int global_n = GLOBAL_N + tile_n + col;
                     const bool in_bounds = (global_m < GLOBAL_M + VALID_M) && (global_n < GLOBAL_N + VALID_N);
-                    bool is_masked = !in_bounds || (global_n > global_m);
+                    bool is_masked = !in_bounds || ((global_n - SEQLEN) > global_m);
 
                     if constexpr (IS_WINDOW) {
-                        is_masked = is_masked || (WIN_L >= 0 && global_n < global_m - WIN_L) || (WIN_R >= 0 && global_n > global_m + WIN_R);
+                        is_masked = is_masked || (WIN_L >= 0 && (global_n - SEQLEN) < global_m - WIN_L) || (WIN_R >= 0 && (global_n - SEQLEN) > global_m + WIN_R);
                     }
 
                     float val = acc_frag.x[i] * SOFTMAX_SCALE;
                     if (!is_masked) {
                         if constexpr (IS_ALIBI) {
-                            val = __fmaf_rn(ALIBI_SLOPE, static_cast<float>(global_m - global_n), val);
+                            val = __fmaf_rn(ALIBI_SLOPE, static_cast<float>(global_m - (global_n - SEQLEN)), val);
                         }
                         if constexpr (IS_SOFTCAP) {
                             val = __fmul_rn(SOFTCAP, __tanhf(__fmul_rn(val, softcap_rcp)));

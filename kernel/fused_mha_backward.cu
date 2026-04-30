@@ -74,6 +74,7 @@ flash_attention_backward_kernel(
 
         int num_kv_tiles = (N + BLOCK_N - 1)  / BLOCK_N;
         const int valid_q_rows  = min(BLOCK_M, M - start_q);
+        const int seqlen_offset = N - M;
 
         // ==================================================================================
         // Trim iteration count for causal attention: K/V blocks beyond Q position are skipped
@@ -81,7 +82,7 @@ flash_attention_backward_kernel(
         //           num_kv_tiles = min(original, ceil((max_key_pos + 1) / BLOCK_N))
         // ==================================================================================
         if constexpr (IS_CAUSAL) {
-            const int max_key_pos = start_q + valid_q_rows - 1;
+            const int max_key_pos = start_q + valid_q_rows - 1 + seqlen_offset;
             if (max_key_pos < 0) {
                num_kv_tiles = 0;
             } else {
@@ -163,7 +164,7 @@ flash_attention_backward_kernel(
             const int valid_kv_rows = min(BLOCK_N, N - start_kv);
 
             // Early skip per tile
-            if constexpr (IS_CAUSAL) { if (start_kv >= start_q + valid_q_rows) continue; }
+            if constexpr (IS_CAUSAL) { if (start_kv >= start_q + valid_q_rows + seqlen_offset) continue; }
 
             // ==================================================================================
             // Load:     V tile from global to sV(reuse) shared memory
@@ -185,7 +186,7 @@ flash_attention_backward_kernel(
             WMMA_GEMM_SCORES<Config, GemmType::dOV_dOVT, D, IS_CAUSAL, IS_ALIBI, IS_SOFTCAP, IS_WINDOW, BLOCK_M, BLOCK_N, D_STRIDE, N_STRIDE>(
             sdO, sV, sdOV,
             valid_q_rows, valid_kv_rows,
-            0, 0, 1.0f, 0.0f, 0.0f, -1, -1,
+            0, 0, 0, 1.0f, 0.0f, 0.0f, -1, -1,
             warp_id, lane_id);
 
             __syncthreads();
@@ -211,6 +212,7 @@ flash_attention_backward_kernel(
             sQ, sK, sS,
             valid_q_rows,  valid_kv_rows,
             start_q,       start_kv,
+            seqlen_offset,
             softmax_scale, softcap, alibi_slope, window_left, window_right,
             warp_id,       lane_id);
 
@@ -277,6 +279,7 @@ flash_attention_backward_kernel(
 
         int num_q_tiles  = (M + BLOCK_N - 1) / BLOCK_N;
         const int valid_kv_rows = min(BLOCK_M, N - start_kv);
+        const int seqlen_offset = N - M;
 
         // ==================================================================================
         // Init:    thread/warp/lane IDs for WMMA coordination
@@ -352,7 +355,7 @@ flash_attention_backward_kernel(
                 const int valid_q_rows = min(BLOCK_N, M - start_q);
 
                 // Early skip per tile
-                if constexpr (IS_CAUSAL) { if (start_kv >= start_q + valid_q_rows) continue; }
+                if constexpr (IS_CAUSAL) { if (start_kv >= start_q + valid_q_rows + seqlen_offset) continue; }
 
                 // ==================================================================================
                 // Load:     Q tile from global to sQ(reuse) shared memory
@@ -375,6 +378,7 @@ flash_attention_backward_kernel(
                 sQ, sK, sS,
                 valid_q_rows,  valid_kv_rows,
                 start_q,       start_kv,
+                seqlen_offset,
                 softmax_scale, softcap, alibi_slope, window_left, window_right,
                 warp_id,       lane_id);
 
@@ -413,7 +417,7 @@ flash_attention_backward_kernel(
                 WMMA_GEMM_SCORES<Config, GemmType::dOV_dOVT, D, IS_CAUSAL, IS_ALIBI, IS_SOFTCAP, IS_WINDOW, BLOCK_N, BLOCK_M, D_STRIDE, M_STRIDE>(
                 sdO, sV, sdOV,
                 valid_q_rows, valid_kv_rows,
-                0, 0, 1.0f, 0.0f, 0.0f, -1, -1,
+                0, 0, 0, 1.0f, 0.0f, 0.0f, -1, -1,
                 warp_id, lane_id);
 
                 __syncthreads();
