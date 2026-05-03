@@ -72,21 +72,33 @@ flash_attention_backward_kernel(
         const int start_q   = block_idx * BLOCK_M;
         if (start_q  >= M) return;
 
-        int num_kv_tiles = (N + BLOCK_N - 1)  / BLOCK_N;
         const int valid_q_rows  = min(BLOCK_M, M - start_q);
         const int seqlen_offset = N - M;
 
         // ==================================================================================
-        // Trim iteration count for causal attention: K/V blocks beyond Q position are skipped
-        // Logic:    max_key_pos = start_q + valid_q_rows - 1 (last Q position in this tile)
-        //           num_kv_tiles = min(original, ceil((max_key_pos + 1) / BLOCK_N))
+        // Trim K/V iteration range for causal and sliding window attention (dQ phase)
+        // Logic:    causal restricts K/V blocks beyond Q position (right bound)
+        //           window_left restricts blocks before Q - window_left (left bound)
+        //           window_right restricts blocks beyond Q + window_right (right bound)
+        //           block_min/block_max define valid [start, end) K/V tile index range
         // ==================================================================================
+        int block_min = 0;
+        int block_max = (N + BLOCK_N - 1) / BLOCK_N;
+
         if constexpr (IS_CAUSAL) {
             const int max_key_pos = start_q + valid_q_rows - 1 + seqlen_offset;
-            if (max_key_pos < 0) {
-               num_kv_tiles = 0;
-            } else {
-                num_kv_tiles = min(num_kv_tiles, (max_key_pos + BLOCK_N) / BLOCK_N);
+            block_max = (max_key_pos < 0) ? 0 : min(block_max, (max_key_pos / BLOCK_N) + 1);
+         }
+
+        if constexpr (IS_WINDOW) {
+            if (window_left >= 0) {
+                const int min_key_pos = start_q + seqlen_offset - window_left;
+                block_min = max(block_min, (min_key_pos > 0) ? (min_key_pos / BLOCK_N) : 0);
+            }
+
+            if (window_right >= 0) {
+                const int max_key_pos_win = start_q + valid_q_rows - 1 + seqlen_offset + window_right;
+                block_max = min(block_max, (max_key_pos_win >= 0) ? (max_key_pos_win / BLOCK_N) + 1 : 0);
             }
         }
 
@@ -158,13 +170,9 @@ flash_attention_backward_kernel(
         // ==================================================================================
         // MAIN LOOP (iterates over K/V blocks for current Q block)
         // ==================================================================================
-        for (int block = 0; block < num_kv_tiles; ++block) {
+        for (int block = block_min; block < block_max; ++block) {
             const int start_kv = block * BLOCK_N;
-            if (start_kv >= N) break;
             const int valid_kv_rows = min(BLOCK_N, N - start_kv);
-
-            // Early skip per tile
-            if constexpr (IS_CAUSAL) { if (start_kv >= start_q + valid_q_rows + seqlen_offset) continue; }
 
             // ==================================================================================
             // Load:     V tile from global to sV(reuse) shared memory
@@ -277,9 +285,35 @@ flash_attention_backward_kernel(
         const int start_kv  = block_idx * BLOCK_M;
         if (start_kv >= N) return;
 
-        int num_q_tiles  = (M + BLOCK_N - 1) / BLOCK_N;
         const int valid_kv_rows = min(BLOCK_M, N - start_kv);
         const int seqlen_offset = N - M;
+
+        // ==================================================================================
+        // Trim Q-tile iteration range for causal and sliding window attention
+        // Logic:    in dKV phase, K/V positions are fixed (start_kv), Q tiles iterate
+        //           causal restricts Q blocks before K - seqlen_offset (left bound)
+        //           window_left restricts Q blocks beyond K + window_left (right bound)
+        //           window_right restricts Q blocks before K - window_right (left bound)
+        //           q_block_min/q_block_max define valid [start, end) Q-tile index range
+        // ==================================================================================
+        int q_block_min = 0;
+        int q_block_max = (M + BLOCK_N - 1) / BLOCK_N;
+
+        if constexpr (IS_CAUSAL) {
+            const int min_q_pos = start_kv - seqlen_offset;
+            q_block_min = max(q_block_min, (min_q_pos > 0) ? (min_q_pos / BLOCK_N) : 0);
+        }
+
+        if constexpr (IS_WINDOW) {
+            if (window_right >= 0) {
+                const int min_q_pos_win = start_kv - seqlen_offset - window_right;
+                q_block_min = max(q_block_min, (min_q_pos_win > 0) ? (min_q_pos_win / BLOCK_N) : 0);
+            }
+            if (window_left >= 0) {
+                const int max_q_pos_win = start_kv + valid_kv_rows - 1 - seqlen_offset + window_left;
+                q_block_max = min(q_block_max, (max_q_pos_win >= 0) ? (max_q_pos_win / BLOCK_N) + 1 : 0);
+            }
+        }
 
         // ==================================================================================
         // Init:    thread/warp/lane IDs for WMMA coordination
@@ -349,13 +383,9 @@ flash_attention_backward_kernel(
             // ==================================================================================
             // Q-TILES LOOP (Iterate over Q-tiles for the current Q-head)
             // ==================================================================================
-            for (int block = 0; block < num_q_tiles; ++block) {
+            for (int block = q_block_min; block < q_block_max; ++block) {
                 const int start_q = block * BLOCK_N;
-                if (start_q >= M) break;
                 const int valid_q_rows = min(BLOCK_N, M - start_q);
-
-                // Early skip per tile
-                if constexpr (IS_CAUSAL) { if (start_kv >= start_q + valid_q_rows + seqlen_offset) continue; }
 
                 // ==================================================================================
                 // Load:     Q tile from global to sQ(reuse) shared memory

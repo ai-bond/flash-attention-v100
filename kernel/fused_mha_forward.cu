@@ -51,30 +51,38 @@ flash_attention_forward_kernel(
     constexpr int D_STRIDE  = Config::DO::D_STRIDE;
     constexpr int N_STRIDE  = Config::DO::N_STRIDE;
 
-    const int batch_head_id = blockIdx.z;
+    const int   batch_head_id = blockIdx.z;
     if (batch_head_id >= B * H_Q) return;
-
     const float alibi_slope = (alibi_slopes) ? alibi_slopes[batch_head_id % H_Q] : 0.0f;
-
-    const int block_idx = blockIdx.x;
-    const int start_q = block_idx * BLOCK_M;
+    const int   block_idx = blockIdx.x;
+    const int   start_q = block_idx * BLOCK_M;
     if (start_q >= M) return;
-
-    int num_kv_tiles = (N + BLOCK_N - 1) / BLOCK_N;
-    const int valid_q_rows = min(BLOCK_M, M - start_q);
-    const int seqlen_offset = N - M;
+    const int   valid_q_rows = min(BLOCK_M, M - start_q);
+    const int   seqlen_offset = N - M;
 
     // ==================================================================================
-    // Trim iteration count for causal attention: K/V blocks beyond Q position are skipped
-    // Logic:    max_key_pos = start_q + valid_q_rows - 1 (last Q position in this tile)
-    //           num_kv_tiles = min(original, ceil((max_key_pos + 1) / BLOCK_N))
+    // Trim K/V iteration range for causal and sliding window attention (forward phase)
+    // Logic:    causal restricts K/V blocks beyond Q position (right bound)
+    //           window_left restricts blocks before Q - window_left (left bound)
+    //           window_right restricts blocks beyond Q + window_right (right bound)
+    //           block_min/block_max define valid [start, end) K/V tile index range
     // ==================================================================================
+    int block_min = 0;
+    int block_max = (N + BLOCK_N - 1) / BLOCK_N;
+
     if constexpr (IS_CAUSAL) {
-        const int max_key_pos = start_q + valid_q_rows - 1 + seqlen_offset;
-        if (max_key_pos < 0) {
-            num_kv_tiles = 0;
-        } else {
-            num_kv_tiles = min(num_kv_tiles, (max_key_pos + BLOCK_N + 0) / BLOCK_N);
+       const int max_key_pos = start_q + valid_q_rows - 1 + seqlen_offset;
+       block_max = (max_key_pos < 0) ? 0 : min(block_max, (max_key_pos / BLOCK_N) + 1);
+    }
+
+    if constexpr (IS_WINDOW) {
+        if (window_left >= 0) {
+            const int min_key_pos = start_q + seqlen_offset - window_left;
+            block_min = max(block_min, (min_key_pos > 0) ? (min_key_pos / BLOCK_N) : 0);
+        }
+        if (window_right >= 0) {
+            const int max_key_pos_win = start_q + valid_q_rows - 1 + seqlen_offset + window_right;
+            block_max = min(block_max, (max_key_pos_win >= 0) ? (max_key_pos_win / BLOCK_N) + 1 : 0);
         }
     }
 
@@ -136,13 +144,9 @@ flash_attention_forward_kernel(
     // ==================================================================================
     // MAIN LOOP (iterates over K/V blocks for current Q block)
     // ==================================================================================
-    for (int block = 0; block < num_kv_tiles; ++block) {
+    for (int block = block_min; block < block_max; ++block) {
         const int start_kv = block * BLOCK_N;
-        if (start_kv >= N) break;
         const int valid_kv_rows = min(BLOCK_N, N - start_kv);
-
-        // Early skip per tile
-        if constexpr (IS_CAUSAL) { if (start_kv >= start_q + valid_q_rows + seqlen_offset) continue; }
 
         // ==================================================================================
         // Load:     K tile from global to sK(reuse) shared memory
