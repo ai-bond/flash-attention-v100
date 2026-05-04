@@ -36,7 +36,7 @@ __device__ __forceinline__ void WMMA_GEMM_INIT_SMEM(char* smem_raw) {
 // TILE LOADER (Single or Dual load, with internal casting)
 // Loads uint4-vectorized tiles from global memory to shared memory with bounds checking.
 // ======================================================================================
-template <typename Config, bool DUAL_LOAD, int SRC_STRIDE, int DST_STRIDE>
+template<typename Config, bool DUAL_LOAD, int SRC_STRIDE, int DST_STRIDE>
 __device__ __forceinline__ void WMMA_GEMM_LOAD_TILE(
     const __half* __restrict__ GMEM0,
           __half* __restrict__ SMEM0,

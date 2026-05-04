@@ -9,6 +9,7 @@
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <ATen/cuda/CUDAGeneratorImpl.h>
+#include <c10/cuda/CUDAGuard.h>
 
 #include "debug.h"
 #include "kernel.h"
@@ -328,7 +329,11 @@ std::vector<at::Tensor> flash_attention_forward(
     const bool return_softmax,
     std::optional<at::Generator> gen
 ) {
-    // Check layouts
+    // Device guard for multi-GPU / pipeline-parallelism
+    at::cuda::CUDAGuard device_guard{q.device()};
+
+    auto props  = at::cuda::getCurrentDeviceProperties();
+    TORCH_CHECK(props->major == 7 && props->minor == 0, "Kernel supports only Volta GPUs.");
     TORCH_CHECK(q.dtype() == torch::kFloat16, "q must be fp16");
     TORCH_CHECK(k.dtype() == torch::kFloat16, "k must be fp16");
     TORCH_CHECK(v.dtype() == torch::kFloat16, "v must be fp16");
@@ -336,12 +341,23 @@ std::vector<at::Tensor> flash_attention_forward(
     TORCH_CHECK(q.stride(-1) == 1 && k.stride(-1) == 1 && v.stride(-1) == 1, "Last dim must be contiguous");
 
     const auto sizes = q.sizes();
-    const int B      = sizes[0], H_Q = sizes[1], M = sizes[2], D = sizes[3];
+    const int B      = sizes[0];
+    const int H_Q    = sizes[1];
+    const int M      = sizes[2];
+    const int D      = sizes[3];
     const int H_K    = k.size(1);
     const int N      = k.size(2);
+
+    TORCH_CHECK(B > 0, "batch_size must be positive");
     TORCH_CHECK(D <= 256 && D % 8 == 0 && D % 2 == 0, "D must be even, <=256, multiple of 8");
     TORCH_CHECK(H_Q % H_K == 0, "H_Q must be divisible by H_K for GQA/MQA");
 
+    // Window edge cases
+    if (window_left  >= N) { window_left  = -1; }
+    if (window_right >= N) { window_right = -1; }
+    if (M == 1 && !alibi_slopes.has_value()) { is_causal = false; }
+
+    // Alibi
     const float* alibi = nullptr;
     if (alibi_slopes.has_value()) {
         const auto& slopes = alibi_slopes.value();
@@ -353,6 +369,7 @@ std::vector<at::Tensor> flash_attention_forward(
         alibi = slopes.data_ptr<float>();
     }
 
+    // Dropout
     TORCH_CHECK(p_dropout >= 0.f && p_dropout < 1.f, "p_dropout must be in [0, 1)");
     TORCH_CHECK(!return_softmax || p_dropout > 0.f, "return_softmax requires p_dropout > 0");
     if (softcap > 0.f) { TORCH_CHECK(p_dropout == 0.f, "Softcapping does not support dropout"); }
@@ -364,13 +381,10 @@ std::vector<at::Tensor> flash_attention_forward(
     if (p_dropout > 0.0f) {
         auto gen_cuda = at::get_generator_or_default<at::CUDAGeneratorImpl>(gen, at::cuda::detail::getDefaultCUDAGenerator());
         std::lock_guard<std::mutex> lock(gen_cuda->mutex_);
-
         dropout_seed   = gen_cuda->current_seed();
         dropout_offset = gen_cuda->get_offset();
-
         uint64_t counter_offset = static_cast<uint64_t>(B) * static_cast<uint64_t>(H_Q) * 32ULL;
         gen_cuda->set_offset(dropout_offset + counter_offset);
-
         rng_state = torch::tensor(
             {static_cast<int64_t>(dropout_seed), static_cast<int64_t>(dropout_offset)},
             torch::dtype(torch::kInt64).device(q.device())
@@ -381,22 +395,26 @@ std::vector<at::Tensor> flash_attention_forward(
 
     // Output tensors
     at::Tensor out_fp16 = out.has_value() ? out.value() : torch::empty_like(q);
-    TORCH_CHECK(out_fp16.dtype() == torch::kFloat16, "out must be fp16");
-
     auto softmax_lse = torch::empty({B, H_Q, M}, torch::dtype(torch::kFloat32).device(q.device()));
+    TORCH_CHECK(out_fp16.dtype() == torch::kFloat16, "out must be fp16");
     TORCH_CHECK(softmax_lse.dtype() == torch::kFloat32, "softmax_lse must be fp32");
 
     at::Tensor dmask;
     if (return_softmax && (p_dropout > 0.0f)) {
-        dmask = torch::zeros({B, H_Q, M, N}, q.options());
+        dmask = torch::empty({B, H_Q, M, N}, q.options());
     } else {
         dmask = torch::empty({0}, q.options());
     }
 
+    // Edge-case return
+    if (N == 0) {
+        out_fp16.zero_();
+        softmax_lse.fill_(std::numeric_limits<float>::infinity());
+        return {out_fp16, softmax_lse, dmask, rng_state};
+    }
+
+    // Run kernel
     auto stream = at::cuda::getCurrentCUDAStream().stream();
-    auto props  = at::cuda::getCurrentDeviceProperties();
-    bool sm70   = props->major == 7 && props->minor == 0;
-    TORCH_CHECK(sm70, "Kernel supports only Volta GPUs.");
 
     #define LAUNCH_KERNEL(DIM) \
         launcher_flash_attention_forward<DIM>(q, k, v, out_fp16, softmax_lse, dmask, softmax_scale, is_causal, \
