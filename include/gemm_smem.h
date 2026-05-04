@@ -36,19 +36,20 @@ __device__ __forceinline__ void WMMA_GEMM_INIT_SMEM(char* smem_raw) {
 // TILE LOADER (Single or Dual load, with internal casting)
 // Loads uint4-vectorized tiles from global memory to shared memory with bounds checking.
 // ======================================================================================
-template<typename Config, bool DUAL_LOAD, int SRC_STRIDE, int DST_STRIDE>
+template<typename Config, bool DUAL_LOAD, int DST_STRIDE>
 __device__ __forceinline__ void WMMA_GEMM_LOAD_TILE(
     const __half* __restrict__ GMEM0,
           __half* __restrict__ SMEM0,
     const __half* __restrict__ GMEM1,
           __half* __restrict__ SMEM1,
+    int SRC_STRIDE,
     int VALID_ROWS,
     int THREAD_ID
 ) {
     constexpr int THREADS_PER_BLOCK = Config::THREADS_PER_BLOCK;
-    constexpr int src_stride_uint4  = (SRC_STRIDE + 7) >> 3;
     constexpr int dst_stride_uint4  = (DST_STRIDE + 7) >> 3;
-    const int total_iters   = VALID_ROWS * src_stride_uint4;
+    const     int src_stride_uint4  = (SRC_STRIDE + 7) >> 3;
+    const     int total_iters       = VALID_ROWS * src_stride_uint4;
 
     if (total_iters == 0) return;
 
@@ -107,19 +108,21 @@ __device__ __forceinline__ void WMMA_GEMM_LOAD_TILE(
 // ============================================================================
 // KERNEL_EPILOGUE
 // ============================================================================
-template<typename Config, GemmType TYPE, int GLOBAL_STRIDE, int SMEM_STRIDE>
+template<typename Config, GemmType TYPE, int SMEM_STRIDE>
 __device__ __forceinline__ void WMMA_GEMM_EPILOGUE(
     const float* __restrict__ SMEM0,
          __half* __restrict__ GMEM0,
     const float* __restrict__ SMEM1,
          __half* __restrict__ GMEM1,
     const float* __restrict__ SMEM_DOT,
+    int GLOBAL_STRIDE,
     int VALID_ROWS,
     int THREAD_ID
 ) {
 
-    constexpr int global_chunks = GLOBAL_STRIDE >> 2;
-    const int total_iters = VALID_ROWS * global_chunks;
+    const int global_chunks = GLOBAL_STRIDE >> 2;
+    const int total_iters   = VALID_ROWS * global_chunks;
+
     if (total_iters == 0) return;
 
     constexpr int  THREADS_PER_BLOCK = Config::THREADS_PER_BLOCK;

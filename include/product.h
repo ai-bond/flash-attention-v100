@@ -10,20 +10,21 @@
 // ======================================================================================
 // COMPUTE_ROW_DOT
 // ======================================================================================
-template<typename Config, GemmType TYPE, int GLOBAL_STRIDE, int SMEM_STRIDE>
+template<typename Config, GemmType TYPE, int SMEM_STRIDE>
 __device__ __forceinline__ void WMMA_GEMM_DOT_PRODUCT(
     const __half* __restrict__ GMEM_O,
     const __half* __restrict__ SMEM_DO,
     const  float* __restrict__ GMEM_LSE,
            float* __restrict__ SMEM_LSE,
            float* __restrict__ SMEM_DOT,
+    int GLOBAL_STRIDE,
     int VALID_ROWS,
     int OFFSET,
     int THREAD_ID
 ) {
-    constexpr int global_blocks = GLOBAL_STRIDE >> 3;
+    const int global_blocks = GLOBAL_STRIDE >> 3;
+    const int total_iters   = VALID_ROWS * global_blocks;
 
-    const int total_iters = VALID_ROWS * global_blocks;
     if (total_iters == 0) return;
 
     uint64_t global_base = static_cast<uint64_t>(__cvta_generic_to_global(GMEM_O));

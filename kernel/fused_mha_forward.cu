@@ -135,10 +135,10 @@ flash_attention_forward_kernel(
     // Layout:   Q: global[row: BLOCK_M, D] -> shared[row: BLOCK_M, D_STRIDE]
     // Template: DUAL_LOAD=false, SRC_STRIDE=D, DST_STRIDE=D_STRIDE
     // ==================================================================================
-    WMMA_GEMM_LOAD_TILE<Config, false, D, D_STRIDE>(
+    WMMA_GEMM_LOAD_TILE<Config, false, D_STRIDE>(
     q_ptr,   sQ,
     nullptr, nullptr,
-    valid_q_rows, tid);
+    D, valid_q_rows, tid);
 
     __syncthreads();
 
@@ -154,10 +154,10 @@ flash_attention_forward_kernel(
         // Layout:   K: global[row: BLOCK_N, D] -> shared[row: BLOCK_N, D_STRIDE]
         // Template: DUAL_LOAD=false, SRC_STRIDE=D, DST_STRIDE=D_STRIDE
         // ==================================================================================
-        WMMA_GEMM_LOAD_TILE<Config, false, D, D_STRIDE>(
+        WMMA_GEMM_LOAD_TILE<Config, false, D_STRIDE>(
         k_ptr + start_kv * D, sK,
         nullptr, nullptr,
-        valid_kv_rows, tid);
+        D, valid_kv_rows, tid);
 
         __syncthreads();
 
@@ -207,10 +207,10 @@ flash_attention_forward_kernel(
         // Layout:   V: global[row: BLOCK_N, D] -> shared[row: BLOCK_N, D_STRIDE]
         // Template: DUAL_LOAD=false, SRC_STRIDE=D, DST_STRIDE=D_STRIDE
         // ==================================================================================
-        WMMA_GEMM_LOAD_TILE<Config, false, D, D_STRIDE>(
+        WMMA_GEMM_LOAD_TILE<Config, false, D_STRIDE>(
         v_ptr + start_kv * D, sV,
         nullptr, nullptr,
-        valid_kv_rows, tid);
+        D, valid_kv_rows, tid);
 
         __syncthreads();
 
@@ -225,19 +225,17 @@ flash_attention_forward_kernel(
         warp_id,      lane_id);
 
         __syncthreads();
-
     }   // END MAIN LOOP
-
     // ==================================================================================
     // Compute:  Store normalized attention output O = softmax(S) @ V
     // Layout:   sO[valid_q_rows, D_STRIDE] -> out_ptr[valid_q_rows, D]
     // Template  D, D_STRIDE  : Head dimension and shared memory stride
     // ==================================================================================
-    WMMA_GEMM_EPILOGUE<Config, GemmType::write_dO, D, D_STRIDE>(
+    WMMA_GEMM_EPILOGUE<Config, GemmType::write_dO, D_STRIDE>(
     sO,      out_ptr,
     nullptr, nullptr,
     sRowSum,
-    valid_q_rows, tid);
+    D, valid_q_rows, tid);
 
     if (tid < valid_q_rows) {
         const float sum = fmaxf(sRowSum[tid], 1e-24f);
