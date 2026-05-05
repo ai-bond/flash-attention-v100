@@ -51,7 +51,35 @@ template <> struct fragment<matrix_b, 16, 16, 16, half, col_major> { uint32_t x[
 template <> struct fragment<accumulator, 16, 16, 16, float>        { float x[8];    static constexpr int num_elements = 8;  };
 
 // ======================================================================================
-// FILL: accumulator m16n16k16
+// FILL: matrix_a / matrix_b m16n16k16 (HALF)
+// ======================================================================================
+// Data per lane:   8x uint32_t registers (each holds 2 halves = 16 halves total)
+// Lane mapping:    Broadcast single half into both slots of each uint32_t register
+// Replication:     N/A (scalar initialization)
+// Memory access:   N/A (register-only operation)
+// ======================================================================================
+template <typename Use, int M, int N, int K, typename Layout>
+__device__ __forceinline__ void fill_fragment(fragment<Use, M, N, K, half, Layout>& frag, half value) {
+    uint32_t packed = (uint32_t(__half_as_ushort(value)) << 16) | uint32_t(__half_as_ushort(value));
+    asm volatile(
+        "{\n\t"
+        "mov.b32 %0, %8;\n\t"
+        "mov.b32 %1, %8;\n\t"
+        "mov.b32 %2, %8;\n\t"
+        "mov.b32 %3, %8;\n\t"
+        "mov.b32 %4, %8;\n\t"
+        "mov.b32 %5, %8;\n\t"
+        "mov.b32 %6, %8;\n\t"
+        "mov.b32 %7, %8;\n\t"
+        "}"
+        : "=r"(frag.x[0]), "=r"(frag.x[1]), "=r"(frag.x[2]), "=r"(frag.x[3]),
+          "=r"(frag.x[4]), "=r"(frag.x[5]), "=r"(frag.x[6]), "=r"(frag.x[7])
+        : "r"(packed)
+    );
+}
+
+// ======================================================================================
+// FILL: accumulator m16n16k16 (FLOAT)
 // ======================================================================================
 // Data per lane:   8 floats (full accumulator fragment)
 // Lane mapping:    Uniform broadcast across all 32 lanes
