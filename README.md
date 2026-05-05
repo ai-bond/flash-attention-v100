@@ -46,13 +46,21 @@ pip install -r requirements.txt
 As NVIDIA deprecated Volta support in CUDA since viersion 13 then PyTorch also restrict and deprecated support in new versions:  [PyTorch is dropping Volta support from CUDA-12.8 binaries for release 2.11](https://dev-discuss.pytorch.org/t/dropping-volta-support-from-cuda-12-8-binaries-for-release-2-11/) and check [PyTorch \[release 2.8-2.9\] delete support for Maxwell, Pascal, and Volta architectures for CUDA 12.8 and 12.9 builds](https://github.com/pytorch/pytorch/issues/157517)
 
 ```bash
-# Install last one PyTorch that's support with 12.9 CUDA
-pip install torch==2.10.0+cu129 --index-url https://download.pytorch.org/whl/cu129
+# Install last one PyTorch that's support with 12.9 CUDA and Volta architecture
+pip install torch==2.11.0+cu126 --index-url https://download.pytorch.org/whl/cu126
 
 # Check is package supports Volta
 python -c "import torch; p=torch.cuda.get_device_properties(0); print(f'{p.name} SM {p.major}.{p.minor} supported')"
 
-# If you will see Tesla V100-XXX-XXGB SM 7.0 supported all is done.
+# If you will see 'Tesla V100-XXX-XXGB SM 7.0 supported' all is done.
+
+# Install g++ (6 < Version g++ < 14) to build with CUDA 12.9, for example:
+yay -S gcc13
+# or
+apt install gcc13
+
+export CC=gcc-13 CXX=g++-13
+
 # We can compile and install project with just:
 
 ./run.sh 

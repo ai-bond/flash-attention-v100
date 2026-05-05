@@ -1,10 +1,10 @@
 [build-system]
 build-backend = "setuptools.build_meta"
 requires = [
-    "setuptools>=82.0.1",
+    "setuptools>77.0.3,<82.0.0",
     "wheel>=0.46.3",
     "packaging>=26.0",
-    "torch @ https://download-r2.pytorch.org/whl/cu129/torch-2.10.0%2Bcu129-cp312-cp312-manylinux_2_28_x86_64.whl#sha256=a3c703e74a88cccfeb4b1807c49d563a0a73793ba72d4fa035d4ac5885f3aefd",
+    "torch @ https://download-r2.pytorch.org/whl/cu126/torch-2.11.0%2Bcu126-cp313-cp313-manylinux_2_28_x86_64.whl",
     "ninja>=1.13.0",
     "psutil>=7.2.2",
     "numpy>=2.4.4"
@@ -21,8 +21,8 @@ license = "BSD-3-Clause"
 license-files = ["LICENSE", "AUTHORS"]
 dynamic = ["authors", "classifiers", "urls"]
 dependencies = [
-    "torch @ https://download-r2.pytorch.org/whl/cu129/torch-2.10.0%2Bcu129-cp312-cp312-manylinux_2_28_x86_64.whl#sha256=a3c703e74a88cccfeb4b1807c49d563a0a73793ba72d4fa035d4ac5885f3aefd",
-    "setuptools>=82.0.1",
+    "torch @ https://download-r2.pytorch.org/whl/cu126/torch-2.11.0%2Bcu126-cp313-cp313-manylinux_2_28_x86_64.whl",
+    "setuptools>77.0.3,<82.0.0",
     "wheel>=0.46.3",
     "packaging>=26.0",
     "ninja>=1.13.0",

@@ -20,7 +20,7 @@ def get_ext_modules():
     except ImportError as e:
         raise RuntimeError(
             "torch is required to build flash_attn_v100. "
-            "Please install torch >= 2.10 first (e.g., `pip install torch==2.10.0+cu129 --index-url https://download.pytorch.org/whl/cu129`)."
+            "Please install torch >= 2.10 first (e.g., `pip install torch==2.11.0+cu126 --index-url https://download.pytorch.org/whl/cu126`)."
         ) from e
 
     nvcc_threads = int(os.environ.get("NVCC_THREADS", 4))
@@ -102,7 +102,7 @@ def get_cmdclass():
     except ImportError as e:
         raise RuntimeError(
             "torch is required to build flash_attn_v100. "
-            "Please install torch >= 2.10 first (e.g., `pip install torch==2.10.0+cu129 --index-url https://download.pytorch.org/whl/cu129`)."
+            "Please install torch >= 2.10 first (e.g., `pip install torch==2.11.0+cu126 --index-url https://download.pytorch.org/whl/cu126`)."
         ) from e
 
     class BuildAttention(BuildExtension):
@@ -138,8 +138,8 @@ def get_cmdclass():
 
             if not torch.cuda.is_available():
                 raise RuntimeError("CUDA is required but not available.")
-            if parse(torch.version.cuda) < parse("12.9"):
-                raise RuntimeError(f"CUDA version {torch.version.cuda} < 12.9 is not supported.")
+            if parse(torch.version.cuda) < parse("12.6"):
+                raise RuntimeError(f"CUDA version {torch.version.cuda} < 12.6 is not supported.")
             super().build_extensions()
 
     return {"build_ext": BuildAttention, "build_py": CopyAttention, 'install': InstallAttention}
