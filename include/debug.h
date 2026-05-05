@@ -70,9 +70,9 @@ DEFINE_FIELD(k_fwd,       phase.fdo.reuse_kv.k)
 DEFINE_FIELD(v_fwd,       phase.fdo.reuse_kv.v)
 DEFINE_FIELD(s_fwd,       phase.fdo.reuse_sp.s)
 DEFINE_FIELD(p_fwd,       phase.fdo.reuse_sp.p)
-DEFINE_FIELD(row_max,     row_max)
-DEFINE_FIELD(row_sum,     row_sum)
-DEFINE_FIELD(o_fwd,       smem.phase.fdo.o)
+DEFINE_FIELD(row_max_fwd, row_max)
+DEFINE_FIELD(row_sum_fwd, row_sum)
+DEFINE_FIELD(o_fwd,       phase.fdo.o)
 
 // Backward dQ fields
 DEFINE_FIELD(q_dq,        phase.bdq.q)
@@ -238,7 +238,7 @@ do { \
 // ======================================================================================
 #define __PRINT_RESULT(FIELD_TAG, VLEN, TILE_IDX) \
 do { \
-    if (tid == 0 && _DEBUG_GLOBAL_GUARD()) { \
+    if (tid == 0 && (blockIdx.x == 0 && blockIdx.z == 0)) { \
         extern __shared__ char smem_raw[]; \
         using Layout = typename Config::SmemLayout; \
         constexpr bool has_field = has_##FIELD_TAG<Layout>::value; \
