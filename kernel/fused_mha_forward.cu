@@ -48,15 +48,18 @@ flash_attention_forward_kernel(
 ) {
     using Config = KernelConfig<D>;
 
-    constexpr int BLOCK_M       = Config::DO::BLOCK_M;
-    constexpr int BLOCK_N       = Config::DO::BLOCK_N;
-    constexpr int D_STRIDE      = Config::DO::D_STRIDE;
-    constexpr int N_STRIDE      = Config::DO::N_STRIDE;
-    const     int batch_head_id = blockIdx.z;
-    const     int block_idx     = blockIdx.x;
+    constexpr int BLOCK_M  = Config::DO::BLOCK_M;
+    constexpr int BLOCK_N  = Config::DO::BLOCK_N;
+    constexpr int D_STRIDE = Config::DO::D_STRIDE;
+    constexpr int N_STRIDE = Config::DO::N_STRIDE;
 
-    if (batch_head_id >= B * H_Q) return;
-    const float alibi_slope = (alibi_slopes) ? alibi_slopes[batch_head_id % H_Q] : 0.0f;
+    // ==================================================================================
+    // Grid Mapping: X for Q-blocks, Z for batch-head composite (batch * H_Q + head).
+    // ==================================================================================
+    const int bthd_idx     = blockIdx.z;
+    const int block_idx    = blockIdx.x;
+
+    if (bthd_idx >= B * H_Q) return;
 
     // ======================================================================================
     // BlockInfo: Metadata resolution (Dense Q-centric)
@@ -64,7 +67,7 @@ flash_attention_forward_kernel(
     BlockInfo<IS_CAUSAL, IS_WINDOW, false> block;
     block.init_q(
         block_idx,       // BLOCK_IDX:      Current Q-block index (grid.x)
-        batch_head_id,   // BATCH_HEAD_ID:  Global Q-head index (batch * H_Q + head_q)
+        bthd_idx,        // BATCH_HEAD_ID:  Global Q-head index (batch * H_Q + head_q)
         H_Q,             // H_Q:            Number of query heads
         H_K,             // H_K:            Number of KV heads
         M,               // M:              Query sequence length
@@ -87,11 +90,13 @@ flash_attention_forward_kernel(
     const int tid     = threadIdx.x;
     const int warp_id = tid >> 5;
     const int lane_id = tid & 31;
+    // Alibi slope only for valid block
+    const float alibi_slope = (alibi_slopes) ? alibi_slopes[bthd_idx % H_Q] : 0.0f;
 
     // ==================================================================================
     // Layout:
-    //   Q/Out/LSE: [B, H_Q, M, D] offset follows batch_head_id (Q-head space)
-    //   K/V:       [B, H_K, N, D] mapped via batch_head_id % H_Q / (H_Q / H_K)
+    //   Q/Out/LSE: [B, H_Q, M, D] offset follows bthd_idx (Q-head space)
+    //   K/V:       [B, H_K, N, D] mapped via bthd_idx % H_Q / (H_Q / H_K)
     // ==================================================================================
     const __half* __restrict__ q_ptr           = Q           + block.q_offset  (D, H_Q, M);
     const __half* __restrict__ k_ptr           = K           + block.kv_offset (D, H_K, N);
@@ -122,6 +127,7 @@ flash_attention_forward_kernel(
 
     if (tid < BLOCK_M) {
         sRowMax[tid] = NEG_INF;
+        sRowSum[tid] = 0.0f;
     }
 
     // ==================================================================================
@@ -178,8 +184,8 @@ flash_attention_forward_kernel(
         __syncthreads();
 
         // ==================================================================================
-        // Compute:  Dropout mask to P tile
-        // Layout:   P[BLOCK_M, BLOCK_N] masked by dmask[start_q:start_q+BLOCK_M, start_kv:start_kv+BLOCK_N]
+        // Compute:  Apply dropout to P tile and generate dropout mask
+        // Layout:   P[BLOCK_M, BLOCK_N] (in SMEM) -> P_masked (in SMEM) Optionally store mask to dmask[BLOCK_M, BLOCK_N] in GMEM
         // Template: BLOCK_M, BLOCK_N, N_STRIDE, IS_DROPOUT
         // ==================================================================================
         WMMA_GEMM_DROPOUT<Config, BLOCK_M, BLOCK_N, N_STRIDE, IS_DROPOUT>(

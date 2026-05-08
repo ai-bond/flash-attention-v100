@@ -63,11 +63,14 @@ flash_attention_backward_kernel(
         constexpr int BLOCK_N   = Config::DQ::BLOCK_N;
         constexpr int D_STRIDE  = Config::DQ::D_STRIDE;
         constexpr int N_STRIDE  = Config::DQ::N_STRIDE;
-        const int batch_head_id = blockIdx.z;
-        const int block_idx     = blockIdx.x;
 
-        if (batch_head_id >= B * H_Q) return;
-        const float alibi_slope = (alibi_slopes) ? alibi_slopes[batch_head_id % H_Q] : 0.0f;
+        // ==================================================================================
+        // Grid Mapping: X for Q-blocks, Z for batch-head composite (batch * H_Q + head).
+        // ==================================================================================
+        const int bthd_idx     = blockIdx.z;
+        const int block_idx    = blockIdx.x;
+
+        if (bthd_idx >= B * H_Q) return;
 
         // ======================================================================================
         // BlockInfo: Unified metadata resolution (Dense Q-centric)
@@ -75,7 +78,7 @@ flash_attention_backward_kernel(
         BlockInfo<IS_CAUSAL, IS_WINDOW, false> block;
         block.init_q(
             block_idx,       // BLOCK_IDX:      Current Q-block index (grid.x)
-            batch_head_id,   // BATCH_HEAD_ID:  Global Q-head index (batch * H_Q + head_q)
+            bthd_idx,        // BATCH_HEAD_ID:  Global Q-head index (batch * H_Q + head_q)
             H_Q,             // H_Q:            Number of query heads
             H_K,             // H_K:            Number of KV heads
             M,               // M:              Query sequence length
@@ -95,14 +98,16 @@ flash_attention_backward_kernel(
         // ==================================================================================
         // Init:   thread/warp/lane IDs for WMMA coordination
         // ==================================================================================
-        const int tid          = threadIdx.x;
-        const int warp_id      = tid >> 5;
-        const int lane_id      = tid & 31;
+        const int tid     = threadIdx.x;
+        const int warp_id = tid >> 5;
+        const int lane_id = tid & 31;
+        // Alibi slope only for valid block
+        const float alibi_slope = (alibi_slopes) ? alibi_slopes[bthd_idx % H_Q] : 0.0f;
 
         // ==================================================================================
         // Layout:
-        //   Q/Out/LSE: [B, H_Q, M, D] offset follows batch_head_id (Q-head space)
-        //   K/V:       [B, H_K, N, D] mapped via batch_head_id % H_Q / (H_Q / H_K)
+        //   Q/Out/LSE: [B, H_Q, M, D] offset follows bthd_idx (Q-head space)
+        //   K/V:       [B, H_K, N, D] mapped via bthd_idx % H_Q / (H_Q / H_K)
         // ==================================================================================
         const __half* __restrict__ q_ptr   = Q           + block.q_offset  (D, H_Q, M);
         const __half* __restrict__ k_ptr   = K           + block.kv_offset (D, H_K, N);
@@ -256,10 +261,14 @@ flash_attention_backward_kernel(
         constexpr int BLOCK_N   = Config::DKV::BLOCK_N;
         constexpr int D_STRIDE  = Config::DKV::D_STRIDE;
         constexpr int M_STRIDE  = Config::DKV::M_STRIDE;
-        const int batch_head_id = blockIdx.z;
-        const int block_idx     = blockIdx.x;
 
-        if (batch_head_id >= B * H_K) return;
+        // ==================================================================================
+        // Grid Mapping: X for Q-blocks, Z for batch-head composite (batch * H_Q + head).
+        // ==================================================================================
+        const int bthd_idx     = blockIdx.z;
+        const int block_idx    = blockIdx.x;
+
+        if (bthd_idx >= B * H_K) return;
 
         // ======================================================================================
         // BlockInfo: Unified metadata resolution (Dense KV-centric)
@@ -267,7 +276,7 @@ flash_attention_backward_kernel(
         BlockInfo<IS_CAUSAL, IS_WINDOW, false> block;
         block.init_kv(
             block_idx,       // BLOCK_IDX:      Current KV-block index (grid.x)
-            batch_head_id,   // BATCH_HEAD_ID:  Global KV-head index (batch * H_K + head_kv)
+            bthd_idx,        // BATCH_HEAD_ID:  Global KV-head index (batch * H_K + head_kv)
             H_Q,             // H_Q:            Number of query heads
             H_K,             // H_K:            Number of KV heads
             M,               // M:              Query sequence length
@@ -292,7 +301,7 @@ flash_attention_backward_kernel(
         const int lane_id      = tid & 31;
 
         // ==================================================================================
-        // Layout:   [B, H_K, N, D] offset follows batch_head_id (KV-head space)
+        // Layout:   [B, H_K, N, D] offset follows bthd_idx (KV-head space)
         // ==================================================================================
         const __half* __restrict__ k_ptr  = K  + block.kv_offset(D, H_K, N) + block.start_kv * D;
         const __half* __restrict__ v_ptr  = V  + block.kv_offset(D, H_K, N) + block.start_kv * D;
@@ -342,11 +351,11 @@ flash_attention_backward_kernel(
             // ==================================================================================
             // Layout:    [B, H_Q, M, D] -> offset computed from KV-head + group index
             // ==================================================================================
-            const __half* __restrict__ q_ptr   = Q           + (size_t)((batch_head_id / H_K) * H_Q + (((batch_head_id % H_K) * (H_Q / H_K)) + group)) * M * D;
-            const __half* __restrict__ o_ptr   = O           + (size_t)((batch_head_id / H_K) * H_Q + (((batch_head_id % H_K) * (H_Q / H_K)) + group)) * M * D;
-            const __half* __restrict__ dO_ptr  = dO          + (size_t)((batch_head_id / H_K) * H_Q + (((batch_head_id % H_K) * (H_Q / H_K)) + group)) * M * D;
-            const  float* __restrict__ lse_ptr = softmax_lse + (size_t)((batch_head_id / H_K) * H_Q + (((batch_head_id % H_K) * (H_Q / H_K)) + group)) * M;
-            const  float           alibi_slope = (alibi_slopes) ? alibi_slopes[((batch_head_id / H_K) * H_Q + (batch_head_id % H_K) * (H_Q / H_K) + group) % H_Q] : 0.0f;
+            const __half* __restrict__ q_ptr   = Q           + (size_t)((bthd_idx / H_K) * H_Q + (((bthd_idx % H_K) * (H_Q / H_K)) + group)) * M * D;
+            const __half* __restrict__ o_ptr   = O           + (size_t)((bthd_idx / H_K) * H_Q + (((bthd_idx % H_K) * (H_Q / H_K)) + group)) * M * D;
+            const __half* __restrict__ dO_ptr  = dO          + (size_t)((bthd_idx / H_K) * H_Q + (((bthd_idx % H_K) * (H_Q / H_K)) + group)) * M * D;
+            const  float* __restrict__ lse_ptr = softmax_lse + (size_t)((bthd_idx / H_K) * H_Q + (((bthd_idx % H_K) * (H_Q / H_K)) + group)) * M;
+            const  float           alibi_slope = (alibi_slopes) ? alibi_slopes[((bthd_idx / H_K) * H_Q + (bthd_idx % H_K) * (H_Q / H_K) + group) % H_Q] : 0.0f;
 
             // ==================================================================================
             // Q-TILES LOOP (Iterate over Q-tiles for the current Q-head)

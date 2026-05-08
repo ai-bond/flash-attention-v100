@@ -45,8 +45,7 @@ struct BlockInfo {
         const int* CU_SEQLENS_K,
         const int* SEQUSED_K
     ) {
-        // Zero-out KV-centric fields to prevent stale data
-        start_kv = 0;
+        start_kv      = 0;
         valid_kv_rows = 0;
 
         if constexpr (IS_VARLEN) {
@@ -135,8 +134,7 @@ struct BlockInfo {
         const int* CU_SEQLENS_K,
         const int* SEQUSED_K
     ) {
-        // Zero-out Q-centric fields to prevent stale data
-        start_q = 0;
+        start_q      = 0;
         valid_q_rows = 0;
 
         if constexpr (IS_VARLEN) {
@@ -215,10 +213,7 @@ struct BlockInfo {
     }
 
     // ======================================================================================
-    // Offset computation for K/V tensors (BASE OFFSET ONLY)
-    // Note:     Returns batch/head base. start_kv*D is added explicitly in kernels.
-    //           Forward/dQ: added inside KV-loop per tile.
-    //           dKV:        added once during pointer initialization.
+    // Offset computation for K/V tensors
     // ======================================================================================
     __device__ __forceinline__ size_t kv_offset(int D, int H_K, int N_or_TK) const {
         if constexpr (IS_VARLEN) {
@@ -242,9 +237,7 @@ struct BlockInfo {
     }
 
     // ======================================================================================
-    // Offset computation for dropout mask (BASE OFFSET ONLY)
-    // Note:     Matches original kernel contract: returns batch*head base.
-    //           start_q*N + start_kv is added inside the WMMA_DROPOUT call.
+    // Offset computation for dropout mask
     // ======================================================================================
     __device__ __forceinline__ size_t dmask_offset(int H_Q, int M_or_TQ, int N_or_MSEQ_K) const {
         if constexpr (IS_VARLEN) {
