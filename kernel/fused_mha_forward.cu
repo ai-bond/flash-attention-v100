@@ -12,13 +12,13 @@
 #include <c10/cuda/CUDAGuard.h>
 
 #include "debug.h"
+#include "template.h"
 #include "kernel.h"
 #include "forward.h"
 #include "gemm_smem.h"
 #include "mat_mul.h"
 #include "softmax.h"
 #include "dropout.h"
-#include "template.h"
 
 // ======================================================================================
 // FORWARD KERNEL
@@ -40,52 +40,46 @@ flash_attention_forward_kernel(
     const float    softmax_scale,
     const float    softcap,
     const float*   alibi_slopes,
-    int window_left,
-    int window_right,
+    int            window_left,
+    int            window_right,
     const float    p_dropout,
     const uint64_t dropout_seed,
     const uint64_t dropout_offset
 ) {
     using Config = KernelConfig<D>;
-    constexpr int BLOCK_M   = Config::DO::BLOCK_M;
-    constexpr int BLOCK_N   = Config::DO::BLOCK_N;
-    constexpr int D_STRIDE  = Config::DO::D_STRIDE;
-    constexpr int N_STRIDE  = Config::DO::N_STRIDE;
 
-    const int   batch_head_id = blockIdx.z;
+    constexpr int BLOCK_M       = Config::DO::BLOCK_M;
+    constexpr int BLOCK_N       = Config::DO::BLOCK_N;
+    constexpr int D_STRIDE      = Config::DO::D_STRIDE;
+    constexpr int N_STRIDE      = Config::DO::N_STRIDE;
+    const     int batch_head_id = blockIdx.z;
+    const     int block_idx     = blockIdx.x;
+
     if (batch_head_id >= B * H_Q) return;
     const float alibi_slope = (alibi_slopes) ? alibi_slopes[batch_head_id % H_Q] : 0.0f;
-    const int   block_idx = blockIdx.x;
-    const int   start_q = block_idx * BLOCK_M;
-    if (start_q >= M) return;
-    const int   valid_q_rows = min(BLOCK_M, M - start_q);
-    const int   seqlen_offset = N - M;
 
-    // ==================================================================================
-    // Trim K/V iteration range for causal and sliding window attention (forward phase)
-    // Logic:    causal restricts K/V blocks beyond Q position (right bound)
-    //           window_left restricts blocks before Q - window_left (left bound)
-    //           window_right restricts blocks beyond Q + window_right (right bound)
-    //           block_min/block_max define valid [start, end) K/V tile index range
-    // ==================================================================================
-    int block_min = 0;
-    int block_max = (N + BLOCK_N - 1) / BLOCK_N;
+    // ======================================================================================
+    // BlockInfo: Metadata resolution (Dense Q-centric)
+    // ======================================================================================
+    BlockInfo<IS_CAUSAL, IS_WINDOW, false> block;
+    block.init_q(
+        block_idx,       // BLOCK_IDX:      Current Q-block index (grid.x)
+        batch_head_id,   // BATCH_HEAD_ID:  Global Q-head index (batch * H_Q + head_q)
+        H_Q,             // H_Q:            Number of query heads
+        H_K,             // H_K:            Number of KV heads
+        M,               // M:              Query sequence length
+        N,               // N:              KV sequence length
+        0,               // B:              Batch size (0 for dense, unused)
+        BLOCK_M,         // BLOCK_M:        Tile size along Q dimension
+        BLOCK_N,         // BLOCK_N:        Tile size along KV dimension
+        window_left,     // WINDOW_LEFT:    Left sliding window bound (-1 if disabled)
+        window_right,    // WINDOW_RIGHT:   Right sliding window bound (-1 if disabled)
+        nullptr,         // CU_SEQLENS_Q:   Cumulative Q lengths (nullptr for dense)
+        nullptr,         // CU_SEQLENS_K:   Cumulative KV lengths (nullptr for dense)
+        nullptr          // SEQUSED_K:      Actual KV lengths override (nullptr for dense)
+    );
 
-    if constexpr (IS_CAUSAL) {
-       const int max_key_pos = start_q + valid_q_rows - 1 + seqlen_offset;
-       block_max = (max_key_pos < 0) ? 0 : min(block_max, (max_key_pos / BLOCK_N) + 1);
-    }
-
-    if constexpr (IS_WINDOW) {
-        if (window_left >= 0) {
-            const int min_key_pos = start_q + seqlen_offset - window_left;
-            block_min = max(block_min, (min_key_pos > 0) ? (min_key_pos / BLOCK_N) : 0);
-        }
-        if (window_right >= 0) {
-            const int max_key_pos_win = start_q + valid_q_rows - 1 + seqlen_offset + window_right;
-            block_max = min(block_max, (max_key_pos_win >= 0) ? (max_key_pos_win / BLOCK_N) + 1 : 0);
-        }
-    }
+    if (block.start_q >= M) return;
 
     // ==================================================================================
     // Init:   thread/warp/lane IDs for WMMA coordination
@@ -99,12 +93,12 @@ flash_attention_forward_kernel(
     //   Q/Out/LSE: [B, H_Q, M, D] offset follows batch_head_id (Q-head space)
     //   K/V:       [B, H_K, N, D] mapped via batch_head_id % H_Q / (H_Q / H_K)
     // ==================================================================================
-    const __half* __restrict__ q_ptr           = Q +           (size_t)batch_head_id * M * D + start_q * D;
-    const __half* __restrict__ k_ptr           = K +           (size_t)((batch_head_id / H_Q) * H_K + (batch_head_id % H_Q) / (H_Q / H_K)) * N * D;
-    const __half* __restrict__ v_ptr           = V +           (size_t)((batch_head_id / H_Q) * H_K + (batch_head_id % H_Q) / (H_Q / H_K)) * N * D;
-          __half* __restrict__ out_ptr         = Out +         (size_t)batch_head_id * M * D + start_q * D;
-           float* __restrict__ softmax_lse_ptr = softmax_lse + (size_t)batch_head_id * M + start_q;
-          __half* __restrict__ dmask_ptr       = (dmask != nullptr) ? dmask + (size_t)batch_head_id * M * N : nullptr;
+    const __half* __restrict__ q_ptr           = Q           + block.q_offset  (D, H_Q, M);
+    const __half* __restrict__ k_ptr           = K           + block.kv_offset (D, H_K, N);
+    const __half* __restrict__ v_ptr           = V           + block.kv_offset (D, H_K, N);
+          __half* __restrict__ out_ptr         = Out         + block.q_offset  (D, H_Q, M);
+           float* __restrict__ softmax_lse_ptr = softmax_lse + block.lse_offset(H_Q, M);
+          __half* __restrict__ dmask_ptr       = (dmask != nullptr) ? dmask + block.dmask_offset(H_Q, M, N) : nullptr;
 
     // ==================================================================================
     // Init:   shared memory with zero-fill union regions to avoid stale data
@@ -136,17 +130,16 @@ flash_attention_forward_kernel(
     // Template: DUAL_LOAD=false, SRC_STRIDE=D, DST_STRIDE=D_STRIDE
     // ==================================================================================
     WMMA_GEMM_LOAD_TILE<Config, false, D_STRIDE>(
-    q_ptr,   sQ,
-    nullptr, nullptr,
-    D, valid_q_rows, tid);
-
+      q_ptr,   sQ,
+      nullptr, nullptr,
+      D, block.valid_q_rows, tid);
     __syncthreads();
 
     // ==================================================================================
     // MAIN LOOP (iterates over K/V blocks for current Q block)
     // ==================================================================================
-    for (int block = block_min; block < block_max; ++block) {
-        const int start_kv = block * BLOCK_N;
+    for (int block_q = block.block_min; block_q < block.block_max; ++block_q) {
+        const int start_kv      = block_q * BLOCK_N;
         const int valid_kv_rows = min(BLOCK_N, N - start_kv);
 
         // ==================================================================================
@@ -155,10 +148,9 @@ flash_attention_forward_kernel(
         // Template: DUAL_LOAD=false, SRC_STRIDE=D, DST_STRIDE=D_STRIDE
         // ==================================================================================
         WMMA_GEMM_LOAD_TILE<Config, false, D_STRIDE>(
-        k_ptr + start_kv * D, sK,
-        nullptr, nullptr,
-        D, valid_kv_rows, tid);
-
+          k_ptr + start_kv * D, sK,
+          nullptr, nullptr,
+          D, valid_kv_rows, tid);
         __syncthreads();
 
         // ==================================================================================
@@ -167,13 +159,11 @@ flash_attention_forward_kernel(
         // Template: BLOCK_X=BLOCK_M, BLOCK_Y=BLOCK_N
         // ==================================================================================
         WMMA_GEMM_SCORES<Config, GemmType::sQ_KT, D, IS_CAUSAL, IS_ALIBI, IS_SOFTCAP, IS_WINDOW, BLOCK_M, BLOCK_N, D_STRIDE, N_STRIDE>(
-        sQ, sK, sS,
-        valid_q_rows,  valid_kv_rows,
-        start_q,       start_kv,
-        seqlen_offset,
-        softmax_scale, softcap, alibi_slope, window_left, window_right,
-        warp_id,       lane_id);
-
+          sQ, sK, sS,
+          block.valid_q_rows,  valid_kv_rows,
+          block.start_q,       start_kv,
+          block.seqlen_offset,
+          softmax_scale, softcap, alibi_slope, window_left, window_right, warp_id, lane_id);
         __syncthreads();
 
         // ==================================================================================
@@ -182,11 +172,9 @@ flash_attention_forward_kernel(
         // Template: BLOCK_M, BLOCK_N, N_STRIDE, D_STRIDE
         // ==================================================================================
         WMMA_GEMM_SOFTMAX<Config, BLOCK_M, BLOCK_N, N_STRIDE, D_STRIDE>(
-        sS, sP, sO,
-        sRowMax, sRowSum,
-        valid_q_rows, valid_kv_rows,
-        tid, block);
-
+          sS, sP, sO,
+          sRowMax, sRowSum,
+          block.valid_q_rows, valid_kv_rows, tid, block_q);
         __syncthreads();
 
         // ==================================================================================
@@ -195,11 +183,10 @@ flash_attention_forward_kernel(
         // Template: BLOCK_M, BLOCK_N, N_STRIDE, IS_DROPOUT
         // ==================================================================================
         WMMA_GEMM_DROPOUT<Config, BLOCK_M, BLOCK_N, N_STRIDE, IS_DROPOUT>(
-        sP, dmask_ptr ? dmask_ptr + start_q * N + start_kv : nullptr,
-        valid_q_rows, valid_kv_rows,
-        start_q, start_kv, N,
-        p_dropout, dropout_seed, dropout_offset, tid);
-
+          sP, dmask_ptr ? dmask_ptr + block.start_q * N + start_kv : nullptr,
+          block.valid_q_rows, valid_kv_rows,
+          block.start_q, start_kv, N,
+          p_dropout, dropout_seed, dropout_offset, tid);
         __syncthreads();
 
         // ==================================================================================
@@ -208,10 +195,9 @@ flash_attention_forward_kernel(
         // Template: DUAL_LOAD=false, SRC_STRIDE=D, DST_STRIDE=D_STRIDE
         // ==================================================================================
         WMMA_GEMM_LOAD_TILE<Config, false, D_STRIDE>(
-        v_ptr + start_kv * D, sV,
-        nullptr, nullptr,
-        D, valid_kv_rows, tid);
-
+          v_ptr + start_kv * D, sV,
+          nullptr, nullptr,
+          D, valid_kv_rows, tid);
         __syncthreads();
 
         // ==================================================================================
@@ -220,10 +206,8 @@ flash_attention_forward_kernel(
         // Template: BLOCK_X=BLOCK_M, BLOCK_Y=BLOCK_N
         // ==================================================================================
         WMMA_GEMM_GRADIENTS<Config, GemmType::dO_PV, D, BLOCK_M, BLOCK_N, N_STRIDE, D_STRIDE>(
-        sP, sV, sO,
-        valid_q_rows, valid_kv_rows,
-        warp_id,      lane_id);
-
+          sP, sV, sO,
+          block.valid_q_rows, valid_kv_rows, warp_id, lane_id);
         __syncthreads();
     }   // END MAIN LOOP
     // ==================================================================================
@@ -232,12 +216,11 @@ flash_attention_forward_kernel(
     // Template  D, D_STRIDE  : Head dimension and shared memory stride
     // ==================================================================================
     WMMA_GEMM_EPILOGUE<Config, GemmType::write_dO, D_STRIDE>(
-    sO,      out_ptr,
-    nullptr, nullptr,
-    sRowSum,
-    D, valid_q_rows, tid);
+      sO,      out_ptr,
+      nullptr, nullptr,
+      sRowSum, D, block.valid_q_rows, tid);
 
-    if (tid < valid_q_rows) {
+    if (tid < block.valid_q_rows) {
         const float sum = fmaxf(sRowSum[tid], 1e-24f);
         softmax_lse_ptr[tid] = sRowMax[tid] + logf(sum);
     }
@@ -251,18 +234,18 @@ void launcher_flash_attention_forward(
     const torch::Tensor& Q,
     const torch::Tensor& K,
     const torch::Tensor& V,
-    torch::Tensor& Out,
-    torch::Tensor& softmax_lse,
+          torch::Tensor& Out,
+          torch::Tensor& softmax_lse,
     const torch::Tensor& dmask,
-    float softmax_scale,
-    bool is_causal,
-    float softcap,
-    float p_dropout,
+    float        softmax_scale,
+    bool         is_causal,
+    float        softcap,
+    float        p_dropout,
     const float* alibi_slopes,
-    int window_left,
-    int window_right,
-    uint64_t dropout_seed,
-    uint64_t dropout_offset,
+    int          window_left,
+    int          window_right,
+    uint64_t     dropout_seed,
+    uint64_t     dropout_offset,
     cudaStream_t stream
 ) {
     using Config = KernelConfig<D>;
@@ -313,18 +296,18 @@ void launcher_flash_attention_forward(
 // WRAPPER
 // ======================================================================================
 std::vector<at::Tensor> flash_attention_forward(
-    at::Tensor& q,
+          at::Tensor& q,
     const at::Tensor& k,
     const at::Tensor& v,
     std::optional<at::Tensor>& out,
     std::optional<at::Tensor>& alibi_slopes,
-    const float p_dropout,
-    const float softmax_scale,
-    bool is_causal,
-    int window_left,
-    int window_right,
-    const float softcap,
-    const bool return_softmax,
+    const float  p_dropout,
+    const float  softmax_scale,
+    bool         is_causal,
+    int          window_left,
+    int          window_right,
+    const float  softcap,
+    const bool   return_softmax,
     std::optional<at::Generator> gen
 ) {
     // Device guard for multi-GPU / pipeline-parallelism

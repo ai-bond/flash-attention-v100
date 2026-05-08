@@ -12,13 +12,13 @@
 #include <c10/cuda/CUDAGuard.h>
 
 #include "debug.h"
+#include "template.h"
 #include "kernel.h"
 #include "backward.h"
 #include "gemm_smem.h"
 #include "product.h"
 #include "mat_mul.h"
 #include "softmax.h"
-#include "template.h"
 
 // ======================================================================================
 // BACKWARD KERNEL
@@ -40,14 +40,14 @@ flash_attention_backward_kernel(
     const int H_K,
     const int M,
     const int N,
-    const int grid_dq,
-    const int grid_dkv,
-    const float  softmax_scale,
-    const float  softcap,
-    const float* alibi_slopes,
-    int window_left,
-    int window_right,
-    const float p_dropout,
+    const int      grid_dq,
+    const int      grid_dkv,
+    const float    softmax_scale,
+    const float    softcap,
+    const float*   alibi_slopes,
+    int            window_left,
+    int            window_right,
+    const float    p_dropout,
     const uint64_t dropout_seed,
     const uint64_t dropout_offset
 ) {
@@ -63,45 +63,34 @@ flash_attention_backward_kernel(
         constexpr int BLOCK_N   = Config::DQ::BLOCK_N;
         constexpr int D_STRIDE  = Config::DQ::D_STRIDE;
         constexpr int N_STRIDE  = Config::DQ::N_STRIDE;
-
         const int batch_head_id = blockIdx.z;
-        if (batch_head_id >= B * H_Q) return;
+        const int block_idx     = blockIdx.x;
 
+        if (batch_head_id >= B * H_Q) return;
         const float alibi_slope = (alibi_slopes) ? alibi_slopes[batch_head_id % H_Q] : 0.0f;
 
-        const int block_idx = blockIdx.x;
-        const int start_q   = block_idx * BLOCK_M;
-        if (start_q  >= M) return;
+        // ======================================================================================
+        // BlockInfo: Unified metadata resolution (Dense Q-centric)
+        // ======================================================================================
+        BlockInfo<IS_CAUSAL, IS_WINDOW, false> block;
+        block.init_q(
+            block_idx,       // BLOCK_IDX:      Current Q-block index (grid.x)
+            batch_head_id,   // BATCH_HEAD_ID:  Global Q-head index (batch * H_Q + head_q)
+            H_Q,             // H_Q:            Number of query heads
+            H_K,             // H_K:            Number of KV heads
+            M,               // M:              Query sequence length
+            N,               // N:              KV sequence length
+            0,               // B:              Batch size (0 for dense, unused)
+            BLOCK_M,         // BLOCK_M:        Tile size along Q dimension
+            BLOCK_N,         // BLOCK_N:        Tile size along KV dimension
+            window_left,     // WINDOW_LEFT:    Left sliding window bound (-1 if disabled)
+            window_right,    // WINDOW_RIGHT:   Right sliding window bound (-1 if disabled)
+            nullptr,         // CU_SEQLENS_Q:   Cumulative Q lengths (nullptr for dense)
+            nullptr,         // CU_SEQLENS_K:   Cumulative KV lengths (nullptr for dense)
+            nullptr          // SEQUSED_K:      Actual KV lengths override (nullptr for dense)
+        );
 
-        const int valid_q_rows  = min(BLOCK_M, M - start_q);
-        const int seqlen_offset = N - M;
-
-        // ==================================================================================
-        // Trim K/V iteration range for causal and sliding window attention (dQ phase)
-        // Logic:    causal restricts K/V blocks beyond Q position (right bound)
-        //           window_left restricts blocks before Q - window_left (left bound)
-        //           window_right restricts blocks beyond Q + window_right (right bound)
-        //           block_min/block_max define valid [start, end) K/V tile index range
-        // ==================================================================================
-        int block_min = 0;
-        int block_max = (N + BLOCK_N - 1) / BLOCK_N;
-
-        if constexpr (IS_CAUSAL) {
-            const int max_key_pos = start_q + valid_q_rows - 1 + seqlen_offset;
-            block_max = (max_key_pos < 0) ? 0 : min(block_max, (max_key_pos / BLOCK_N) + 1);
-         }
-
-        if constexpr (IS_WINDOW) {
-            if (window_left >= 0) {
-                const int min_key_pos = start_q + seqlen_offset - window_left;
-                block_min = max(block_min, (min_key_pos > 0) ? (min_key_pos / BLOCK_N) : 0);
-            }
-
-            if (window_right >= 0) {
-                const int max_key_pos_win = start_q + valid_q_rows - 1 + seqlen_offset + window_right;
-                block_max = min(block_max, (max_key_pos_win >= 0) ? (max_key_pos_win / BLOCK_N) + 1 : 0);
-            }
-        }
+        if (block.start_q >= M) return;
 
         // ==================================================================================
         // Init:   thread/warp/lane IDs for WMMA coordination
@@ -115,13 +104,13 @@ flash_attention_backward_kernel(
         //   Q/Out/LSE: [B, H_Q, M, D] offset follows batch_head_id (Q-head space)
         //   K/V:       [B, H_K, N, D] mapped via batch_head_id % H_Q / (H_Q / H_K)
         // ==================================================================================
-        const __half* __restrict__ q_ptr   = Q           + (size_t)batch_head_id * M * D + start_q * D;
-        const __half* __restrict__ k_ptr   = K           + (size_t)((batch_head_id / H_Q) * H_K + (batch_head_id % H_Q) / (H_Q / H_K)) * N * D;
-        const __half* __restrict__ v_ptr   = V           + (size_t)((batch_head_id / H_Q) * H_K + (batch_head_id % H_Q) / (H_Q / H_K)) * N * D;
-        const __half* __restrict__ o_ptr   = O           + (size_t)batch_head_id * M * D + start_q * D;
-        const __half* __restrict__ dO_ptr  = dO          + (size_t)batch_head_id * M * D + start_q * D;
-              __half* __restrict__ dQ_ptr  = dQ          + (size_t)batch_head_id * M * D + start_q * D;
-        const float*  __restrict__ lse_ptr = softmax_lse + (size_t)batch_head_id * M + start_q;
+        const __half* __restrict__ q_ptr   = Q           + block.q_offset  (D, H_Q, M);
+        const __half* __restrict__ k_ptr   = K           + block.kv_offset (D, H_K, N);
+        const __half* __restrict__ v_ptr   = V           + block.kv_offset (D, H_K, N);
+        const __half* __restrict__ o_ptr   = O           + block.q_offset  (D, H_Q, M);
+        const __half* __restrict__ dO_ptr  = dO          + block.q_offset  (D, H_Q, M);
+              __half* __restrict__ dQ_ptr  = dQ          + block.q_offset  (D, H_Q, M);
+        const float*  __restrict__ lse_ptr = softmax_lse + block.lse_offset(H_Q, M);
 
         // ==================================================================================
         // Init:   shared memory with zero-fill union regions to avoid stale data
@@ -134,16 +123,16 @@ flash_attention_backward_kernel(
 
         auto& smem = *reinterpret_cast<typename Config::SmemLayout*>(smem_raw);
 
-        __half* __restrict__ sQ            = smem.phase.bdq.q;
-        __half* __restrict__ sK            = smem.phase.bdq.reuse_kv.k;
-        __half* __restrict__ sV            = smem.phase.bdq.reuse_kv.v;
-         float* __restrict__ sS            = smem.phase.bdq.s;
-        __half* __restrict__ sdO           = smem.phase.bdq.dO;
-         float* __restrict__ sdOV          = smem.phase.bdq.reuse_sdOVS.dOV;
-        __half* __restrict__ sdS           = smem.phase.bdq.reuse_sdOVS.dS;
-         float* __restrict__ sRowDot       = smem.row_dot;
-         float* __restrict__ sLse          = smem.lse;
-         float* __restrict__ sdQ           = smem.phase.bdq.dQ;
+        __half* __restrict__ sQ      = smem.phase.bdq.q;
+        __half* __restrict__ sK      = smem.phase.bdq.reuse_kv.k;
+        __half* __restrict__ sV      = smem.phase.bdq.reuse_kv.v;
+         float* __restrict__ sS      = smem.phase.bdq.s;
+        __half* __restrict__ sdO     = smem.phase.bdq.dO;
+         float* __restrict__ sdOV    = smem.phase.bdq.reuse_sdOVS.dOV;
+        __half* __restrict__ sdS     = smem.phase.bdq.reuse_sdOVS.dS;
+         float* __restrict__ sRowDot = smem.row_dot;
+         float* __restrict__ sLse    = smem.lse;
+         float* __restrict__ sdQ     = smem.phase.bdq.dQ;
 
         // ==================================================================================
         // Load:     Q(dO)  tile from global to sQ(sdO) shared memory
@@ -151,10 +140,9 @@ flash_attention_backward_kernel(
         // Template: DUAL_LOAD=true, SRC_STRIDE=D, DST_STRIDE=D_STRIDE
         // ==================================================================================
         WMMA_GEMM_LOAD_TILE<Config, true, D_STRIDE>(
-        q_ptr,   sQ,
-        dO_ptr,  sdO,
-        D, valid_q_rows, tid);
-
+          q_ptr,   sQ,
+          dO_ptr,  sdO,
+          D, block.valid_q_rows, tid);
         __syncthreads();
 
         // ==================================================================================
@@ -163,16 +151,15 @@ flash_attention_backward_kernel(
         // Template: TYPE=rowdot_dQ (LSE_OFFSET=0), GLOBAL_STRIDE=D, SMEM_STRIDE=D_STRIDE
         // ==================================================================================
         WMMA_GEMM_DOT_PRODUCT<Config, GemmType::rowdot_dQ, D_STRIDE>(
-        o_ptr,   sdO, lse_ptr, sLse,
-        sRowDot, D, valid_q_rows, 0, tid);
-
+          o_ptr,   sdO, lse_ptr, sLse,
+          sRowDot, D, block.valid_q_rows, 0, tid);
         __syncthreads();
 
         // ==================================================================================
         // MAIN LOOP (iterates over K/V blocks for current Q block)
         // ==================================================================================
-        for (int block = block_min; block < block_max; ++block) {
-            const int start_kv = block * BLOCK_N;
+        for (int block_q = block.block_min; block_q < block.block_max; ++block_q) {
+            const int start_kv      = block_q * BLOCK_N;
             const int valid_kv_rows = min(BLOCK_N, N - start_kv);
 
             // ==================================================================================
@@ -181,10 +168,9 @@ flash_attention_backward_kernel(
             // Template: DUAL_LOAD=false, SRC_STRIDE=D, DST_STRIDE=D_STRIDE
             // ==================================================================================
             WMMA_GEMM_LOAD_TILE<Config, false, D_STRIDE>(
-            v_ptr + start_kv * D, sV,
-            nullptr, nullptr,
-            D, valid_kv_rows, tid);
-
+              v_ptr + start_kv * D, sV,
+              nullptr, nullptr,
+              D, valid_kv_rows, tid);
             __syncthreads();
 
             // ==================================================================================
@@ -193,11 +179,9 @@ flash_attention_backward_kernel(
             // Template: BLOCK_X=BLOCK_M, BLOCK_Y=BLOCK_N
             // ==================================================================================
             WMMA_GEMM_SCORES<Config, GemmType::dOV_dOVT, D, IS_CAUSAL, IS_ALIBI, IS_SOFTCAP, IS_WINDOW, BLOCK_M, BLOCK_N, D_STRIDE, N_STRIDE>(
-            sdO, sV, sdOV,
-            valid_q_rows, valid_kv_rows,
-            0, 0, 0, 1.0f, 0.0f, 0.0f, -1, -1,
-            warp_id, lane_id);
-
+              sdO, sV, sdOV,
+              block.valid_q_rows, valid_kv_rows,
+              0, 0, 0, 1.0f, 0.0f, 0.0f, -1, -1, warp_id, lane_id);
             __syncthreads();
 
             // ==================================================================================
@@ -206,10 +190,9 @@ flash_attention_backward_kernel(
             // Template: DUAL_LOAD=false, SRC_STRIDE=D, DST_STRIDE=D_STRIDE
             // ==================================================================================
             WMMA_GEMM_LOAD_TILE<Config, false, D_STRIDE>(
-            k_ptr + start_kv * D, sK,
-            nullptr, nullptr,
-            D, valid_kv_rows, tid);
-
+              k_ptr + start_kv * D, sK,
+              nullptr, nullptr,
+              D, valid_kv_rows, tid);
             __syncthreads();
 
             // ==================================================================================
@@ -218,13 +201,11 @@ flash_attention_backward_kernel(
             // Template: BLOCK_X=BLOCK_M, BLOCK_Y=BLOCK_N
             // ==================================================================================
             WMMA_GEMM_SCORES<Config, GemmType::sQ_KT, D, IS_CAUSAL, IS_ALIBI, IS_SOFTCAP, IS_WINDOW, BLOCK_M, BLOCK_N, D_STRIDE, N_STRIDE>(
-            sQ, sK, sS,
-            valid_q_rows,  valid_kv_rows,
-            start_q,       start_kv,
-            seqlen_offset,
-            softmax_scale, softcap, alibi_slope, window_left, window_right,
-            warp_id,       lane_id);
-
+              sQ, sK, sS,
+              block.valid_q_rows,  valid_kv_rows,
+              block.start_q,       start_kv,
+              block.seqlen_offset,
+              softmax_scale, softcap, alibi_slope, window_left, window_right, warp_id, lane_id);
             __syncthreads();
 
             // ==================================================================================
@@ -234,13 +215,12 @@ flash_attention_backward_kernel(
             // Template: LDS_STRIDE=N_STRIDE, LDO_STRIDE=N_STRIDE, TILE_X=BLOCK_M, TILE_Y=BLOCK_N
             // ==================================================================================
             WMMA_GEMM_SOFTMAX_GRADIENT<Config, GemmType::compute_dS, IS_SOFTCAP, IS_DROPOUT, N_STRIDE, N_STRIDE, BLOCK_M, BLOCK_N>(
-            sS, sdOV, sLse, sRowDot,
-            nullptr, sdS,
-            valid_q_rows, valid_kv_rows,
-            softmax_scale, softcap,
-            p_dropout, dropout_seed, dropout_offset,
-            start_q, start_kv, N, tid);
-
+              sS, sdOV, sLse, sRowDot,
+              nullptr, sdS,
+              block.valid_q_rows, valid_kv_rows,
+              softmax_scale, softcap,
+              p_dropout, dropout_seed, dropout_offset,
+              block.start_q, start_kv, N, tid);
             __syncthreads();
 
             // ==================================================================================
@@ -249,10 +229,8 @@ flash_attention_backward_kernel(
             // Template: BLOCK_X=BLOCK_M, BLOCK_Y=BLOCK_N
             // ==================================================================================
             WMMA_GEMM_GRADIENTS<Config, GemmType::dQ_dSK, D, BLOCK_M, BLOCK_N, N_STRIDE, D_STRIDE>(
-            sdS, sK, sdQ,
-            valid_q_rows, valid_kv_rows,
-            warp_id,      lane_id);
-
+              sdS, sK, sdQ,
+              block.valid_q_rows, valid_kv_rows, warp_id, lane_id);
             __syncthreads();
         } // END MAIN LOOP
         // ==================================================================================
@@ -261,10 +239,10 @@ flash_attention_backward_kernel(
         // Template: D, D_STRIDE Head dimension and stride
         // ==================================================================================
         WMMA_GEMM_EPILOGUE<Config, GemmType::write_dQ, D_STRIDE>(
-        sdQ,     dQ_ptr,
-        nullptr, nullptr,
-        nullptr,
-        D, valid_q_rows, tid);
+          sdQ,     dQ_ptr,
+          nullptr, nullptr,
+          nullptr,
+          D, block.valid_q_rows, tid);
     }
     // ===================================================================================
     // PHASE 2: dKV
@@ -278,43 +256,33 @@ flash_attention_backward_kernel(
         constexpr int BLOCK_N   = Config::DKV::BLOCK_N;
         constexpr int D_STRIDE  = Config::DKV::D_STRIDE;
         constexpr int M_STRIDE  = Config::DKV::M_STRIDE;
-
         const int batch_head_id = blockIdx.z;
+        const int block_idx     = blockIdx.x;
+
         if (batch_head_id >= B * H_K) return;
 
-        const int block_idx = blockIdx.x;
-        const int start_kv  = block_idx * BLOCK_M;
-        if (start_kv >= N) return;
+        // ======================================================================================
+        // BlockInfo: Unified metadata resolution (Dense KV-centric)
+        // ======================================================================================
+        BlockInfo<IS_CAUSAL, IS_WINDOW, false> block;
+        block.init_kv(
+            block_idx,       // BLOCK_IDX:      Current KV-block index (grid.x)
+            batch_head_id,   // BATCH_HEAD_ID:  Global KV-head index (batch * H_K + head_kv)
+            H_Q,             // H_Q:            Number of query heads
+            H_K,             // H_K:            Number of KV heads
+            M,               // M:              Query sequence length
+            N,               // N:              KV sequence length
+            0,               // B:              Batch size (0 for dense, unused)
+            BLOCK_M,         // BLOCK_M:        Tile size along KV dimension
+            BLOCK_N,         // BLOCK_N:        Tile size along Q dimension
+            window_left,     // WINDOW_LEFT:    Left sliding window bound (-1 if disabled)
+            window_right,    // WINDOW_RIGHT:   Right sliding window bound (-1 if disabled)
+            nullptr,         // CU_SEQLENS_Q:   Cumulative Q lengths (nullptr for dense)
+            nullptr,         // CU_SEQLENS_K:   Cumulative KV lengths (nullptr for dense)
+            nullptr          // SEQUSED_K:      Actual KV lengths override (nullptr for dense)
+        );
 
-        const int valid_kv_rows = min(BLOCK_M, N - start_kv);
-        const int seqlen_offset = N - M;
-
-        // ==================================================================================
-        // Trim Q-tile iteration range for causal and sliding window attention
-        // Logic:    in dKV phase, K/V positions are fixed (start_kv), Q tiles iterate
-        //           causal restricts Q blocks before K - seqlen_offset (left bound)
-        //           window_left restricts Q blocks beyond K + window_left (right bound)
-        //           window_right restricts Q blocks before K - window_right (left bound)
-        //           q_block_min/q_block_max define valid [start, end) Q-tile index range
-        // ==================================================================================
-        int q_block_min = 0;
-        int q_block_max = (M + BLOCK_N - 1) / BLOCK_N;
-
-        if constexpr (IS_CAUSAL) {
-            const int min_q_pos = start_kv - seqlen_offset;
-            q_block_min = max(q_block_min, (min_q_pos > 0) ? (min_q_pos / BLOCK_N) : 0);
-        }
-
-        if constexpr (IS_WINDOW) {
-            if (window_right >= 0) {
-                const int min_q_pos_win = start_kv - seqlen_offset - window_right;
-                q_block_min = max(q_block_min, (min_q_pos_win > 0) ? (min_q_pos_win / BLOCK_N) : 0);
-            }
-            if (window_left >= 0) {
-                const int max_q_pos_win = start_kv + valid_kv_rows - 1 - seqlen_offset + window_left;
-                q_block_max = min(q_block_max, (max_q_pos_win >= 0) ? (max_q_pos_win / BLOCK_N) + 1 : 0);
-            }
-        }
+        if (block.start_kv >= N) return;
 
         // ==================================================================================
         // Init:    thread/warp/lane IDs for WMMA coordination
@@ -326,10 +294,10 @@ flash_attention_backward_kernel(
         // ==================================================================================
         // Layout:   [B, H_K, N, D] offset follows batch_head_id (KV-head space)
         // ==================================================================================
-        const __half* __restrict__ k_ptr  = K  + ((size_t)((batch_head_id / H_K) * H_K + (batch_head_id % H_K)) * N * D) + start_kv * D;
-        const __half* __restrict__ v_ptr  = V  + ((size_t)((batch_head_id / H_K) * H_K + (batch_head_id % H_K)) * N * D) + start_kv * D;
-              __half* __restrict__ dK_ptr = dK + ((size_t)((batch_head_id / H_K) * H_K + (batch_head_id % H_K)) * N * D) + start_kv * D;
-              __half* __restrict__ dV_ptr = dV + ((size_t)((batch_head_id / H_K) * H_K + (batch_head_id % H_K)) * N * D) + start_kv * D;
+        const __half* __restrict__ k_ptr  = K  + block.kv_offset(D, H_K, N) + block.start_kv * D;
+        const __half* __restrict__ v_ptr  = V  + block.kv_offset(D, H_K, N) + block.start_kv * D;
+              __half* __restrict__ dK_ptr = dK + block.kv_offset(D, H_K, N) + block.start_kv * D;
+              __half* __restrict__ dV_ptr = dV + block.kv_offset(D, H_K, N) + block.start_kv * D;
 
         // ==================================================================================
         // Init:   shared memory with zero-fill union regions to avoid stale data
@@ -361,10 +329,9 @@ flash_attention_backward_kernel(
         // Template: DUAL_LOAD=true, SRC_STRIDE=D, DST_STRIDE=D_STRIDE
         // ==================================================================================
         WMMA_GEMM_LOAD_TILE<Config, true, D_STRIDE>(
-        k_ptr,   sK,
-        v_ptr,   sV,
-        D, valid_kv_rows, tid);
-
+          k_ptr,   sK,
+          v_ptr,   sV,
+          D, block.valid_kv_rows, tid);
         __syncthreads();
 
         // ==================================================================================
@@ -384,8 +351,8 @@ flash_attention_backward_kernel(
             // ==================================================================================
             // Q-TILES LOOP (Iterate over Q-tiles for the current Q-head)
             // ==================================================================================
-            for (int block = q_block_min; block < q_block_max; ++block) {
-                const int start_q = block * BLOCK_N;
+            for (int block_q = block.block_min; block_q < block.block_max; ++block_q) {
+                const int start_q      = block_q * BLOCK_N;
                 const int valid_q_rows = min(BLOCK_N, M - start_q);
 
                 // ==================================================================================
@@ -394,10 +361,9 @@ flash_attention_backward_kernel(
                 // Template: DUAL_LOAD=false, SRC_STRIDE=D, DST_STRIDE=D_STRIDE
                 // ==================================================================================
                 WMMA_GEMM_LOAD_TILE<Config, false, D_STRIDE>(
-                q_ptr + start_q * D, sQ,
-                nullptr, nullptr,
-                D, valid_q_rows, tid);
-
+                  q_ptr + start_q * D, sQ,
+                  nullptr, nullptr,
+                  D, valid_q_rows, tid);
                 __syncthreads();
 
                 // ==================================================================================
@@ -406,13 +372,11 @@ flash_attention_backward_kernel(
                 // Template: BLOCK_X=BLOCK_N, BLOCK_Y=BLOCK_M
                 // ==================================================================================
                 WMMA_GEMM_SCORES<Config, GemmType::sQ_KT, D, IS_CAUSAL, IS_ALIBI, IS_SOFTCAP, IS_WINDOW, BLOCK_N, BLOCK_M, D_STRIDE, M_STRIDE>(
-                sQ, sK, sS,
-                valid_q_rows,  valid_kv_rows,
-                start_q,       start_kv,
-                seqlen_offset,
-                softmax_scale, softcap, alibi_slope, window_left, window_right,
-                warp_id,       lane_id);
-
+                  sQ, sK, sS,
+                  valid_q_rows,  block.valid_kv_rows,
+                  start_q,       block.start_kv,
+                  block.seqlen_offset,
+                  softmax_scale, softcap, alibi_slope, window_left, window_right, warp_id, lane_id);
                 __syncthreads();
 
                 // ==================================================================================
@@ -421,10 +385,9 @@ flash_attention_backward_kernel(
                 // Template: DUAL_LOAD=false, SRC_STRIDE=D, DST_STRIDE=D_STRIDE
                 // ==================================================================================
                 WMMA_GEMM_LOAD_TILE<Config, false, D_STRIDE>(
-                dO_ptr + start_q * D, sdO,
-                nullptr, nullptr,
-                D, valid_q_rows, tid);
-
+                  dO_ptr + start_q * D, sdO,
+                  nullptr, nullptr,
+                  D, valid_q_rows, tid);
                 __syncthreads();
 
                 // ==================================================================================
@@ -434,10 +397,9 @@ flash_attention_backward_kernel(
                 // Note:     o_ptr must be pre-offset by caller (o_ptr + start_q*D), lse_ptr loaded with offset
                 // ==================================================================================
                 WMMA_GEMM_DOT_PRODUCT<Config, GemmType::rowdot_dKV, D_STRIDE>(
-                o_ptr + start_q * D, sdO,
-                lse_ptr, sLse, sRowDot,
-                D, valid_q_rows, start_q, tid);
-
+                  o_ptr + start_q * D, sdO,
+                  lse_ptr, sLse, sRowDot,
+                  D, valid_q_rows, start_q, tid);
                 __syncthreads();
 
                 // ==================================================================================
@@ -446,11 +408,9 @@ flash_attention_backward_kernel(
                 // Template: BLOCK_X=BLOCK_N, BLOCK_Y=BLOCK_M
                 // ==================================================================================
                 WMMA_GEMM_SCORES<Config, GemmType::dOV_dOVT, D, IS_CAUSAL, IS_ALIBI, IS_SOFTCAP, IS_WINDOW, BLOCK_N, BLOCK_M, D_STRIDE, M_STRIDE>(
-                sdO, sV, sdOV,
-                valid_q_rows, valid_kv_rows,
-                0, 0, 0, 1.0f, 0.0f, 0.0f, -1, -1,
-                warp_id, lane_id);
-
+                  sdO, sV, sdOV,
+                  valid_q_rows, block.valid_kv_rows,
+                  0, 0, 0, 1.0f, 0.0f, 0.0f, -1, -1, warp_id, lane_id);
                 __syncthreads();
 
                 // ==================================================================================
@@ -460,12 +420,10 @@ flash_attention_backward_kernel(
                 // Template: LDS_STRIDE=M_STRIDE, LDO_STRIDE=BLOCK_M, TILE_X=BLOCK_N, TILE_Y=BLOCK_M
                 // ==================================================================================
                 WMMA_GEMM_SOFTMAX_GRADIENT<Config, GemmType::compute_P_dS, IS_SOFTCAP, IS_DROPOUT, M_STRIDE, BLOCK_M, BLOCK_N, BLOCK_M>(
-                sS, sdOV, sLse, sRowDot, sP, sdS,
-                valid_q_rows,  valid_kv_rows,
-                softmax_scale, softcap,
-                p_dropout, dropout_seed, dropout_offset,
-                start_q, start_kv, N, tid);
-
+                  sS, sdOV, sLse, sRowDot, sP, sdS,
+                  valid_q_rows,  block.valid_kv_rows,
+                  softmax_scale, softcap,
+                  p_dropout, dropout_seed, dropout_offset, start_q, block.start_kv, N, tid);
                 __syncthreads();
 
                 // ==================================================================================
@@ -474,10 +432,9 @@ flash_attention_backward_kernel(
                 // Template: BLOCK_X=BLOCK_M, BLOCK_Y=BLOCK_N
                 // ==================================================================================
                 WMMA_GEMM_GRADIENTS<Config, GemmType::dV_PTdO, D, BLOCK_M, BLOCK_N, BLOCK_M, D_STRIDE>(
-                sP, sdO, sdV,
-                valid_kv_rows, valid_q_rows,
-                warp_id,       lane_id);
-
+                  sP, sdO, sdV,
+                  block.valid_kv_rows, valid_q_rows,
+                  warp_id, lane_id);
                 __syncthreads();
 
                 // ==================================================================================
@@ -486,10 +443,9 @@ flash_attention_backward_kernel(
                 // Template: DUAL_LOAD=false, SRC_STRIDE=D, DST_STRIDE=D_STRIDE
                 // ==================================================================================
                 WMMA_GEMM_LOAD_TILE<Config, false, D_STRIDE>(
-                q_ptr + start_q * D, sQ,
-                nullptr, nullptr,
-                D, valid_q_rows, tid);
-
+                  q_ptr + start_q * D, sQ,
+                  nullptr, nullptr,
+                  D, valid_q_rows, tid);
                 __syncthreads();
 
                 // ==================================================================================
@@ -498,10 +454,9 @@ flash_attention_backward_kernel(
                 // Template: BLOCK_X=BLOCK_M, BLOCK_Y=BLOCK_N
                 // ==================================================================================
                 WMMA_GEMM_GRADIENTS<Config, GemmType::dK_dSTQ, D, BLOCK_M, BLOCK_N, BLOCK_M, D_STRIDE>(
-                sdS, sQ, sdK,
-                valid_kv_rows, valid_q_rows,
-                warp_id,       lane_id);
-
+                  sdS, sQ, sdK,
+                  block.valid_kv_rows, valid_q_rows,
+                  warp_id, lane_id);
                 __syncthreads();
             } // END Q-TILES LOOP
         } // END Q-HEADS LOOP
@@ -513,10 +468,10 @@ flash_attention_backward_kernel(
         // Template: D, D_STRIDE Head dimension and stride
         // ==================================================================================
         WMMA_GEMM_EPILOGUE<Config, GemmType::write_dKV, D_STRIDE>(
-        sdK,    dK_ptr,
-        sdV,    dV_ptr,
-        nullptr,
-        D, valid_kv_rows, tid);
+          sdK,    dK_ptr,
+          sdV,    dV_ptr,
+          nullptr,
+          D, block.valid_kv_rows, tid);
     }
 }
 

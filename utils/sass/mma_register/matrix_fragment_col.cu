@@ -4,7 +4,7 @@
 #include <cstdio>
 
 #ifdef USE_VOLTA_MMA
-    #include "fused_mma_m16n16k16.h"
+    #include "mma_m16n16k16.h"
     using namespace volta;
 #else
     #include <mma.h>
