@@ -33,23 +33,27 @@ __device__ __forceinline__ void WMMA_GEMM_INIT_SMEM(char* smem_raw) {
 }
 
 // ======================================================================================
-// TILE LOADER (Single or Dual load, with internal casting)
-// Loads uint4-vectorized tiles from global memory to shared memory with bounds checking.
+// TILE LOADER: Global-shared load with decoupled stride/width for varlen/dense layouts.
+//   DUAL_LOAD:     Loads two independent buffers (GMEM0->SMEM0, GMEM1->SMEM1).
+//   SMEM_STRIDE:   Shared memory pitch (uint4-aligned), decoupled from global stride.
+//   GLOBAL_WIDTH:  Sub-tile column width for varlen; -1 falls back to GLOBAL_STRIDE.
 // ======================================================================================
-template<typename Config, bool DUAL_LOAD, int DST_STRIDE>
+template<typename Config, bool DUAL_LOAD, int SMEM_STRIDE, int GLOBAL_WIDTH = -1>
 __device__ __forceinline__ void WMMA_GEMM_LOAD_TILE(
     const __half* __restrict__ GMEM0,
           __half* __restrict__ SMEM0,
     const __half* __restrict__ GMEM1,
           __half* __restrict__ SMEM1,
-    int SRC_STRIDE,
+    int GLOBAL_STRIDE,
     int VALID_ROWS,
     int THREAD_ID
 ) {
     constexpr int THREADS_PER_BLOCK = Config::THREADS_PER_BLOCK;
-    constexpr int dst_stride_uint4  = (DST_STRIDE + 7) >> 3;
-    const     int src_stride_uint4  = (SRC_STRIDE + 7) >> 3;
-    const     int total_iters       = VALID_ROWS * src_stride_uint4;
+    constexpr int dst_stride_uint4  = (SMEM_STRIDE + 7) >> 3;
+    const     int wth_stride_uint4  = (((GLOBAL_WIDTH > 0) ? GLOBAL_WIDTH : GLOBAL_STRIDE) + 7) >> 3;
+    const     int src_stride_uint4  = (GLOBAL_STRIDE + 7) >> 3;
+
+    const     int total_iters       = VALID_ROWS * wth_stride_uint4;
 
     if (total_iters == 0) return;
 
@@ -65,8 +69,8 @@ __device__ __forceinline__ void WMMA_GEMM_LOAD_TILE(
 
     #pragma unroll 2
     for (int idx = THREAD_ID; idx < total_iters; idx += THREADS_PER_BLOCK) {
-        const int row = idx / src_stride_uint4;
-        const int col = idx % src_stride_uint4;
+        const int row = idx / wth_stride_uint4;
+        const int col = idx % wth_stride_uint4;
 
         const int src_offset = row * src_stride_uint4 + col;
         const int dst_offset = row * dst_stride_uint4 + col;
