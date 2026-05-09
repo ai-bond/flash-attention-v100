@@ -12,7 +12,8 @@
 namespace py = pybind11;
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.doc() = "FlashAttention-2 implementation optimized for Volta";
-    m.def("fwd", &flash_attention_forward, "FlashAttention-2 Forward Pass (Volta)");
-    m.def("bwd", &flash_attention_backward, "FlashAttention-2 Backward Pass (Volta)");
+    m.doc() = "FlashAttention implementation optimized for Volta";
+    m.def("fwd", &flash_attention_forward,  "FlashAttention Forward Pass");
+    m.def("bwd", &flash_attention_backward, "FlashAttention Backward Pass");
+    m.def("varlen_fwd", &flash_attention_varlen_forward,  "FlashAttention Forward Pass  (variable length)");
 }

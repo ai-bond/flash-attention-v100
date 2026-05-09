@@ -60,6 +60,7 @@ def get_ext_modules():
             sources=[
                 "kernel/fused_mha_api.cpp",
                 "kernel/fused_mha_forward.cu",
+                "kernel/fused_mha_forward_varlen.cu",
                 "kernel/fused_mha_backward.cu",
             ],
             include_dirs=[this_dir / "include"],
