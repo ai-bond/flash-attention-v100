@@ -7,6 +7,10 @@
 
 // ======================================================================================
 // BlockInfo: Computes iteration bounds, offsets, and block for forward/backward kernels.
+//   - Forward/dQ: Grid Y = B * H_Q  -> BATCH_HEAD_ID decodes via H_Q
+//   - Backward dKV:
+//       * Varlen: Grid Y = B * H_Q  -> H_Q, maps to KV-head internally
+//       * Dense:  Grid Y = B * H_K  -> H_K directly
 // ======================================================================================
 template<bool IS_CAUSAL, bool IS_WINDOW, bool IS_VARLEN>
 struct BlockInfo {
@@ -49,32 +53,20 @@ struct BlockInfo {
         valid_kv_rows = 0;
 
         if constexpr (IS_VARLEN) {
-            head_idx    = BATCH_HEAD_ID;
+            batch_idx   = BATCH_HEAD_ID / H_Q;
+            head_idx    = BATCH_HEAD_ID % H_Q;
             kv_head_idx = head_idx / (H_Q / H_K);
-            batch_idx   = -1;
-            int local_block = BLOCK_IDX;
-            #pragma unroll 1
-            for (int b = 0; b < B; ++b) {
-                int seq_q = CU_SEQLENS_Q[b + 1] - CU_SEQLENS_Q[b];
-                int seq_k = CU_SEQLENS_K[b + 1] - CU_SEQLENS_K[b];
-                int blocks_in_seq = (seq_q + BLOCK_M - 1) / BLOCK_M;
-                if (local_block < blocks_in_seq) {
-                    batch_idx  = b;
-                    seqlen_q   = seq_q;
-                    seqlen_k   = seq_k;
-                    break;
-                }
-                local_block -= blocks_in_seq;
-            }
-            if (batch_idx == -1) { valid_q_rows = 0; return; }
+
+            q_base      = CU_SEQLENS_Q[batch_idx];
+            k_base      = CU_SEQLENS_K[batch_idx];
+            seqlen_q    = CU_SEQLENS_Q[batch_idx + 1] - q_base;
+            seqlen_k    = CU_SEQLENS_K[batch_idx + 1] - k_base;
 
             if (SEQUSED_K != nullptr) {
                 int used_k = SEQUSED_K[batch_idx];
                 seqlen_k = (used_k > 0) ? min(seqlen_k, used_k) : 0;
             }
-            q_base = CU_SEQLENS_Q[batch_idx];
-            k_base = CU_SEQLENS_K[batch_idx];
-            start_q = local_block * BLOCK_M;
+            start_q = BLOCK_IDX * BLOCK_M;
         } else {
             batch_idx   = BATCH_HEAD_ID / H_Q;
             head_idx    = BATCH_HEAD_ID % H_Q;
@@ -86,10 +78,15 @@ struct BlockInfo {
             start_q     = BLOCK_IDX * BLOCK_M;
         }
 
-        valid_q_rows    = min(BLOCK_M, seqlen_q - start_q);
-        seqlen_offset   = seqlen_k - seqlen_q;
-        block_min       = 0;
-        block_max       = (seqlen_k + BLOCK_N - 1) / BLOCK_N;
+        if (start_q >= seqlen_q) {
+            valid_q_rows = 0;
+            return;
+        }
+
+        valid_q_rows  = min(BLOCK_M, seqlen_q - start_q);
+        seqlen_offset = seqlen_k - seqlen_q;
+        block_min     = 0;
+        block_max     = (seqlen_k + BLOCK_N - 1) / BLOCK_N;
 
         // ==================================================================================
         // Trim K/V iteration range for causal and sliding window attention (forward/dQ phase)
@@ -134,32 +131,23 @@ struct BlockInfo {
         const int* CU_SEQLENS_K,
         const int* SEQUSED_K
     ) {
-        start_q      = 0;
-        valid_q_rows = 0;
+        start_q         = 0;
+        valid_q_rows    = 0;
 
         if constexpr (IS_VARLEN) {
-            kv_head_idx = BATCH_HEAD_ID;
-            head_idx    = -1;
-            batch_idx   = -1;
-            int local_block = BLOCK_IDX;
-            #pragma unroll 1
-            for (int b = 0; b < B; ++b) {
-                int seq_k = CU_SEQLENS_K[b + 1] - CU_SEQLENS_K[b];
-                int seq_q = CU_SEQLENS_Q[b + 1] - CU_SEQLENS_Q[b];
-                int blocks_in_seq = (seq_k + BLOCK_M - 1) / BLOCK_M;
-                if (local_block < blocks_in_seq) {
-                    batch_idx  = b;
-                    seqlen_k   = seq_k;
-                    seqlen_q   = seq_q;
-                    break;
-                }
-                local_block -= blocks_in_seq;
-            }
-            if (batch_idx == -1) { valid_kv_rows = 0; return; }
+            batch_idx   = BATCH_HEAD_ID / H_Q;
+            head_idx    = BATCH_HEAD_ID % H_Q;
+            kv_head_idx = head_idx / (H_Q / H_K);
+            q_base      = CU_SEQLENS_Q[batch_idx];
+            k_base      = CU_SEQLENS_K[batch_idx];
+            seqlen_q    = CU_SEQLENS_Q[batch_idx + 1] - q_base;
+            seqlen_k    = CU_SEQLENS_K[batch_idx + 1] - k_base;
 
-            q_base = CU_SEQLENS_Q[batch_idx];
-            k_base = CU_SEQLENS_K[batch_idx];
-            start_kv = local_block * BLOCK_M;
+            if (SEQUSED_K != nullptr) {
+                int used_k = SEQUSED_K[batch_idx];
+                seqlen_k = (used_k > 0) ? min(seqlen_k, used_k) : 0;
+            }
+            start_kv = BLOCK_IDX * BLOCK_M;
         } else {
             batch_idx   = BATCH_HEAD_ID / H_K;
             kv_head_idx = BATCH_HEAD_ID % H_K;
@@ -171,10 +159,15 @@ struct BlockInfo {
             start_kv    = BLOCK_IDX * BLOCK_M;
         }
 
-        valid_kv_rows   = min(BLOCK_M, seqlen_k - start_kv);
-        seqlen_offset   = seqlen_k - seqlen_q;
-        block_min       = 0;
-        block_max       = (seqlen_q + BLOCK_N - 1) / BLOCK_N;
+        if (start_kv >= seqlen_k) {
+            valid_kv_rows = 0;
+            return;
+        }
+
+        valid_kv_rows = min(BLOCK_M, seqlen_k - start_kv);
+        seqlen_offset = seqlen_k - seqlen_q;
+        block_min     = 0;
+        block_max     = (seqlen_q + BLOCK_N - 1) / BLOCK_N;
 
         // ==================================================================================
         // Trim Q-tile iteration range for causal and sliding window attention (dKV phase)
