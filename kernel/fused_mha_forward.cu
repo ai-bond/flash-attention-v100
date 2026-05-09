@@ -175,7 +175,7 @@ flash_attention_forward_kernel(
         // ==================================================================================
         // Compute:  Online Softmax + O-scaling
         // Layout:   S[BLOCK_M, BLOCK_N] -> P[BLOCK_M, BLOCK_N], O[BLOCK_M, D] scaled
-        // Template: BLOCK_M, BLOCK_N, N_STRIDE, D_STRIDE
+        // Template: BLOCK_M, BLOCK_N, N_STRIDE, D_STRIDE, TAILS(FALSE)
         // ==================================================================================
         WMMA_GEMM_SOFTMAX<Config, BLOCK_M, BLOCK_N, N_STRIDE, D_STRIDE>(
           sS, sP, sO,

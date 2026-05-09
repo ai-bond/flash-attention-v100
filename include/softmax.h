@@ -11,7 +11,7 @@
 // ======================================================================================
 // WMMA_GEMM_SOFTMAX: Online softmax with O-scaling
 // ======================================================================================
-template<typename Config, int BLOCK_M, int BLOCK_N, int SCORE_STRIDE, int HEAD_STRIDE>
+template<typename Config, int BLOCK_M, int BLOCK_N, int SCORE_STRIDE, int HEAD_STRIDE, bool TILES = false>
 __device__ __forceinline__ void WMMA_GEMM_SOFTMAX(
     float*  __restrict__ SMEM_S,
     __half* __restrict__ SMEM_P,
@@ -40,14 +40,19 @@ __device__ __forceinline__ void WMMA_GEMM_SOFTMAX(
      __half* sP_half   = SMEM_P + row * SCORE_STRIDE;
     __half2* sP_half2  = reinterpret_cast<__half2*>(sP_half);
 
-    const int cols = VALID_KV >> 2;
-    const int tail = cols << 2;
+    const int cols =  VALID_KV >> 2;
+    const int tail = (VALID_KV >> 2) << 2;
 
     if (row < VALID_Q) {
         #pragma unroll 4
         for (int idx = thread; idx < cols; idx += THREADS_PER_ROW) {
             float4 buffer = sS_float4[idx];
             thread_max = fmaxf(thread_max, fmaxf(fmaxf(buffer.x, buffer.y), fmaxf(buffer.z, buffer.w)));
+        }
+        if constexpr (TILES) {
+            for (int idx = tail + thread; idx < VALID_KV; idx += THREADS_PER_ROW) {
+                thread_max = fmaxf(thread_max, sS_float[idx]);
+            }
         }
     }
 
@@ -75,13 +80,12 @@ __device__ __forceinline__ void WMMA_GEMM_SOFTMAX(
             half_buffer[rb_idx++] = __float22half2_rn(make_float2(e2, e3));
         }
 
-        if (tail < VALID_KV) {
-            #pragma unroll 4
-            for (int idx = tail + thread; idx < BLOCK_N; idx += THREADS_PER_ROW) {
-                float v = (idx < VALID_KV) ? sS_float[idx] : NEG_INF;
+        if constexpr (TILES) {
+            for (int idx = tail + thread; idx < VALID_KV; idx += THREADS_PER_ROW) {
+                float v = sS_float[idx];
                 float e = __expf(fmaxf(v - new_max, -80.0f));
-                thread_sum += (idx < VALID_KV) ? e : 0.0f;
-                sP_half[idx] = (idx < VALID_KV) ? __float2half_rn(e) : __float2half(0.f);
+                thread_sum += e;
+                sP_half[idx] = __float2half_rn(e);
             }
         }
 
