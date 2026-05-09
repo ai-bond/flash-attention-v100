@@ -33,10 +33,10 @@ __device__ __forceinline__ void WMMA_GEMM_INIT_SMEM(char* smem_raw) {
 }
 
 // ======================================================================================
-// TILE LOADER: Global-shared load with decoupled stride/width for varlen/dense layouts.
-//   DUAL_LOAD:     Loads two independent buffers (GMEM0->SMEM0, GMEM1->SMEM1).
-//   SMEM_STRIDE:   Shared memory pitch (uint4-aligned), decoupled from global stride.
-//   GLOBAL_WIDTH:  Sub-tile column width for varlen; -1 falls back to GLOBAL_STRIDE.
+// TILE LOADER: Global-shared load with decoupled stride/width for varlen/dense layouts
+//   DUAL_LOAD:     Loads two independent buffers (GMEM0->SMEM0, GMEM1->SMEM1)
+//   SMEM_STRIDE:   Shared memory pitch (uint4-aligned), decoupled from global stride
+//   GLOBAL_WIDTH:  Sub-tile column width for varlen; -1 falls back to GLOBAL_STRIDE
 // ======================================================================================
 template<typename Config, bool DUAL_LOAD, int SMEM_STRIDE, int GLOBAL_WIDTH = -1>
 __device__ __forceinline__ void WMMA_GEMM_LOAD_TILE(
@@ -110,9 +110,12 @@ __device__ __forceinline__ void WMMA_GEMM_LOAD_TILE(
 }
 
 // ============================================================================
-// KERNEL_EPILOGUE
+// KERNEL EPILOGUE:   Shared-global fp32->fp16 store with optional norm & dual output
+//   TYPE (GemmType): NORMLZE (bit 0) rescales by 1/SMEM_DOT[row]; DUAL_STORE (bit 1) writes SMEM1->GMEM1
+//   SMEM_STRIDE:     Shared memory pitch (float4-aligned), decoupled from global stride
+//   GLOBAL_WIDTH:    Sub-tile column width for varlen; -1 falls back to GLOBAL_STRIDE
 // ============================================================================
-template<typename Config, GemmType TYPE, int SMEM_STRIDE>
+template<typename Config, GemmType TYPE, int SMEM_STRIDE, int GLOBAL_WIDTH = -1 >
 __device__ __forceinline__ void WMMA_GEMM_EPILOGUE(
     const float* __restrict__ SMEM0,
          __half* __restrict__ GMEM0,
@@ -123,8 +126,7 @@ __device__ __forceinline__ void WMMA_GEMM_EPILOGUE(
     int VALID_ROWS,
     int THREAD_ID
 ) {
-
-    const int global_chunks = GLOBAL_STRIDE >> 2;
+    const int global_chunks = ((GLOBAL_WIDTH > 0) ? GLOBAL_WIDTH : GLOBAL_STRIDE) >> 2;
     const int total_iters   = VALID_ROWS * global_chunks;
 
     if (total_iters == 0) return;
