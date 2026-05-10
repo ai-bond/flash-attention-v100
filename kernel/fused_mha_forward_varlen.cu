@@ -97,8 +97,8 @@ flash_attention_forward_varlen_kernel(
     // Writes deterministic zeros to Out and NEG_INF to LSE for numerical stability.
     // ======================================================================================
     if (block.block_min >= block.block_max || block.seqlen_k == 0) {
-        const size_t q_base   = static_cast<size_t>(block.q_base + block.start_q) * H_Q * D + static_cast<size_t>(bthd_idx) * D;
-        const size_t lse_base = static_cast<size_t>(bthd_idx) * T_Q + block.q_base + block.start_q;
+        const size_t q_base   = block.q_offset(D, H_Q, T_Q);
+        const size_t lse_base = block.lse_offset(H_Q, T_Q);
         for (int row = threadIdx.x; row < block.valid_q_rows; row += blockDim.x) {
             #pragma unroll
             for (int d = 0; d < D; ++d) {
