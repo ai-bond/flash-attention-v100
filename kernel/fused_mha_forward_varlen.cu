@@ -23,7 +23,7 @@
 // ======================================================================================
 // FORWARD VARLEN KERNEL
 // ======================================================================================
-template<int D, bool IS_CAUSAL, bool IS_ALIBI, bool IS_SOFTCAP, bool IS_WINDOW, bool IS_DROPOUT>
+template<int D, bool IS_CAUSAL, bool IS_ALIBI, bool IS_SOFTCAP, bool IS_WINDOW, bool IS_DROPOUT, bool IS_PAGED>
 __global__ void __launch_bounds__(KernelConfig<D>::THREADS_PER_BLOCK, 2)
 flash_attention_forward_varlen_kernel(
     const __half* __restrict__ Q,
@@ -179,7 +179,7 @@ flash_attention_forward_varlen_kernel(
         const __half* __restrict__ k_ptr_page;
         const __half* __restrict__ v_ptr_page;
 
-        if (block_table != nullptr) {
+        if constexpr (IS_PAGED) {
             const int page_idx    = start_kv / block_page;
             const int page_offset = start_kv % block_page;
             const int bt_idx      = block.batch_idx * block_table_stride + page_idx;
@@ -333,7 +333,7 @@ void launcher_flash_attention_forward_varlen(
     bool is_softcap = (softcap > 0.0f);
     bool is_window  = (window_left >= 0 || window_right >= 0);
     bool is_dropout = (p_dropout > 0.0f);
-    bool is_paged   = false;
+    bool is_paged   = paged_KV;
 
     const __half* q_ptr            = reinterpret_cast<const __half*>(Q.data_ptr());
     const __half* k_ptr            = reinterpret_cast<const __half*>(K.data_ptr());
@@ -354,8 +354,9 @@ void launcher_flash_attention_forward_varlen(
         constexpr bool IS_SOFTCAP = decltype(SOFTCAP)::value;
         constexpr bool IS_WINDOW  = decltype(WINDOW)::value;
         constexpr bool IS_DROPOUT = decltype(DROPOUT)::value;
+        constexpr bool IS_PAGED   = decltype(PAGED)::value;
 
-        auto kernel = flash_attention_forward_varlen_kernel<D, IS_CAUSAL, IS_ALIBI, IS_SOFTCAP, IS_WINDOW, IS_DROPOUT>;
+        auto kernel = flash_attention_forward_varlen_kernel<D, IS_CAUSAL, IS_ALIBI, IS_SOFTCAP, IS_WINDOW, IS_DROPOUT, IS_PAGED>;
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
 
         kernel<<<grid, block, smem, stream>>>(
