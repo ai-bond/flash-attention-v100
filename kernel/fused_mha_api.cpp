@@ -16,4 +16,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("fwd", &flash_attention_forward,  "FlashAttention Forward Pass");
     m.def("bwd", &flash_attention_backward, "FlashAttention Backward Pass");
     m.def("varlen_fwd", &flash_attention_varlen_forward,  "FlashAttention Forward Pass  (variable length)");
+    m.def("varlen_bwd", &flash_attention_varlen_backward, "FlashAttention Backward Pass (variable length)");
 }

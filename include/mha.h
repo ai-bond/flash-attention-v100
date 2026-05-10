@@ -137,3 +137,59 @@ std::vector<at::Tensor> flash_attention_varlen_forward(
     std::optional<at::Generator> gen,
     int          num_splits = 0
 );
+
+/**
+ * FlashAttention Backward Pass (Varlen / Packed Layout)
+ *
+ * @param dout                Gradient output                  [total_q, H, D] (fp16, input)
+ * @param q                   Query tensor from forward        [total_q, H, D] (fp16, input)
+ * @param k                   Key tensor from forward          [total_k, H, D] (fp16, input)
+ * @param v                   Value tensor from forward        [total_k, H, D] (fp16, input)
+ * @param out                 Output from forward pass         [total_q, H, D] (fp16, input)
+ * @param softmax_lse         Forward's Softmax logsumexp      [total_q, H]    (fp32, input)
+ * @param dq                  Optional gradient query          [total_q, H, D] (fp16, output)
+ * @param dk                  Optional gradient key            [total_k, H, D] (fp16, output)
+ * @param dv                  Optional gradient value          [total_k, H, D] (fp16, output)
+ * @param cu_seqlens_q        Cumulative seq lengths for Q     [B+1] (int32, input)
+ * @param cu_seqlens_k        Cumulative seq lengths for K     [B+1] (int32, input)
+ * @param alibi_slopes        Optional ALiBi slopes tensor     (must match forward)
+ * @param max_seqlen_q        Maximum sequence length for Q    (int, input)
+ * @param max_seqlen_k        Maximum sequence length for K    (int, input)
+ * @param p_dropout           Dropout probability              (must match forward)
+ * @param softmax_scale       Softmax scale factor             (must match forward)
+ * @param zero_tensors        Zero grad tensors before compute (bool, input)
+ * @param is_causal           Causal masking flag              (must match forward)
+ * @param window_left         Left window size                 (must match forward)
+ * @param window_right        Right window size                (must match forward)
+ * @param softcap             Soft capping value               (must match forward)
+ * @param deterministic       Use deterministic backward pass  (bool, input)
+ * @param gen                 Optional RNG for dropout         (input)
+ * @param rng_state           Optional RNG state for repro     (input)
+ * @return                    Vector of gradient tensors {dq, dk, dv}
+ */
+std::vector<at::Tensor> flash_attention_varlen_backward(
+    const at::Tensor& dout,
+    const at::Tensor& q,
+    const at::Tensor& k,
+    const at::Tensor& v,
+    const at::Tensor& out,
+    const at::Tensor& softmax_lse,
+    std::optional<at::Tensor>& dq,
+    std::optional<at::Tensor>& dk,
+    std::optional<at::Tensor>& dv,
+    const at::Tensor& cu_seqlens_q,
+    const at::Tensor& cu_seqlens_k,
+    std::optional<at::Tensor>& alibi_slopes,
+    const int    max_seqlen_q,
+    const int    max_seqlen_k,
+    const float  p_dropout,
+    const float  softmax_scale,
+    const bool   zero_tensors,
+    const bool   is_causal,
+    int          window_left,
+    int          window_right,
+    const float  softcap,
+    const bool  deterministic,
+    std::optional<at::Generator> gen,
+    std::optional<at::Tensor>& rng_state
+);
