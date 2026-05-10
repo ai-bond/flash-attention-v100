@@ -67,7 +67,7 @@ flash_attention_forward_varlen_kernel(
     const int block_idx    = blockIdx.x;
     const int bthd_idx     = blockIdx.z;
 
-    if (bthd_idx >= H_Q) return;
+    if (bthd_idx >= B * H_Q) return;
 
     // ======================================================================================
     // BlockInfo: Metadata resolution

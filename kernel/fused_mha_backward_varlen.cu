@@ -71,7 +71,7 @@ flash_attention_backward_varlen_kernel(
         // ======================================================================================
         const int block_idx    = blockIdx.x;
         const int bthd_idx     = blockIdx.z;
-        if (bthd_idx >= H_Q) return;
+        if (bthd_idx >= B * H_Q) return;
 
         // ======================================================================================
         // BlockInfo: Metadata resolution
@@ -130,12 +130,12 @@ flash_attention_backward_varlen_kernel(
         //   K/V:       [T_K, H_K, D]            offset follows k_base (K, H_K, D)
         //   LSE/dLSE:  [H_Q, T_Q]               offset follows bthd_idx * T_Q (H_Q, T_Q)
         // ======================================================================================
-        const __half* __restrict__ q_ptr   = Q  + block.q_offset(D, H_Q, T_Q);
+        const __half* __restrict__ q_ptr   = Q  + block.q_offset (D, H_Q, T_Q);
         const __half* __restrict__ k_ptr   = K  + block.kv_offset(D, H_K, T_K);
         const __half* __restrict__ v_ptr   = V  + block.kv_offset(D, H_K, T_K);
-        const __half* __restrict__ o_ptr   = O  + block.q_offset(D, H_Q, T_Q);
-        const __half* __restrict__ dO_ptr  = dO + block.q_offset(D, H_Q, T_Q);
-        __half* __restrict__ dQ_ptr        = dQ + block.q_offset(D, H_Q, T_Q);
+        const __half* __restrict__ o_ptr   = O  + block.q_offset (D, H_Q, T_Q);
+        const __half* __restrict__ dO_ptr  = dO + block.q_offset (D, H_Q, T_Q);
+              __half* __restrict__ dQ_ptr  = dQ + block.q_offset (D, H_Q, T_Q);
         const float*  __restrict__ lse_ptr = softmax_lse + block.lse_offset(H_Q, T_Q);
         float*  __restrict__ dLse_ptr      = softmax_d   + block.lse_offset(H_Q, T_Q);
 
@@ -143,8 +143,11 @@ flash_attention_backward_varlen_kernel(
         // INIT SHARED MEMORY
         // ======================================================================================
         extern __shared__ char smem_raw[];
+
         WMMA_GEMM_INIT_SMEM<Config>(smem_raw);
+
         __syncthreads();
+
         auto& smem = *reinterpret_cast<typename Config::SmemLayout*>(smem_raw);
 
         __half* __restrict__ sQ      = smem.phase.bdq.q;
@@ -297,7 +300,8 @@ flash_attention_backward_varlen_kernel(
         // ======================================================================================
         const int block_idx    = blockIdx.x;
         const int bthd_idx  = blockIdx.z;
-        if (bthd_idx >= H_K) return;
+
+        if (bthd_idx >= B * H_Q) return;
 
         // ======================================================================================
         // BlockInfo: Metadata resolution
