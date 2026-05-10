@@ -69,8 +69,9 @@ flash_attention_backward_varlen_kernel(
         // ======================================================================================
         // Grid Mapping: 1D X for Q-blocks, Z for heads. Batch resolved device-side.
         // ======================================================================================
-        const int block_idx    = blockIdx.x;
-        const int bthd_idx     = blockIdx.z;
+        const int block_idx     = blockIdx.x;
+        const int bthd_idx      = blockIdx.z;
+
         if (bthd_idx >= B * H_Q) return;
 
         // ======================================================================================
@@ -121,7 +122,7 @@ flash_attention_backward_varlen_kernel(
         const int lane_id = tid & 31;
 
         // Alibi slope for current head
-        const float alibi_slope = (alibi_slopes != nullptr) ? alibi_slopes[bthd_idx] : 0.0f;
+        const float alibi_slope = (alibi_slopes != nullptr) ? alibi_slopes[bthd_idx % H_Q] : 0.0f;
 
         // ======================================================================================
         // RAGGED POINTERS
@@ -298,8 +299,8 @@ flash_attention_backward_varlen_kernel(
         // ======================================================================================
         // Grid Mapping: 1D X for KV-blocks, Z for bthd_idx. Batch resolved device-side.
         // ======================================================================================
-        const int block_idx    = blockIdx.x;
-        const int bthd_idx  = blockIdx.z;
+        const int block_idx     = blockIdx.x;
+        const int bthd_idx      = blockIdx.z;
 
         if (bthd_idx >= B * H_Q) return;
 

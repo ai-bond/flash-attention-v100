@@ -116,7 +116,7 @@ flash_attention_forward_varlen_kernel(
     const int warp_id   = tid >> 5;
     const int lane_id   = tid & 31;
     // Alibi slope only for valid block
-    const float alibi_slope = (alibi_slopes != nullptr) ? alibi_slopes[bthd_idx] : 0.0f;
+    const float alibi_slope = (alibi_slopes != nullptr) ? alibi_slopes[bthd_idx % H_Q] : 0.0f;
 
     // ======================================================================================
     // RAGGED POINTERS
