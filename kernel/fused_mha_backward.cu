@@ -45,6 +45,7 @@ flash_attention_backward_kernel(
     const float    softmax_scale,
     const float    softcap,
     const float*   alibi_slopes,
+    const int      alibi_batch,
     int            window_left,
     int            window_right,
     const float    p_dropout,
@@ -101,8 +102,9 @@ flash_attention_backward_kernel(
         const int tid     = threadIdx.x;
         const int warp_id = tid >> 5;
         const int lane_id = tid & 31;
-        // Alibi slope only for valid block
-        const float alibi_slope = (alibi_slopes) ? alibi_slopes[bthd_idx % H_Q] : 0.0f;
+        // Alibi slope only for valid block + batch
+        const int   alibi_idx   = (alibi_batch > 0) ? (block.batch_idx * alibi_batch + block.head_idx) : block.head_idx;
+        const float alibi_slope = (alibi_slopes != nullptr) ? alibi_slopes[alibi_idx] : 0.0f;
 
         // ==================================================================================
         // Layout:
@@ -355,7 +357,9 @@ flash_attention_backward_kernel(
             const __half* __restrict__ o_ptr   = O           + (size_t)((bthd_idx / H_K) * H_Q + (((bthd_idx % H_K) * (H_Q / H_K)) + group)) * M * D;
             const __half* __restrict__ dO_ptr  = dO          + (size_t)((bthd_idx / H_K) * H_Q + (((bthd_idx % H_K) * (H_Q / H_K)) + group)) * M * D;
             const  float* __restrict__ lse_ptr = softmax_lse + (size_t)((bthd_idx / H_K) * H_Q + (((bthd_idx % H_K) * (H_Q / H_K)) + group)) * M;
-            const  float           alibi_slope = (alibi_slopes) ? alibi_slopes[((bthd_idx / H_K) * H_Q + (bthd_idx % H_K) * (H_Q / H_K) + group) % H_Q] : 0.0f;
+            // Alibi slope only for valid block + batch
+            const int   alibi_idx   = (alibi_batch > 0) ? ((bthd_idx / H_K) * alibi_batch + ((bthd_idx % H_K) * (H_Q / H_K) + group)) : (bthd_idx % H_K) * (H_Q / H_K) + group;
+            const float alibi_slope = (alibi_slopes != nullptr) ? alibi_slopes[alibi_idx] : 0.0f;
 
             // ==================================================================================
             // Q-TILES LOOP (Iterate over Q-tiles for the current Q-head)
@@ -503,6 +507,7 @@ void launcher_flash_attention_backward(
     float softcap,
     float p_dropout,
     const float* alibi_slopes,
+    const int    alibi_batch,
     int window_left,
     int window_right,
     uint64_t dropout_seed,
@@ -558,7 +563,7 @@ void launcher_flash_attention_backward(
             q_ptr, k_ptr, v_ptr, o_ptr, dO_ptr, lse_ptr,
             dQ_ptr, dK_ptr, dV_ptr,
             B, H_Q, H_K, M, N, grid_dq, grid_dkv,
-            softmax_scale, softcap, alibi_slopes, window_left, window_right,
+            softmax_scale, softcap, alibi_slopes, alibi_batch, window_left, window_right,
             p_dropout, dropout_seed, dropout_offset
         );
     });
@@ -627,6 +632,7 @@ std::vector<at::Tensor> flash_attention_backward(
 
     // Alibi slopes validation
     const float* alibi = nullptr;
+    int alibi_batch = 0;
     if (alibi_slopes.has_value()) {
         const auto& slopes = alibi_slopes.value();
         auto sizes = slopes.sizes();
@@ -635,6 +641,7 @@ std::vector<at::Tensor> flash_attention_backward(
         bool valid_shape = (sizes.size() == 1 && sizes[0] == H_Q) ||
                            (sizes.size() == 2 && sizes[0] == B && sizes[1] == H_Q);
         TORCH_CHECK(valid_shape, "alibi_slopes shape must be [H_Q] or [B, H_Q], got ", sizes);
+        alibi_batch = (slopes.dim() == 2) ? slopes.stride(0) : 0;
         alibi = slopes.data_ptr<float>();
     }
 
@@ -676,7 +683,7 @@ std::vector<at::Tensor> flash_attention_backward(
 
     #define LAUNCH_KERNEL(DIM) \
         launcher_flash_attention_backward<DIM>(q, k, v, out, dout, softmax_lse, dq_fp16, dk_fp16, dv_fp16, softmax_scale, is_causal, \
-                                               softcap, p_dropout, alibi, window_left, window_right, dropout_seed, dropout_offset, stream);
+                                               softcap, p_dropout, alibi, alibi_batch, window_left, window_right, dropout_seed, dropout_offset, stream);
     switch (D) {
         case 16:  LAUNCH_KERNEL(16);  break;
         case 32:  LAUNCH_KERNEL(32);  break;

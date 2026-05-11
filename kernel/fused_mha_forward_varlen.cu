@@ -48,6 +48,7 @@ flash_attention_forward_varlen_kernel(
     const float    softmax_scale,
     const float    softcap,
     const float*   alibi_slopes,
+    const int      alibi_batch,
     int            window_left,
     int            window_right,
     const float    p_dropout,
@@ -115,8 +116,9 @@ flash_attention_forward_varlen_kernel(
     const int tid       = threadIdx.x;
     const int warp_id   = tid >> 5;
     const int lane_id   = tid & 31;
-    // Alibi slope only for valid block
-    const float alibi_slope = (alibi_slopes != nullptr) ? alibi_slopes[bthd_idx % H_Q] : 0.0f;
+    // Alibi slope only for valid block + batch
+    const int   alibi_idx   = (alibi_batch > 0) ? (block.batch_idx * alibi_batch + block.head_idx) : block.head_idx;
+    const float alibi_slope = (alibi_slopes != nullptr) ? alibi_slopes[alibi_idx] : 0.0f;
 
     // ======================================================================================
     // RAGGED POINTERS
@@ -308,6 +310,7 @@ void launcher_flash_attention_forward_varlen(
     float        softcap,
     float        p_dropout,
     const float* alibi_slopes,
+    const int    alibi_batch,
     int          window_left,
     int          window_right,
     uint64_t     dropout_seed,
@@ -365,7 +368,7 @@ void launcher_flash_attention_forward_varlen(
             seqused_k_ptr, leftpad_k_ptr, block_table_ptr,
             B, H_Q, H_K, T_Q, max_seqlen_k,
             block_page, block_table_stride, kv_block_stride,
-            softmax_scale, softcap, alibi_slopes, window_left, window_right,
+            softmax_scale, softcap, alibi_slopes, alibi_batch, window_left, window_right,
             p_dropout, dropout_seed, dropout_offset
         );
     });
@@ -457,6 +460,7 @@ std::vector<at::Tensor> flash_attention_varlen_forward(
 
     // Alibi
     const float* alibi = nullptr;
+    int alibi_batch = 0;
     if (alibi_slopes.has_value()) {
         const auto& slopes = alibi_slopes.value();
         auto sizes = slopes.sizes();
@@ -465,6 +469,7 @@ std::vector<at::Tensor> flash_attention_varlen_forward(
         bool valid_shape = (sizes.size() == 1 && sizes[0] == H_Q) ||
                            (sizes.size() == 2 && sizes[0] == B && sizes[1] == H_Q);
         TORCH_CHECK(valid_shape, "alibi_slopes shape must be [H_Q] or [B, H_Q], got ", sizes);
+        alibi_batch = (slopes.dim() == 2) ? slopes.stride(0) : 0;
         alibi = slopes.data_ptr<float>();
     }
 
@@ -519,7 +524,7 @@ std::vector<at::Tensor> flash_attention_varlen_forward(
             cu_seqlens_q, cu_seqlens_k, seqused_k.value_or(torch::Tensor()), \
             leftpad_k.has_value() ? leftpad_k.value() : torch::Tensor(), \
             block_table_t, paged_KV, T_Q, max_seqlen_q, max_seqlen_k, \
-            softmax_scale, is_causal, softcap, p_dropout, alibi, \
+            softmax_scale, is_causal, softcap, p_dropout, alibi, alibi_batch, \
             window_left, window_right, dropout_seed, dropout_offset, stream);
 
     switch (D) {

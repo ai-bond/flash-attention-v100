@@ -48,6 +48,7 @@ flash_attention_backward_varlen_kernel(
     const float    softmax_scale,
     const float    softcap,
     const float*   alibi_slopes,
+    const int      alibi_batch,
     int            window_left,
     int            window_right,
     const float    p_dropout,
@@ -120,9 +121,9 @@ flash_attention_backward_varlen_kernel(
         const int tid     = threadIdx.x;
         const int warp_id = tid >> 5;
         const int lane_id = tid & 31;
-
-        // Alibi slope for current head
-        const float alibi_slope = (alibi_slopes != nullptr) ? alibi_slopes[bthd_idx % H_Q] : 0.0f;
+        // Alibi slope only for valid block + batch
+        const int   alibi_idx   = (alibi_batch > 0) ? (block.batch_idx * alibi_batch + block.head_idx) : block.head_idx;
+        const float alibi_slope = (alibi_slopes != nullptr) ? alibi_slopes[alibi_idx] : 0.0f;
 
         // ======================================================================================
         // RAGGED POINTERS
@@ -406,8 +407,6 @@ flash_attention_backward_varlen_kernel(
         // Iterates over all Q-heads that map to the current KV-head
         // ======================================================================================
         for (int group = 0; group < (H_Q / H_K); ++group) {
-            const int bthd_idx = block.kv_head_idx * (H_Q / H_K) + group;
-            const float alibi_slope = (alibi_slopes != nullptr) ? alibi_slopes[bthd_idx] : 0.0f;
 
             // ======================================================================================
             // RAGGED POINTERS for current Q-head
@@ -421,6 +420,9 @@ flash_attention_backward_varlen_kernel(
             const __half* __restrict__ o_ptr   = O  + q_head_off;
             const __half* __restrict__ dO_ptr  = dO + q_head_off;
             const float*  __restrict__ lse_ptr = softmax_lse + static_cast<size_t>(bthd_idx) * T_Q + block.q_base;
+            // Alibi slope only for valid block + batch
+            const int   alibi_idx   = (alibi_batch > 0) ? (block.batch_idx * alibi_batch + (block.kv_head_idx * (H_Q / H_K) + group)) : block.kv_head_idx * (H_Q / H_K) + group;
+            const float alibi_slope = (alibi_slopes != nullptr) ? alibi_slopes[alibi_idx] : 0.0f;
 
             __half* __restrict__ dK_ptr = dK_ptr_base + static_cast<size_t>(bthd_idx) * D;
             __half* __restrict__ dV_ptr = dV_ptr_base + static_cast<size_t>(bthd_idx) * D;
@@ -573,6 +575,7 @@ void launcher_flash_attention_backward_varlen(
     float        softcap,
     float        p_dropout,
     const float* alibi_slopes,
+    const int    alibi_batch,
     int          window_left,
     int          window_right,
     uint64_t     dropout_seed,
@@ -629,7 +632,7 @@ void launcher_flash_attention_backward_varlen(
             dq_ptr, dk_ptr, dv_ptr, softmax_d_ptr,
             cu_seqlens_q_ptr, cu_seqlens_k_ptr,
             B, H_Q, H_K, T_Q, T_K, grid_dq, grid_dkv,
-            softmax_scale, softcap, alibi_slopes, window_left, window_right,
+            softmax_scale, softcap, alibi_slopes, alibi_batch, window_left, window_right,
             p_dropout, dropout_seed, dropout_offset
         );
     });
@@ -704,6 +707,7 @@ std::vector<at::Tensor> flash_attention_varlen_backward(
 
     // Alibi
     const float* alibi = nullptr;
+    int alibi_batch = 0;
     if (alibi_slopes.has_value()) {
         const auto& slopes = alibi_slopes.value();
         auto sizes = slopes.sizes();
@@ -712,6 +716,7 @@ std::vector<at::Tensor> flash_attention_varlen_backward(
         bool valid_shape = (sizes.size() == 1 && sizes[0] == H_Q) ||
                            (sizes.size() == 2 && sizes[0] == B && sizes[1] == H_Q);
         TORCH_CHECK(valid_shape, "alibi_slopes shape must be [H_Q] or [B, H_Q], got ", sizes);
+        alibi_batch = (slopes.dim() == 2) ? slopes.stride(0) : 0;
         alibi = slopes.data_ptr<float>();
     }
 
@@ -759,7 +764,7 @@ std::vector<at::Tensor> flash_attention_varlen_backward(
     #define LAUNCH_KERNEL(DIM) \
         launcher_flash_attention_backward_varlen<DIM>(q, k, v, out, dout, softmax_lse, dq_fp16, dk_expanded, dv_expanded, softmax_d, \
             cu_seqlens_q, cu_seqlens_k, T_Q, T_K, max_seqlen_q, max_seqlen_k, \
-            softmax_scale, is_causal, softcap, p_dropout, alibi, \
+            softmax_scale, is_causal, softcap, p_dropout, alibi, alibi_batch, \
             window_left, window_right, dropout_seed, dropout_offset, stream);
 
     switch (D) {
