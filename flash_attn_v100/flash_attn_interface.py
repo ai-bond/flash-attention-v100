@@ -6,7 +6,7 @@ import torch
 import warnings
 import traceback
 import flash_attn_v100_cuda
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
 
 def maybe_contiguous(x: torch.Tensor) -> torch.Tensor:
     return x.contiguous() if x is not None and not x.is_contiguous() else x
@@ -28,7 +28,8 @@ class FlashAttnFunc(torch.autograd.Function):
         softcap: float,
         alibi_slopes: Optional[torch.Tensor],
         deterministic: bool,
-        return_attn_probs: bool = False
+        return_softmax: bool,
+        is_grad_enabled: bool
     ) -> torch.Tensor:
         q_ = q.permute(0, 2, 1, 3)
         k_ = k.permute(0, 2, 1, 3)
@@ -58,12 +59,12 @@ class FlashAttnFunc(torch.autograd.Function):
             q_, k_, v_, None, alibi_slopes,
             dropout_p, softmax_scale, causal,
             window_left, window_right, softcap,
-            return_attn_probs, None
+            return_softmax, None
         )
 
         out = out_[..., :head_size_og].permute(0, 2, 1, 3).contiguous()
 
-        if q.requires_grad or k.requires_grad or v.requires_grad:
+        if is_grad_enabled and (q.requires_grad or k.requires_grad or v.requires_grad):
             ctx.save_for_backward(q_, k_, v_, out_, lse_, rng_state)
             ctx.dropout_p = dropout_p
             ctx.softmax_scale = softmax_scale
@@ -75,7 +76,7 @@ class FlashAttnFunc(torch.autograd.Function):
             ctx.head_size_og = head_size_og
             ctx.pad_size = pad_size
 
-        return (out, lse_, dmask_) if return_attn_probs else out
+        return (out, lse_, dmask_) if return_softmax else out
 
     @staticmethod
     def backward(ctx, dout, *args):
@@ -106,7 +107,7 @@ class FlashAttnFunc(torch.autograd.Function):
         dk = grads[1][..., :head_size_og].permute(0, 2, 1, 3).contiguous()
         dv = grads[2][..., :head_size_og].permute(0, 2, 1, 3).contiguous()
 
-        return dq, dk, dv, None, None, None, None, None, None, None, None
+        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None
 
 
 def flash_attn_func(
@@ -129,8 +130,18 @@ def flash_attn_func(
 
     try:
         return FlashAttnFunc.apply(
-            q, k, v, dropout_p, softmax_scale, causal,
-            window_size, softcap, alibi_slopes, deterministic, return_attn_probs
+            q,
+            k,
+            v,
+            dropout_p,
+            softmax_scale,
+            causal,
+            window_size,
+            softcap,
+            alibi_slopes,
+            deterministic,
+            return_attn_probs,
+            torch.is_grad_enabled()
         )
     except Exception as e:
         print(f"[VOLTA FA2 DENSE FAILED] {type(e).__name__}: {e}")
@@ -161,8 +172,6 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         deterministic: bool,
         return_attn_probs: bool,
         block_table: Optional[torch.Tensor],
-        seqused_k: Optional[torch.Tensor],
-        leftpad_k: Optional[torch.Tensor],
         is_grad_enabled: bool
     ) -> torch.Tensor:
         cu_seqlens_q = cu_seqlens_q.to(torch.int32)
@@ -189,12 +198,16 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
 
         window_left, window_right = window_size
 
+        seqused_k = None
+        leftpad_k = None
+        num_splits = 0
+
         out, lse, dmask, rng_state = flash_attn_v100_cuda.varlen_fwd(
             q, k, v, None, cu_seqlens_q, cu_seqlens_k,
             seqused_k, leftpad_k, block_table, alibi_slopes,
             max_seqlen_q, max_seqlen_k, dropout_p, softmax_scale,
             False, causal, window_left, window_right, softcap,
-            return_attn_probs and dropout_p > 0.0, None, 0
+            return_attn_probs and dropout_p > 0.0, None, num_splits
         )
 
         out = out[..., :head_size_og].contiguous()
@@ -248,7 +261,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         dk = grads[1][..., :head_size_og].contiguous()
         dv = grads[2][..., :head_size_og].contiguous()
 
-        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None
+        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None
 
 
 def flash_attn_varlen_func(
@@ -268,8 +281,6 @@ def flash_attn_varlen_func(
     deterministic: bool = False,
     return_attn_probs: bool = False,
     block_table: Optional[torch.Tensor] = None,
-    seqused_k: Optional[torch.Tensor] = None,
-    leftpad_k: Optional[torch.Tensor] = None
 ):
     """Varlen Flash Attention (T, H, D)"""
     if deterministic:
@@ -278,10 +289,22 @@ def flash_attn_varlen_func(
 
     try:
         return FlashAttnVarlenFunc.apply(
-            q, k, v, cu_seqlens_q, cu_seqlens_k,
-            max_seqlen_q, max_seqlen_k, dropout_p, softmax_scale, causal,
-            window_size, softcap, alibi_slopes, deterministic,
-            return_attn_probs, block_table, seqused_k, leftpad_k,
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            dropout_p,
+            softmax_scale,
+            causal,
+            window_size,
+            softcap,
+            alibi_slopes,
+            deterministic,
+            return_attn_probs,
+            block_table,
             torch.is_grad_enabled()
         )
     except Exception as e:
@@ -290,10 +313,103 @@ def flash_attn_varlen_func(
         raise
 
 
+# ======================================================================================
+# KV ATTENTION (B, M, H, D) -> (B, H, M, D)
+# ======================================================================================
+def flash_attn_with_kvcache(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    k: Optional[torch.Tensor] = None,
+    v: Optional[torch.Tensor] = None,
+    rotary_cos: Optional[torch.Tensor] = None,
+    rotary_sin: Optional[torch.Tensor] = None,
+    cache_seqlens: Optional[Union[int, torch.Tensor]] = None,
+    cache_batch_idx: Optional[torch.Tensor] = None,
+    cache_leftpad: Optional[torch.Tensor] = None,
+    block_table: Optional[torch.Tensor] = None,
+    softmax_scale: Optional[float] = None,
+    causal: bool = False,
+    window_size: Tuple[int, int] = (-1, -1),
+    softcap: float = 0.0,
+    rotary_interleaved: bool = True,
+    alibi_slopes: Optional[torch.Tensor] = None,
+    num_splits: int = 0,
+    return_softmax_lse: bool = False,
+) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    """
+    FlashAttention with KV cache (B, M, H, D) for incremental decoding.
+    If k and v are not None, k_cache and v_cache will be updated *inplace* with the new values.
+    Note: Does not support backward pass.
+    """
+    assert k_cache.stride(-1) == 1, "k_cache must have contiguous last dimension"
+    assert v_cache.stride(-1) == 1, "v_cache must have contiguous last dimension"
+
+    q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
+
+    q_ = q.permute(0, 2, 1, 3).contiguous()
+    k_cache_ = k_cache
+    v_cache_ = v_cache
+
+    if k is not None:
+        k_ = k.permute(0, 2, 1, 3).contiguous()
+    else:
+        k_ = None
+
+    if v is not None:
+        v_ = v.permute(0, 2, 1, 3).contiguous()
+    else:
+        v_ = None
+
+    if softmax_scale is None:
+        softmax_scale = q_.shape[-1] ** (-0.5)
+
+    if cache_seqlens is not None and isinstance(cache_seqlens, int):
+        cache_seqlens = torch.full(
+            (q_.shape[0],), cache_seqlens, dtype=torch.int32, device=k_cache_.device
+        )
+        cache_seqlens = maybe_contiguous(cache_seqlens)
+
+    cache_batch_idx = maybe_contiguous(cache_batch_idx)
+    block_table = maybe_contiguous(block_table)
+    out_ = torch.empty_like(q_)
+
+    out_, softmax_lse = flash_attn_v100_cuda.fwd_kvcache(
+        q_,
+        k_cache_,
+        v_cache_,
+        k_,
+        v_,
+        cache_seqlens,
+        rotary_cos,
+        rotary_sin,
+        cache_batch_idx,
+        cache_leftpad,
+        block_table,
+        alibi_slopes,
+        out_,
+        softmax_scale,
+        causal,
+        window_size[0],
+        window_size[1],
+        softcap,
+        rotary_interleaved,
+        num_splits,
+    )
+
+    out = out_.permute(0, 2, 1, 3).contiguous()
+
+    if return_softmax_lse:
+        return out, softmax_lse
+    return out
+
+
 flash_attn_gpu = flash_attn_func
 flash_attn_varlen_gpu = flash_attn_varlen_func
+flash_attn_with_kvcache_gpu = flash_attn_with_kvcache
 
 __all__ = [
     "flash_attn_func", "flash_attn_gpu",
-    "flash_attn_varlen_func", "flash_attn_varlen_gpu"
+    "flash_attn_varlen_func", "flash_attn_varlen_gpu",
+    "flash_attn_with_kvcache", "flash_attn_with_kvcache_gpu"
 ]
