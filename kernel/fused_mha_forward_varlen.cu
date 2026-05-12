@@ -350,8 +350,8 @@ void launcher_flash_attention_forward_varlen(
     const int*    leftpad_k_ptr    = leftpad_k.defined() ? leftpad_k.data_ptr<int>() : nullptr;
     const int*    block_table_ptr  = paged_KV ? block_table.data_ptr<int>() : nullptr;
 
-    dispatch_attention_features(is_causal, is_alibi, is_softcap, is_window, is_dropout, is_paged,
-    [&](auto CAUSAL, auto ALIBI, auto SOFTCAP, auto WINDOW, auto DROPOUT, auto PAGED) {
+    dispatch_attention_features(is_causal, is_alibi, is_softcap, is_window, is_dropout, is_paged, is_rope, is_interleaved,
+    [&](auto CAUSAL, auto ALIBI, auto SOFTCAP, auto WINDOW, auto DROPOUT, auto PAGED, auto /*ROPE*/, auto /*INTERLEAVED*/) {
         constexpr bool IS_CAUSAL  = decltype(CAUSAL)::value;
         constexpr bool IS_ALIBI   = decltype(ALIBI)::value;
         constexpr bool IS_SOFTCAP = decltype(SOFTCAP)::value;

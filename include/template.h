@@ -270,17 +270,21 @@ __host__ inline void dispatch_attention_features(
     bool is_window,
     bool is_dropout,
     bool is_paged,
+    bool is_rope,
+    bool is_interleaved,
     LaunchFn&& launch)
 {
-    const bool chk_causal  = is_causal;
-    const bool chk_alibi   = is_causal && is_alibi;
-    const bool chk_softcap = is_causal && is_softcap;
-    const bool chk_window  = is_causal && is_window;
-    const bool chk_dropout = is_dropout;
-    const bool chk_paged   = is_paged;
+    const bool chk_causal      = is_causal;
+    const bool chk_alibi       = is_alibi;
+    const bool chk_window      = is_window;
+    const bool chk_softcap     = is_softcap && !is_dropout;
+    const bool chk_dropout     = is_dropout && !is_softcap;
+    const bool chk_paged       = is_paged;
+    const bool chk_rope        = is_rope;
+    const bool chk_interleaved = is_rope && is_interleaved;
 
     dispatch_flags<LaunchFn>(
         launch,
-        chk_causal, chk_alibi, chk_softcap, chk_window, chk_dropout, chk_paged
+        chk_causal, chk_alibi, chk_softcap, chk_window, chk_dropout, chk_paged, chk_rope, chk_interleaved
     );
 }

@@ -616,8 +616,8 @@ void launcher_flash_attention_backward_varlen(
     const int*    cu_seqlens_q_ptr = cu_seqlens_q.data_ptr<int>();
     const int*    cu_seqlens_k_ptr = cu_seqlens_k.data_ptr<int>();
 
-    dispatch_attention_features(is_causal, is_alibi, is_softcap, is_window, is_dropout, is_paged,
-    [&](auto CAUSAL, auto ALIBI, auto SOFTCAP, auto WINDOW, auto DROPOUT, auto PAGED) {
+    dispatch_attention_features(is_causal, is_alibi, is_softcap, is_window, is_dropout, is_paged, is_rope, is_interleaved,
+    [&](auto CAUSAL, auto ALIBI, auto SOFTCAP, auto WINDOW, auto DROPOUT, auto PAGED, auto /*ROPE*/, auto /*INTERLEAVED*/) {
         constexpr bool IS_CAUSAL  = decltype(CAUSAL)::value;
         constexpr bool IS_ALIBI   = decltype(ALIBI)::value;
         constexpr bool IS_SOFTCAP = decltype(SOFTCAP)::value;

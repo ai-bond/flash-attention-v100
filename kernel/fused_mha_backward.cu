@@ -548,8 +548,8 @@ void launcher_flash_attention_backward(
     __half*       dK_ptr  = reinterpret_cast<__half*>(dK.data_ptr());
     __half*       dV_ptr  = reinterpret_cast<__half*>(dV.data_ptr());
 
-    dispatch_attention_features(is_causal, is_alibi, is_softcap, is_window, is_dropout, is_paged,
-    [&](auto CAUSAL, auto ALIBI, auto SOFTCAP, auto WINDOW, auto DROPOUT, auto PAGED) {
+    dispatch_attention_features(is_causal, is_alibi, is_softcap, is_window, is_dropout, is_paged, is_rope, is_interleaved,
+    [&](auto CAUSAL, auto ALIBI, auto SOFTCAP, auto WINDOW, auto DROPOUT, auto /*PAGED*/, auto /*ROPE*/, auto /*INTERLEAVED*/) {
         constexpr bool IS_CAUSAL  = decltype(CAUSAL)::value;
         constexpr bool IS_ALIBI   = decltype(ALIBI)::value;
         constexpr bool IS_SOFTCAP = decltype(SOFTCAP)::value;

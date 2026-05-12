@@ -284,8 +284,8 @@ void launcher_flash_attention_forward(
            float* lse_ptr   = softmax_lse.data_ptr<float>();
           __half* dmask_ptr = dmask.numel() > 0 ? reinterpret_cast<__half*>(dmask.data_ptr()) : nullptr;
 
-    dispatch_attention_features(is_causal, is_alibi, is_softcap, is_window, is_dropout, is_paged,
-    [&](auto CAUSAL, auto ALIBI, auto SOFTCAP, auto WINDOW, auto DROPOUT, auto PAGED) {
+    dispatch_attention_features(is_causal, is_alibi, is_softcap, is_window, is_dropout, is_paged, is_rope, is_interleaved,
+    [&](auto CAUSAL, auto ALIBI, auto SOFTCAP, auto WINDOW, auto DROPOUT, auto /*PAGED*/, auto /*ROPE*/, auto /*INTERLEAVED*/) {
         constexpr bool IS_CAUSAL  = decltype(CAUSAL)::value;
         constexpr bool IS_ALIBI   = decltype(ALIBI)::value;
         constexpr bool IS_SOFTCAP = decltype(SOFTCAP)::value;
