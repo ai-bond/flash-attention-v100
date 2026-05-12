@@ -597,11 +597,13 @@ void launcher_flash_attention_backward_varlen(
     const dim3 grid(grid_x, 2, B * H_Q);
     const dim3 block(Config::THREADS_PER_BLOCK);
 
-    bool is_alibi   = (alibi_slopes != nullptr);
-    bool is_softcap = (softcap > 0.0f);
-    bool is_window  = (window_left >= 0 || window_right >= 0);
-    bool is_dropout = (p_dropout > 0.0f);
-    bool is_paged   = false;
+    bool is_alibi       = (alibi_slopes != nullptr);
+    bool is_softcap     = (softcap > 0.0f);
+    bool is_window      = (window_left >= 0 || window_right >= 0);
+    bool is_dropout     = (p_dropout > 0.0f);
+    bool is_paged       = false;
+    bool is_rope        = false;
+    bool is_interleaved = false;
 
     const __half* q_ptr            = reinterpret_cast<const __half*>(Q.data_ptr());
     const __half* k_ptr            = reinterpret_cast<const __half*>(K.data_ptr());
@@ -654,16 +656,16 @@ std::vector<at::Tensor> flash_attention_varlen_backward(
     const at::Tensor& cu_seqlens_q,
     const at::Tensor& cu_seqlens_k,
     std::optional<at::Tensor>& alibi_slopes,
-    const int   max_seqlen_q,
-    const int   max_seqlen_k,
-    const float p_dropout,
-    const float softmax_scale,
-    const bool  zero_tensors,
-    const bool  is_causal,
-    int         window_left,
-    int         window_right,
-    const float softcap,
-    const bool  deterministic,
+    const int    max_seqlen_q,
+    const int    max_seqlen_k,
+    const float  p_dropout,
+    const float  softmax_scale,
+    const bool   zero_tensors,
+    const bool   is_causal,
+    int          window_left,
+    int          window_right,
+    const float  softcap,
+    const bool   deterministic,
     std::optional<at::Generator> gen,
     std::optional<at::Tensor>& rng_state
 ) {
@@ -674,22 +676,26 @@ std::vector<at::Tensor> flash_attention_varlen_backward(
     TORCH_CHECK(props->major == 7 && props->minor == 0, "Kernel supports only Volta GPUs.");
     TORCH_CHECK(!deterministic, "Deterministic backward not supported in this Volta build");
 
-    TORCH_CHECK(q.dtype() == torch::kFloat16, "q must be fp16");
-    TORCH_CHECK(k.dtype() == torch::kFloat16, "k must be fp16");
-    TORCH_CHECK(v.dtype() == torch::kFloat16, "v must be fp16");
-    TORCH_CHECK(out.dtype() == torch::kFloat16, "out must be fp16");
-    TORCH_CHECK(dout.dtype() == torch::kFloat16, "dout must be fp16");
+    // dtype / device / contiguity
+    auto q_dtype = q.dtype();
+    TORCH_CHECK(q_dtype == torch::kFloat16, "q must be fp16");
+    TORCH_CHECK(k.dtype() == q_dtype && v.dtype() == q_dtype, "k/v must have the same dtype as q");
+    TORCH_CHECK(out.dtype() == q_dtype, "out must have the same dtype as q");
+    TORCH_CHECK(dout.dtype() == q_dtype, "dout must have the same dtype as q");
     TORCH_CHECK(softmax_lse.dtype() == torch::kFloat32, "softmax_lse must be fp32");
 
-    TORCH_CHECK(q.is_cuda() && k.is_cuda() && v.is_cuda(), "q, k, v must be on CUDA");
+    TORCH_CHECK(q.is_cuda() && k.is_cuda() && v.is_cuda(), "Tensors q, k, v must be on CUDA");
+    TORCH_CHECK(out.is_cuda() && dout.is_cuda(), "out/dout must be on CUDA");
     TORCH_CHECK(q.stride(-1) == 1 && k.stride(-1) == 1 && v.stride(-1) == 1, "Last dim of q, k, v must be contiguous");
     TORCH_CHECK(out.stride(-1) == 1 && dout.stride(-1) == 1, "Last dim of out, dout must be contiguous");
 
+    // cu_seqlens
     TORCH_CHECK(cu_seqlens_q.dtype() == torch::kInt32 && cu_seqlens_k.dtype() == torch::kInt32, "cu_seqlens must be int32");
-    TORCH_CHECK(cu_seqlens_q.is_cuda() && cu_seqlens_k.is_cuda(), "cu_seqlens must be on CUDA device");
+    TORCH_CHECK(cu_seqlens_q.is_cuda() && cu_seqlens_k.is_cuda(), "cu_seqlens must be on CUDA");
     TORCH_CHECK(cu_seqlens_q.is_contiguous() && cu_seqlens_k.is_contiguous(), "cu_seqlens must be contiguous");
-    TORCH_CHECK(cu_seqlens_q.dim() == 1 && cu_seqlens_k.dim() == 1, "cu_seqlens must be 1D tensors");
+    TORCH_CHECK(cu_seqlens_q.dim() == 1 && cu_seqlens_k.dim() == 1, "cu_seqlens must be 1D");
 
+    // dimensions
     const int T_Q   = q.size(0);
     const int H_Q   = q.size(1);
     const int D     = q.size(2);
@@ -697,32 +703,39 @@ std::vector<at::Tensor> flash_attention_varlen_backward(
     const int H_K   = k.size(1);
     const int B     = cu_seqlens_q.size(0) - 1;
 
-    TORCH_CHECK(B > 0, "batch_size must be positive");
-    TORCH_CHECK(D <= 256 && D % 8 == 0, "D must be even, <=256, multiple of 8");
+    TORCH_CHECK(B > 0, "batch size must be positive");
+    TORCH_CHECK(D <= 256, "head dimension must be <= 256");
+    TORCH_CHECK(D % 8 == 0, "head dimension must be multiple of 8");
     TORCH_CHECK(H_Q % H_K == 0, "H_Q must be divisible by H_K for GQA/MQA");
+    TORCH_CHECK(cu_seqlens_q.size(0) == B + 1, "cu_seqlens_q size mismatch");
+    TORCH_CHECK(cu_seqlens_k.size(0) == B + 1, "cu_seqlens_k size mismatch");
 
-    // Window edge cases
+    // softcap restrictions
+    if (softcap > 0.f) {
+        TORCH_CHECK(p_dropout == 0.f, "Softcapping does not support dropout");
+    }
+
+    // window edge cases
     if (window_left  >= max_seqlen_k) window_left  = -1;
     if (window_right >= max_seqlen_k) window_right = -1;
 
-    // Alibi
-    const float* alibi = nullptr;
+    // alibi
+    const float* alibi_ptr = nullptr;
     int alibi_batch = 0;
     if (alibi_slopes.has_value()) {
         const auto& slopes = alibi_slopes.value();
-        auto sizes = slopes.sizes();
         TORCH_CHECK(slopes.dtype() == torch::kFloat32 && slopes.is_cuda(), "alibi_slopes must be fp32 on CUDA");
         TORCH_CHECK(slopes.stride(-1) == 1, "alibi_slopes last dim must be contiguous");
-        bool valid_shape = (sizes.size() == 1 && sizes[0] == H_Q) ||
-                           (sizes.size() == 2 && sizes[0] == B && sizes[1] == H_Q);
-        TORCH_CHECK(valid_shape, "alibi_slopes shape must be [H_Q] or [B, H_Q], got ", sizes);
-        alibi_batch = (slopes.dim() == 2) ? slopes.stride(0) : 0;
-        alibi = slopes.data_ptr<float>();
+        auto sizes = slopes.sizes();
+        bool valid = (sizes.size() == 1 && sizes[0] == H_Q) ||
+                     (sizes.size() == 2 && sizes[0] == B && sizes[1] == H_Q);
+        TORCH_CHECK(valid, "alibi_slopes must be [H_Q] or [B, H_Q]");
+        alibi_batch = (sizes.size() == 2) ? slopes.stride(0) : 0;
+        alibi_ptr = slopes.data_ptr<float>();
     }
 
-    // Dropout
+    // dropout
     TORCH_CHECK(p_dropout >= 0.f && p_dropout < 1.f, "p_dropout must be in [0, 1)");
-    if (softcap > 0.f) { TORCH_CHECK(p_dropout == 0.f, "Softcapping does not support dropout"); }
 
     uint64_t dropout_seed   = 0;
     uint64_t dropout_offset = 0;
@@ -734,19 +747,38 @@ std::vector<at::Tensor> flash_attention_varlen_backward(
         dropout_offset = static_cast<uint64_t>(rng_acc[1]);
     }
 
-    // Output tensors
+    // output tensors
     at::Tensor dq_fp16 = dq.has_value() ? dq.value() : torch::empty_like(q);
     at::Tensor dk_fp16 = dk.has_value() ? dk.value() : torch::empty_like(k);
     at::Tensor dv_fp16 = dv.has_value() ? dv.value() : torch::empty_like(v);
 
-    // GQA/MQA expansion buffers [T_K, H_Q, D] for deterministic host-side reduction
+    TORCH_CHECK(dq_fp16.dtype() == q_dtype, "dq must have the same dtype as q");
+    TORCH_CHECK(dk_fp16.dtype() == q_dtype, "dk must have the same dtype as q");
+    TORCH_CHECK(dv_fp16.dtype() == q_dtype, "dv must have the same dtype as q");
+    TORCH_CHECK(dq_fp16.is_cuda() && dk_fp16.is_cuda() && dv_fp16.is_cuda(), "d*/v* must be on CUDA");
+    TORCH_CHECK(dq_fp16.stride(-1) == 1, "dq must have contiguous last dimension");
+    TORCH_CHECK(dk_fp16.stride(-1) == 1, "dk must have contiguous last dimension");
+    TORCH_CHECK(dv_fp16.stride(-1) == 1, "dv must have contiguous last dimension");
+
+    if (dq.has_value()) {
+        TORCH_CHECK(dq_fp16.sizes() == q.sizes(), "dq shape must match q shape");
+    }
+    if (dk.has_value()) {
+        TORCH_CHECK(dk_fp16.sizes() == k.sizes(), "dk shape must match k shape");
+    }
+    if (dv.has_value()) {
+        TORCH_CHECK(dv_fp16.sizes() == k.sizes(), "dv shape must match k shape");
+    }
+
+    // GQA/MQA expansion buffers
     at::Tensor dk_expanded = (H_K != H_Q) ? torch::empty({T_K, H_Q, D}, q.options()) : dk_fp16;
     at::Tensor dv_expanded = (H_K != H_Q) ? torch::empty({T_K, H_Q, D}, q.options()) : dv_fp16;
 
-    // dLSE tensor matches forward LSE layout [H_Q, T_Q]
+    // dLSE tensor
     auto softmax_d = torch::empty({H_Q, T_Q}, torch::dtype(torch::kFloat32).device(q.device()));
+    TORCH_CHECK(softmax_d.dtype() == torch::kFloat32, "softmax_d must be fp32");
 
-    // Edge-case return
+    // zero tensors / empty case
     if (zero_tensors) {
         dq_fp16.zero_();
         dk_expanded.zero_();
@@ -758,15 +790,13 @@ std::vector<at::Tensor> flash_attention_varlen_backward(
         return {dq_fp16, dk_fp16, dv_fp16, softmax_d};
     }
 
-    // Run kernel
+    // run kernel
     auto stream = at::cuda::getCurrentCUDAStream().stream();
 
     #define LAUNCH_KERNEL(DIM) \
-        launcher_flash_attention_backward_varlen<DIM>(q, k, v, out, dout, softmax_lse, dq_fp16, dk_expanded, dv_expanded, softmax_d, \
-            cu_seqlens_q, cu_seqlens_k, T_Q, T_K, max_seqlen_q, max_seqlen_k, \
-            softmax_scale, is_causal, softcap, p_dropout, alibi, alibi_batch, \
-            window_left, window_right, dropout_seed, dropout_offset, stream);
-
+        launcher_flash_attention_backward_varlen<DIM>(q, k, v, out, dout, softmax_lse, dq_fp16, dk_expanded, dv_expanded, softmax_d, cu_seqlens_q, cu_seqlens_k, \
+                                                      T_Q, T_K, max_seqlen_q, max_seqlen_k, softmax_scale, is_causal, softcap, p_dropout, alibi_ptr, alibi_batch, \
+                                                       window_left, window_right, dropout_seed, dropout_offset, stream);
     switch (D) {
         case 16:  LAUNCH_KERNEL(16);  break;
         case 32:  LAUNCH_KERNEL(32);  break;
@@ -777,7 +807,7 @@ std::vector<at::Tensor> flash_attention_varlen_backward(
     }
     #undef LAUNCH_KERNEL
 
-    // Reduce expanded gradients for GQA/MQA
+    // reduce expanded gradients for GQA/MQA
     if (H_K != H_Q) {
         at::sum_out(dk_fp16, at::reshape(dk_expanded, {T_K, H_K, H_Q / H_K, D}), {2});
         at::sum_out(dv_fp16, at::reshape(dv_expanded, {T_K, H_K, H_Q / H_K, D}), {2});

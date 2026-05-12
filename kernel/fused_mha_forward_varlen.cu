@@ -332,11 +332,13 @@ void launcher_flash_attention_forward_varlen(
     const dim3 grid((max_seqlen_q + Config::DO::BLOCK_M - 1) / Config::DO::BLOCK_M, 1, B * H_Q);
     const dim3 block(Config::THREADS_PER_BLOCK);
 
-    bool is_alibi   = (alibi_slopes != nullptr);
-    bool is_softcap = (softcap > 0.0f);
-    bool is_window  = (window_left >= 0 || window_right >= 0);
-    bool is_dropout = (p_dropout > 0.0f);
-    bool is_paged   = paged_KV;
+    bool is_alibi       = (alibi_slopes != nullptr);
+    bool is_softcap     = (softcap > 0.0f);
+    bool is_window      = (window_left >= 0 || window_right >= 0);
+    bool is_dropout     = (p_dropout > 0.0f);
+    bool is_paged       = paged_KV;
+    bool is_rope        = false;
+    bool is_interleaved = false;
 
     const __half* q_ptr            = reinterpret_cast<const __half*>(Q.data_ptr());
     const __half* k_ptr            = reinterpret_cast<const __half*>(K.data_ptr());
@@ -407,75 +409,106 @@ std::vector<at::Tensor> flash_attention_varlen_forward(
     auto props = at::cuda::getCurrentDeviceProperties();
     TORCH_CHECK(props->major == 7 && props->minor == 0, "Kernel supports only Volta GPUs.");
 
-    TORCH_CHECK(q.dtype() == torch::kFloat16, "q must be fp16");
-    TORCH_CHECK(k.dtype() == torch::kFloat16, "k must be fp16");
-    TORCH_CHECK(v.dtype() == torch::kFloat16, "v must be fp16");
-    TORCH_CHECK(q.is_cuda() && k.is_cuda() && v.is_cuda(), "q, k, v must be on CUDA");
+    // dtype / device / contiguity
+    auto q_dtype = q.dtype();
+    TORCH_CHECK(q_dtype == torch::kFloat16, "q must be fp16");
+    TORCH_CHECK(k.dtype() == q_dtype && v.dtype() == q_dtype, "k/v must have the same dtype as q");
+    TORCH_CHECK(q.is_cuda() && k.is_cuda() && v.is_cuda(), "Tensors q, k, v must be on CUDA");
     TORCH_CHECK(q.stride(-1) == 1 && k.stride(-1) == 1 && v.stride(-1) == 1, "Last dim of q, k, v must be contiguous");
 
+    // dimensions
     const int T_Q = q.size(0);
     const int H_Q = q.size(1);
     const int D   = q.size(2);
     const int B   = cu_seqlens_q.size(0) - 1;
     const bool paged_KV = block_table.has_value();
 
-    at::Tensor block_table_t;
     int H_K = paged_KV ? k.size(2) : k.size(1);
     int page_block_size = paged_KV ? k.size(1) : 1;
 
-    if (paged_KV) {
-        block_table_t = block_table.value();
-        TORCH_CHECK(block_table_t.is_cuda(), "block_table must be on CUDA");
-        TORCH_CHECK(block_table_t.dtype() == torch::kInt32, "block_table must have dtype torch.int32");
-        TORCH_CHECK(block_table_t.stride(-1) == 1, "block_table must have contiguous last dimension");
-        TORCH_CHECK(page_block_size % 256 == 0, "Paged KV cache block size must be divisible by 256");
-        TORCH_CHECK(k.sizes() == v.sizes(), "K and V paged shapes must match");
-    }
-
-    TORCH_CHECK(cu_seqlens_q.dtype() == torch::kInt32 && cu_seqlens_k.dtype() == torch::kInt32, "cu_seqlens must be int32");
-    TORCH_CHECK(cu_seqlens_q.is_cuda() && cu_seqlens_k.is_cuda(), "cu_seqlens must be on CUDA device");
-    TORCH_CHECK(cu_seqlens_q.is_contiguous() && cu_seqlens_k.is_contiguous(), "cu_seqlens must be contiguous");
-    TORCH_CHECK(cu_seqlens_q.dim() == 1 && cu_seqlens_k.dim() == 1, "cu_seqlens must be 1D tensors");
-
-    TORCH_CHECK(D <= 256 && D % 8 == 0, "D must be even, <=256, multiple of 8");
+    TORCH_CHECK(B > 0, "batch size must be positive");
+    TORCH_CHECK(D <= 256, "head dimension must be <= 256");
+    TORCH_CHECK(D % 8 == 0, "head dimension must be multiple of 8");
     TORCH_CHECK(H_Q % H_K == 0, "H_Q must be divisible by H_K for GQA/MQA");
-    TORCH_CHECK(B > 0, "batch_size must be positive");
+    TORCH_CHECK(num_splits <= 1, "num_splits > 1 not supported");
 
-    if (seqused_k.has_value()) {
-        auto seqused = seqused_k.value();
-        TORCH_CHECK(seqused.dtype() == torch::kInt32 && seqused.is_cuda() && seqused.is_contiguous(), "seqused_k must be int32, contiguous, on CUDA");
-        TORCH_CHECK(seqused.dim() == 1 && seqused.size(0) == B, "seqused_k must be 1D with size == batch_size");
+    // causal / window optimizations
+    if (max_seqlen_q == 1 && !alibi_slopes.has_value()) { is_causal = false; }
+
+    // softcap restrictions
+    if (softcap > 0.f) {
+        TORCH_CHECK(p_dropout == 0.f, "Softcapping does not support dropout");
     }
 
+    // paged KV
+    at::Tensor block_table_tensor;
+    if (paged_KV) {
+        block_table_tensor = block_table.value();
+        TORCH_CHECK(block_table_tensor.is_cuda(), "block_table must be on CUDA");
+        TORCH_CHECK(block_table_tensor.dtype() == torch::kInt32, "block_table must have dtype int32");
+        TORCH_CHECK(block_table_tensor.stride(-1) == 1, "block_table must have contiguous last dimension");
+        TORCH_CHECK(page_block_size % 256 == 0, "Paged KV block size must be divisible by 256");
+
+        const int num_blocks = k.size(0);
+        const int max_num_blocks_per_seq = block_table_tensor.size(1);
+        TORCH_CHECK(block_table_tensor.size(0) == B, "block_table batch dim must match q");
+        TORCH_CHECK(k.sizes() == v.sizes(), "K and V paged shapes must match");
+        TORCH_CHECK(k.size(0) == num_blocks, "k block dim mismatch");
+        TORCH_CHECK(k.size(1) == page_block_size, "k page size mismatch");
+        TORCH_CHECK(k.size(2) == H_K, "k heads mismatch");
+        TORCH_CHECK(k.size(3) == D, "k head_dim mismatch");
+    }
+
+    // cu_seqlens
+    TORCH_CHECK(cu_seqlens_q.dtype() == torch::kInt32 && cu_seqlens_k.dtype() == torch::kInt32, "cu_seqlens must be int32");
+    TORCH_CHECK(cu_seqlens_q.is_cuda() && cu_seqlens_k.is_cuda(), "cu_seqlens must be on CUDA");
+    TORCH_CHECK(cu_seqlens_q.is_contiguous() && cu_seqlens_k.is_contiguous(), "cu_seqlens must be contiguous");
+    TORCH_CHECK(cu_seqlens_q.dim() == 1 && cu_seqlens_k.dim() == 1, "cu_seqlens must be 1D");
+    TORCH_CHECK(cu_seqlens_q.size(0) == B + 1, "cu_seqlens_q size mismatch");
+    TORCH_CHECK(cu_seqlens_k.size(0) == B + 1, "cu_seqlens_k size mismatch");
+
+    // seqused_k
+    at::Tensor seqused_tensor;
+    if (seqused_k.has_value()) {
+        seqused_tensor = seqused_k.value();
+        TORCH_CHECK(seqused_tensor.dtype() == torch::kInt32, "seqused_k must have dtype int32");
+        TORCH_CHECK(seqused_tensor.is_cuda(), "seqused_k must be on CUDA");
+        TORCH_CHECK(seqused_tensor.is_contiguous(), "seqused_k must be contiguous");
+        TORCH_CHECK(seqused_tensor.dim() == 1 && seqused_tensor.size(0) == B, "seqused_k must be 1D with size == batch_size");
+    }
+
+    // leftpad_k
+    at::Tensor leftpad_tensor;
     if (leftpad_k.has_value()) {
         TORCH_CHECK(!paged_KV, "Paged KV and leftpad_k are not supported simultaneously");
-        auto leftpad = leftpad_k.value();
-        TORCH_CHECK(leftpad.dtype() == torch::kInt32 && leftpad.is_cuda() && leftpad.is_contiguous(), "leftpad_k must be int32, contiguous, on CUDA");
-        TORCH_CHECK(leftpad.dim() == 1 && leftpad.size(0) == B, "leftpad_k must be 1D with size == batch_size");
+        leftpad_tensor = leftpad_k.value();
+        TORCH_CHECK(leftpad_tensor.dtype() == torch::kInt32, "leftpad_k must have dtype int32");
+        TORCH_CHECK(leftpad_tensor.is_cuda(), "leftpad_k must be on CUDA");
+        TORCH_CHECK(leftpad_tensor.is_contiguous(), "leftpad_k must be contiguous");
+        TORCH_CHECK(leftpad_tensor.dim() == 1 && leftpad_tensor.size(0) == B, "leftpad_k must be 1D with size == batch_size");
     }
 
-    // Window edge cases
+    // window edge cases
     if (window_left  >= max_seqlen_k) window_left  = -1;
     if (window_right >= max_seqlen_k) window_right = -1;
 
-    // Alibi
-    const float* alibi = nullptr;
+    // alibi
+    const float* alibi_ptr = nullptr;
     int alibi_batch = 0;
     if (alibi_slopes.has_value()) {
         const auto& slopes = alibi_slopes.value();
-        auto sizes = slopes.sizes();
         TORCH_CHECK(slopes.dtype() == torch::kFloat32 && slopes.is_cuda(), "alibi_slopes must be fp32 on CUDA");
         TORCH_CHECK(slopes.stride(-1) == 1, "alibi_slopes last dim must be contiguous");
-        bool valid_shape = (sizes.size() == 1 && sizes[0] == H_Q) ||
-                           (sizes.size() == 2 && sizes[0] == B && sizes[1] == H_Q);
-        TORCH_CHECK(valid_shape, "alibi_slopes shape must be [H_Q] or [B, H_Q], got ", sizes);
-        alibi_batch = (slopes.dim() == 2) ? slopes.stride(0) : 0;
-        alibi = slopes.data_ptr<float>();
+        auto sizes = slopes.sizes();
+        bool valid = (sizes.size() == 1 && sizes[0] == H_Q) ||
+                     (sizes.size() == 2 && sizes[0] == B && sizes[1] == H_Q);
+        TORCH_CHECK(valid, "alibi_slopes must be [H_Q] or [B, H_Q]");
+        alibi_batch = (sizes.size() == 2) ? slopes.stride(0) : 0;
+        alibi_ptr = slopes.data_ptr<float>();
     }
 
-    // Dropout
+    // dropout
     TORCH_CHECK(p_dropout >= 0.f && p_dropout < 1.f, "p_dropout must be in [0, 1)");
-    if (softcap > 0.f) { TORCH_CHECK(p_dropout == 0.f, "Softcapping does not support dropout"); }
 
     uint64_t dropout_seed   = 0;
     uint64_t dropout_offset = 0;
@@ -486,18 +519,25 @@ std::vector<at::Tensor> flash_attention_varlen_forward(
         std::lock_guard<std::mutex> lock(gen_cuda->mutex_);
         dropout_seed   = gen_cuda->current_seed();
         dropout_offset = gen_cuda->get_offset();
-        uint64_t counter_offset = static_cast<uint64_t>(T_Q) * static_cast<uint64_t>(H_Q) * 32ULL;
+        uint64_t counter_offset = static_cast<uint64_t>(B) * static_cast<uint64_t>(H_Q) * 32ULL;
         gen_cuda->set_offset(dropout_offset + counter_offset);
         rng_state[0] = static_cast<int64_t>(dropout_seed);
         rng_state[1] = static_cast<int64_t>(dropout_offset);
     }
 
-    // Output tensors
+    // output tensors
     at::Tensor out_fp16 = out.has_value() ? out.value() : torch::empty_like(q);
     auto softmax_lse = torch::empty({H_Q, T_Q}, torch::dtype(torch::kFloat32).device(q.device()));
-    TORCH_CHECK(out_fp16.dtype()    == torch::kFloat16, "out must be fp16");
+
+    TORCH_CHECK(out_fp16.dtype() == q_dtype, "out must have the same dtype as q");
+    TORCH_CHECK(out_fp16.is_cuda(), "out must be on CUDA");
+    TORCH_CHECK(out_fp16.stride(-1) == 1, "out must have contiguous last dimension");
+    if (out.has_value()) {
+        TORCH_CHECK(out_fp16.sizes() == q.sizes(), "out shape must match q shape");
+    }
     TORCH_CHECK(softmax_lse.dtype() == torch::kFloat32, "softmax_lse must be fp32");
 
+    // dropout mask
     at::Tensor dmask;
     if (return_softmax && p_dropout > 0.0f) {
         dmask = torch::empty({T_Q, H_Q, max_seqlen_k}, q.options());
@@ -505,7 +545,7 @@ std::vector<at::Tensor> flash_attention_varlen_forward(
         dmask = torch::empty({0}, q.options());
     }
 
-    // Edge-case return
+    // zero tensors / empty case
     if (zero_tensors) {
         out_fp16.zero_();
         softmax_lse.fill_(-std::numeric_limits<float>::infinity());
@@ -516,17 +556,13 @@ std::vector<at::Tensor> flash_attention_varlen_forward(
         return {out_fp16, softmax_lse, dmask, rng_state};
     }
 
-    // Run kernel
+    // run kernel
     auto stream = at::cuda::getCurrentCUDAStream().stream();
 
     #define LAUNCH_KERNEL(DIM) \
-        launcher_flash_attention_forward_varlen<DIM>(q, k, v, out_fp16, softmax_lse, dmask, \
-            cu_seqlens_q, cu_seqlens_k, seqused_k.value_or(torch::Tensor()), \
-            leftpad_k.has_value() ? leftpad_k.value() : torch::Tensor(), \
-            block_table_t, paged_KV, T_Q, max_seqlen_q, max_seqlen_k, \
-            softmax_scale, is_causal, softcap, p_dropout, alibi, alibi_batch, \
-            window_left, window_right, dropout_seed, dropout_offset, stream);
-
+        launcher_flash_attention_forward_varlen<DIM>(q, k, v, out_fp16, softmax_lse, dmask, cu_seqlens_q, cu_seqlens_k, seqused_tensor, leftpad_tensor, \
+                                                     block_table_tensor, paged_KV, T_Q, max_seqlen_q, max_seqlen_k, softmax_scale, is_causal, softcap, p_dropout, \
+                                                     alibi_ptr, alibi_batch, window_left, window_right, dropout_seed, dropout_offset, stream);
     switch (D) {
         case 16:  LAUNCH_KERNEL(16);  break;
         case 32:  LAUNCH_KERNEL(32);  break;
