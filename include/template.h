@@ -243,49 +243,48 @@ struct BlockInfo {
 };
 
 // ======================================================================================
+// Internal recursive dispatcher: accumulates runtime flags into a compile-time pack
+// ======================================================================================
+template <typename LaunchFn, bool... Resolved>
+__host__ inline void dispatch_flags(LaunchFn& launch) {
+    launch(std::integral_constant<bool, Resolved>{}...);
+}
+
+template <typename LaunchFn, bool... Resolved, typename... Rest>
+__host__ inline void dispatch_flags(LaunchFn& launch, bool next, Rest... rest) {
+    if (next) {
+        dispatch_flags<LaunchFn, Resolved..., true>(launch, rest...);
+    } else {
+        dispatch_flags<LaunchFn, Resolved..., false>(launch, rest...);
+    }
+}
+
+// ======================================================================================
 // Runtime / Compile-Time Dispatcher
 // ======================================================================================
 template <typename LaunchFn>
 __host__ inline void dispatch_attention_features(
-    bool is_causal, bool is_alibi, bool is_softcap, bool is_window, bool is_dropout,
+    bool is_causal,
+    bool is_alibi,
+    bool is_softcap,
+    bool is_window,
+    bool is_dropout,
+    bool is_paged,
+    bool is_rope,
+    bool is_interleaved,
     LaunchFn&& launch)
 {
-    const bool call_alibi   = is_causal && is_alibi;
-    const bool call_softcap = is_causal && is_softcap;
-    const bool call_window  = is_causal && is_window;
-    const bool call_dropout = is_dropout;
+    const bool chk_causal      = is_causal;
+    const bool chk_alibi       = is_alibi;
+    const bool chk_window      = is_window;
+    const bool chk_softcap     = is_softcap && !is_dropout;
+    const bool chk_dropout     = is_dropout && !is_softcap;
+    const bool chk_paged       = is_paged;
+    const bool chk_rope        = is_rope;
+    const bool chk_interleaved = is_rope && is_interleaved;
 
-    const int mask = (call_alibi ? 1 : 0) | (call_softcap ? 2 : 0) | (call_window ? 4 : 0) | (call_dropout ? 8 : 0);
-
-    #define CALL(C, A, S, W, D) \
-        launch(std::integral_constant<bool, C>{}, \
-               std::integral_constant<bool, A>{}, \
-               std::integral_constant<bool, S>{}, \
-               std::integral_constant<bool, W>{}, \
-               std::integral_constant<bool, D>{})
-
-    if (!is_causal) {
-        if (call_dropout) CALL(false, false, false, false, true);
-        else              CALL(false, false, false, false, false);
-    } else {
-        switch (mask) {
-            case 0:  CALL(true, false, false, false, false); break;
-            case 1:  CALL(true, true,  false, false, false); break;
-            case 2:  CALL(true, false, true,  false, false); break;
-            case 3:  CALL(true, true,  true,  false, false); break;
-            case 4:  CALL(true, false, false, true,  false); break;
-            case 5:  CALL(true, true,  false, true,  false); break;
-            case 6:  CALL(true, false, true,  true,  false); break;
-            case 7:  CALL(true, true,  true,  true,  false); break;
-            case 8:  CALL(true, false, false, false, true);  break;
-            case 9:  CALL(true, true,  false, false, true);  break;
-            case 10: CALL(true, false, true,  false, true);  break;
-            case 11: CALL(true, true,  true,  false, true);  break;
-            case 12: CALL(true, false, false, true,  true);  break;
-            case 13: CALL(true, true,  false, true,  true);  break;
-            case 14: CALL(true, false, true,  true,  true);  break;
-            case 15: CALL(true, true,  true,  true,  true);  break;
-        }
-    }
-    #undef CALL
+    dispatch_flags<LaunchFn>(
+        launch,
+        chk_causal, chk_alibi, chk_softcap, chk_window, chk_dropout, chk_paged, chk_rope, chk_interleaved
+    );
 }

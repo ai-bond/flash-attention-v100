@@ -7,6 +7,8 @@ from flash_attn_v100 import (
     flash_attn_gpu,
     flash_attn_varlen_func,
     flash_attn_varlen_gpu,
+    flash_attn_with_kvcache,
+    flash_attn_with_kvcache_gpu,
     __version__ as _v100_version
 )
 
@@ -17,6 +19,8 @@ __all__ = [
     "flash_attn_gpu",
     "flash_attn_varlen_func",
     "flash_attn_varlen_gpu",
+    "flash_attn_with_kvcache",
+    "flash_attn_with_kvcache_gpu",
     "__version__"
 ]
 

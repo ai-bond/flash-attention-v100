@@ -40,6 +40,7 @@ flash_attention_forward_kernel(
     const float    softmax_scale,
     const float    softcap,
     const float*   alibi_slopes,
+    const int      alibi_batch,
     int            window_left,
     int            window_right,
     const float    p_dropout,
@@ -90,8 +91,9 @@ flash_attention_forward_kernel(
     const int tid     = threadIdx.x;
     const int warp_id = tid >> 5;
     const int lane_id = tid & 31;
-    // Alibi slope only for valid block
-    const float alibi_slope = (alibi_slopes) ? alibi_slopes[bthd_idx % H_Q] : 0.0f;
+    // Alibi slope only for valid block + batch
+    const int   alibi_idx   = (alibi_batch > 0) ? (block.batch_idx * alibi_batch + block.head_idx) : block.head_idx;
+    const float alibi_slope = (alibi_slopes != nullptr) ? alibi_slopes[alibi_idx] : 0.0f;
 
     // ==================================================================================
     // Layout:
@@ -248,6 +250,7 @@ void launcher_flash_attention_forward(
     float        softcap,
     float        p_dropout,
     const float* alibi_slopes,
+    const int    alibi_batch,
     int          window_left,
     int          window_right,
     uint64_t     dropout_seed,
@@ -268,10 +271,13 @@ void launcher_flash_attention_forward(
     const dim3 grid((M + Config::DO::BLOCK_M - 1) / Config::DO::BLOCK_M, 1, B * H_Q);
     const dim3 block(Config::THREADS_PER_BLOCK);
 
-    bool is_alibi   = (alibi_slopes != nullptr);
-    bool is_softcap = (softcap > 0.0f);
-    bool is_window  = (window_left >= 0 || window_right >= 0);
-    bool is_dropout = (p_dropout > 0.0f);
+    bool is_alibi       = (alibi_slopes != nullptr);
+    bool is_softcap     = (softcap > 0.0f);
+    bool is_window      = (window_left >= 0 || window_right >= 0);
+    bool is_dropout     = (p_dropout > 0.0f);
+    bool is_paged       = false;
+    bool is_rope        = false;
+    bool is_interleaved = false;
 
     const __half* q_ptr     = reinterpret_cast<const __half*>(Q.data_ptr());
     const __half* k_ptr     = reinterpret_cast<const __half*>(K.data_ptr());
@@ -280,8 +286,8 @@ void launcher_flash_attention_forward(
            float* lse_ptr   = softmax_lse.data_ptr<float>();
           __half* dmask_ptr = dmask.numel() > 0 ? reinterpret_cast<__half*>(dmask.data_ptr()) : nullptr;
 
-    dispatch_attention_features(is_causal, is_alibi, is_softcap, is_window, is_dropout,
-    [&](auto CAUSAL, auto ALIBI, auto SOFTCAP, auto WINDOW, auto DROPOUT) {
+    dispatch_attention_features(is_causal, is_alibi, is_softcap, is_window, is_dropout, is_paged, is_rope, is_interleaved,
+    [&](auto CAUSAL, auto ALIBI, auto SOFTCAP, auto WINDOW, auto DROPOUT, auto /*PAGED*/, auto /*ROPE*/, auto /*INTERLEAVED*/) {
         constexpr bool IS_CAUSAL  = decltype(CAUSAL)::value;
         constexpr bool IS_ALIBI   = decltype(ALIBI)::value;
         constexpr bool IS_SOFTCAP = decltype(SOFTCAP)::value;
@@ -294,7 +300,7 @@ void launcher_flash_attention_forward(
         kernel<<<grid, block, smem, stream>>>(
             q_ptr, k_ptr, v_ptr, out_ptr, lse_ptr, dmask_ptr,
             B, H_Q, H_K, M, N,
-            softmax_scale, softcap, alibi_slopes, window_left, window_right,
+            softmax_scale, softcap, alibi_slopes, alibi_batch, window_left, window_right,
             p_dropout, dropout_seed, dropout_offset
         );
     });
@@ -321,54 +327,64 @@ std::vector<at::Tensor> flash_attention_forward(
     // Device guard for multi-GPU / pipeline-parallelism
     at::cuda::CUDAGuard device_guard{q.device()};
 
-    auto props  = at::cuda::getCurrentDeviceProperties();
+    auto props = at::cuda::getCurrentDeviceProperties();
     TORCH_CHECK(props->major == 7 && props->minor == 0, "Kernel supports only Volta GPUs.");
-    TORCH_CHECK(q.dtype() == torch::kFloat16, "q must be fp16");
-    TORCH_CHECK(k.dtype() == torch::kFloat16, "k must be fp16");
-    TORCH_CHECK(v.dtype() == torch::kFloat16, "v must be fp16");
-    TORCH_CHECK(q.is_cuda() && k.is_cuda() && v.is_cuda(), "q, k, v must be on CUDA");
+
+    // dtype / device / contiguity
+    auto q_dtype = q.dtype();
+    TORCH_CHECK(q_dtype == torch::kFloat16, "q must be fp16");
+    TORCH_CHECK(k.dtype() == q_dtype && v.dtype() == q_dtype, "k/v must have the same dtype as q");
+    TORCH_CHECK(q.is_cuda() && k.is_cuda() && v.is_cuda(), "Tensors q, k, v must be on CUDA");
     TORCH_CHECK(q.stride(-1) == 1 && k.stride(-1) == 1 && v.stride(-1) == 1, "Last dim of q, k, v must be contiguous");
 
-    const auto sizes = q.sizes();
-    const int B      = sizes[0];
-    const int H_Q    = sizes[1];
-    const int M      = sizes[2];
-    const int D      = sizes[3];
-    const int H_K    = k.size(1);
-    const int N      = k.size(2);
+    // dimensions
+    const int B   = q.size(0);
+    const int H_Q = q.size(1);
+    const int M   = q.size(2);
+    const int D   = q.size(3);
+    const int H_K = k.size(1);
+    const int N   = k.size(2);
 
-    TORCH_CHECK(B > 0, "batch_size must be positive");
-    TORCH_CHECK(D <= 256 && D % 8 == 0 && D % 2 == 0, "D must be even, <=256, multiple of 8");
+    TORCH_CHECK(B > 0, "batch size must be positive");
+    TORCH_CHECK(D <= 256, "head dimension must be <= 256");
+    TORCH_CHECK(D % 8 == 0, "head dimension must be multiple of 8");
     TORCH_CHECK(H_Q % H_K == 0, "H_Q must be divisible by H_K for GQA/MQA");
 
-    // Window edge cases
-    if (window_left  >= N) { window_left  = -1; }
-    if (window_right >= N) { window_right = -1; }
+    // causal / window optimizations
     if (M == 1 && !alibi_slopes.has_value()) { is_causal = false; }
 
-    // Alibi
-    const float* alibi = nullptr;
-    if (alibi_slopes.has_value()) {
-        const auto& slopes = alibi_slopes.value();
-        auto sizes = slopes.sizes();
-        TORCH_CHECK(slopes.dtype() == torch::kFloat32, "alibi_slopes must be fp32");
-        TORCH_CHECK(slopes.is_cuda(), "alibi_slopes must be on CUDA");
-        TORCH_CHECK(slopes.stride(-1) == 1, "alibi_slopes last dim must be contiguous");
-        bool valid_shape = (sizes.size() == 1 && sizes[0] == H_Q) ||
-                           (sizes.size() == 2 && sizes[0] == B && sizes[1] == H_Q);
-        TORCH_CHECK(valid_shape, "alibi_slopes shape must be [H_Q] or [B, H_Q], got ", sizes);
-        alibi = slopes.data_ptr<float>();
+    // softcap restrictions
+    if (softcap > 0.f) {
+        TORCH_CHECK(p_dropout == 0.f, "Softcapping does not support dropout");
     }
 
-    // Dropout
+    // window edge cases
+    if (window_left  >= N) window_left  = -1;
+    if (window_right >= N) window_right = -1;
+
+    // alibi
+    const float* alibi_ptr = nullptr;
+    int alibi_batch = 0;
+    if (alibi_slopes.has_value()) {
+        const auto& slopes = alibi_slopes.value();
+        TORCH_CHECK(slopes.dtype() == torch::kFloat32 && slopes.is_cuda(), "alibi_slopes must be fp32 on CUDA");
+        TORCH_CHECK(slopes.stride(-1) == 1, "alibi_slopes last dim must be contiguous");
+        auto sizes = slopes.sizes();
+        bool valid = (sizes.size() == 1 && sizes[0] == H_Q) ||
+                     (sizes.size() == 2 && sizes[0] == B && sizes[1] == H_Q);
+        TORCH_CHECK(valid, "alibi_slopes must be [H_Q] or [B, H_Q]");
+        alibi_batch = (sizes.size() == 2) ? slopes.stride(0) : 0;
+        alibi_ptr = slopes.data_ptr<float>();
+    }
+
+    // dropout
     TORCH_CHECK(p_dropout >= 0.f && p_dropout < 1.f, "p_dropout must be in [0, 1)");
     TORCH_CHECK(!return_softmax || p_dropout > 0.f, "return_softmax requires p_dropout > 0");
-    if (softcap > 0.f) { TORCH_CHECK(p_dropout == 0.f, "Softcapping does not support dropout"); }
 
     uint64_t dropout_seed   = 0;
     uint64_t dropout_offset = 0;
+    at::Tensor rng_state = torch::empty({2}, torch::dtype(torch::kInt64).device(q.device()));
 
-    at::Tensor rng_state;
     if (p_dropout > 0.0f) {
         auto gen_cuda = at::get_generator_or_default<at::CUDAGeneratorImpl>(gen, at::cuda::detail::getDefaultCUDAGenerator());
         std::lock_guard<std::mutex> lock(gen_cuda->mutex_);
@@ -376,40 +392,43 @@ std::vector<at::Tensor> flash_attention_forward(
         dropout_offset = gen_cuda->get_offset();
         uint64_t counter_offset = static_cast<uint64_t>(B) * static_cast<uint64_t>(H_Q) * 32ULL;
         gen_cuda->set_offset(dropout_offset + counter_offset);
-        rng_state = torch::tensor(
-            {static_cast<int64_t>(dropout_seed), static_cast<int64_t>(dropout_offset)},
-            torch::dtype(torch::kInt64).device(q.device())
-        );
-    } else {
-        rng_state = torch::empty({2}, torch::dtype(torch::kInt64).device(q.device()));
+        rng_state[0] = static_cast<int64_t>(dropout_seed);
+        rng_state[1] = static_cast<int64_t>(dropout_offset);
     }
 
-    // Output tensors
+    // output tensors
     at::Tensor out_fp16 = out.has_value() ? out.value() : torch::empty_like(q);
     auto softmax_lse = torch::empty({B, H_Q, M}, torch::dtype(torch::kFloat32).device(q.device()));
-    TORCH_CHECK(out_fp16.dtype() == torch::kFloat16, "out must be fp16");
+
+    TORCH_CHECK(out_fp16.dtype() == q_dtype, "out must have the same dtype as q");
+    TORCH_CHECK(out_fp16.is_cuda(), "out must be on CUDA");
+    TORCH_CHECK(out_fp16.stride(-1) == 1, "out must have contiguous last dimension");
+    if (out.has_value()) {
+        TORCH_CHECK(out_fp16.sizes() == q.sizes(), "out shape must match q shape");
+    }
     TORCH_CHECK(softmax_lse.dtype() == torch::kFloat32, "softmax_lse must be fp32");
 
+    // dropout mask
     at::Tensor dmask;
-    if (return_softmax && (p_dropout > 0.0f)) {
+    if (return_softmax && p_dropout > 0.0f) {
         dmask = torch::empty({B, H_Q, M, N}, q.options());
     } else {
         dmask = torch::empty({0}, q.options());
     }
 
-    // Edge-case return
+    // empty case
     if (N == 0) {
         out_fp16.zero_();
         softmax_lse.fill_(-std::numeric_limits<float>::infinity());
         return {out_fp16, softmax_lse, dmask, rng_state};
     }
 
-    // Run kernel
+    // run kernel
     auto stream = at::cuda::getCurrentCUDAStream().stream();
 
     #define LAUNCH_KERNEL(DIM) \
         launcher_flash_attention_forward<DIM>(q, k, v, out_fp16, softmax_lse, dmask, softmax_scale, is_causal, \
-                                        softcap, p_dropout, alibi, window_left, window_right, dropout_seed, dropout_offset, stream);
+                                        softcap, p_dropout, alibi_ptr, alibi_batch, window_left, window_right, dropout_seed, dropout_offset, stream);
     switch (D) {
         case 16:  LAUNCH_KERNEL(16);  break;
         case 32:  LAUNCH_KERNEL(32);  break;
