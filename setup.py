@@ -63,6 +63,7 @@ def get_ext_modules():
                 "kernel/fused_mha_forward_varlen.cu",
                 "kernel/fused_mha_backward.cu",
                 "kernel/fused_mha_backward_varlen.cu",
+                "kernel/fused_mha_forward_kvcache.cu",
             ],
             include_dirs=[this_dir / "include"],
             extra_compile_args={

@@ -193,3 +193,53 @@ std::vector<at::Tensor> flash_attention_varlen_backward(
     std::optional<at::Generator> gen,
     std::optional<at::Tensor>& rng_state
 );
+
+/**
+ * FlashAttention Forward Pass with KV-Cache (Paged / Variable-Length)
+ *
+ * @param q                   Query tensor                           [B, M, H, D]         (fp16, input)
+ * @param kcache              Key cache tensor                       [B_c, N, H_k, D]     (fp16, input)
+ *                            or [num_blocks, page_block_size, H_k, D] if block_table is set
+ * @param vcache              Value cache tensor                     [B_c, N, H_k, D]     (fp16, input)
+ *                            or [num_blocks, page_block_size, H_k, D] if block_table is set
+ * @param k                   Optional new key tensor                [B, M_new, H_k, D]   (fp16, input)
+ * @param v                   Optional new value tensor              [B, M_new, H_k, D]   (fp16, input)
+ * @param seqlens_k           Optional actual sequence lengths for K [B]                  (int32, input)
+ * @param rotary_cos          Cosine frequencies for RoPE            [seqlen_ro, D_ro/2]  (fp16, input)
+ * @param rotary_sin          Sine frequencies for RoPE              [seqlen_ro, D_ro/2]  (fp16, input)
+ * @param cache_batch_idx     Indices to index into the KV cache     [B]                  (int32, input)
+ * @param leftpad_k           Optional left padding offsets for K    [B]                  (int32, input)
+ * @param block_table         Optional block table for paged attn    [B, max_blocks]      (int32, input)
+ * @param alibi_slopes        Optional ALiBi slopes tensor           [H] or [B, H]        (fp32, input)
+ * @param out                 Optional output tensor                 [B, M, H, D]         (fp16, output)
+ * @param softmax_scale       Softmax scale factor                   (float, input)
+ * @param is_causal           Enable causal masking                  (bool, input)
+ * @param window_left         Left window size for sliding attn      (int, input)
+ * @param window_right        Right window size for sliding attn     (int, input)
+ * @param softcap             Soft capping value for logits          (float, input)
+ * @param is_rotary_interleaved  If true, RoPE interleaves dims 0,1; else 0, D_ro/2 (bool, input)
+ * @param num_splits          KV-cache split heuristic               (int, input)
+ * @return                    Vector of output tensors {out, softmax_lse}
+ */
+std::vector<at::Tensor> flash_attention_kvcache(
+    at::Tensor &q,
+    const at::Tensor &kcache,
+    const at::Tensor &vcache,
+    std::optional<const at::Tensor> &k,
+    std::optional<const at::Tensor> &v,
+    std::optional<const at::Tensor> &seqlens_k,
+    std::optional<const at::Tensor> &rotary_cos,
+    std::optional<const at::Tensor> &rotary_sin,
+    std::optional<const at::Tensor> &cache_batch_idx,
+    std::optional<const at::Tensor> &leftpad_k,
+    std::optional<at::Tensor> &block_table,
+    std::optional<at::Tensor> alibi_slopes,
+    std::optional<at::Tensor> &out,
+    const float  softmax_scale,
+    bool         is_causal,
+    int          window_left,
+    int          window_right,
+    const float  softcap,
+    bool         is_rotary_interleaved,
+    int          num_splits = 0
+);
