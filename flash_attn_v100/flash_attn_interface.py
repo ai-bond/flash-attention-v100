@@ -31,6 +31,8 @@ class FlashAttnFunc(torch.autograd.Function):
         return_softmax: bool,
         is_grad_enabled: bool
     ) -> torch.Tensor:
+        is_grad = is_grad_enabled and any(x.requires_grad for x in [q, k, v])
+
         q_ = q.permute(0, 2, 1, 3)
         k_ = k.permute(0, 2, 1, 3)
         v_ = v.permute(0, 2, 1, 3)
@@ -64,7 +66,7 @@ class FlashAttnFunc(torch.autograd.Function):
 
         out = out_[..., :head_size_og].permute(0, 2, 1, 3).contiguous()
 
-        if is_grad_enabled and (q.requires_grad or k.requires_grad or v.requires_grad):
+        if is_grad:
             ctx.save_for_backward(q_, k_, v_, out_, lse_, rng_state)
             ctx.dropout_p = dropout_p
             ctx.softmax_scale = softmax_scale
@@ -174,6 +176,9 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         block_table: Optional[torch.Tensor],
         is_grad_enabled: bool
     ) -> torch.Tensor:
+
+        is_grad = is_grad_enabled and any(x.requires_grad for x in [q, k, v])
+
         cu_seqlens_q = cu_seqlens_q.to(torch.int32)
         cu_seqlens_k = cu_seqlens_k.to(torch.int32)
 
@@ -212,7 +217,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
 
         out = out[..., :head_size_og].contiguous()
 
-        if is_grad_enabled and (q.requires_grad or k.requires_grad or v.requires_grad):
+        if is_grad:
             ctx.save_for_backward(q, k, v, out, lse, cu_seqlens_q, cu_seqlens_k, rng_state)
             ctx.dropout_p = dropout_p
             ctx.softmax_scale = softmax_scale
