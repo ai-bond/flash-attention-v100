@@ -81,11 +81,12 @@ __device__ __forceinline__ void WMMA_GEMM_SOFTMAX(
         }
 
         if constexpr (TILES) {
-            for (int idx = tail + thread; idx < VALID_KV; idx += THREADS_PER_ROW) {
-                float v = sS_float[idx];
-                float e = __expf(fmaxf(v - new_max, -80.0f));
-                thread_sum += e;
-                sP_half[idx] = __float2half_rn(e);
+            #pragma unroll 4
+            for (int idx = tail + thread; idx < BLOCK_N; idx += THREADS_PER_ROW) {
+                float      v = (idx < VALID_KV) ? sS_float[idx] : NEG_INF;
+                float      e = __expf(fmaxf(v - new_max, -80.0f));
+                thread_sum  += (idx < VALID_KV) ? e : 0.0f;
+                sP_half[idx] = (idx < VALID_KV) ? __float2half_rn(e) : __float2half(0.f);
             }
         }
 
