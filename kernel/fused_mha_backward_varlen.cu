@@ -408,6 +408,11 @@ flash_attention_backward_varlen_kernel(
         // ======================================================================================
         for (int group = 0; group < (H_Q / H_K); ++group) {
 
+            if (H_Q > H_K) {
+                WMMA_GEMM_INIT_SMEM<Config>(smem_raw);
+                __syncthreads();
+            }
+
             // ======================================================================================
             // RAGGED POINTERS for current Q-head
             // Layout:
