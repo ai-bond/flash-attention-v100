@@ -37,18 +37,16 @@ __device__ __forceinline__ void WMMA_GEMM_SCORES(
 #else
     using namespace volta::wmma;
 #endif
-    constexpr bool APPLY_MASK   = static_cast<uint8_t>(TYPE) & 0x1;
-    constexpr bool NEED_MASKING = APPLY_MASK && IS_CAUSAL;
-    constexpr bool HAS_FEATURES = IS_ALIBI || IS_SOFTCAP || IS_WINDOW;
+    constexpr bool APPLY_MASK    = static_cast<uint8_t>(TYPE) & 0x1;
+    constexpr bool HAS_FEATURES  = IS_ALIBI || IS_SOFTCAP || IS_WINDOW;
+    const     int  SEQLEN_OFFSET = (IS_CAUSAL || IS_WINDOW) ? SEQLEN : 0;
 
     constexpr int WARPS_PER_BLOCK = Config::WARPS_PER_BLOCK;
-
-    constexpr int num_tiles_m = (BLOCK_X + WMMA_M - 1) / WMMA_M;
-    constexpr int num_tiles_n = (BLOCK_Y + WMMA_N - 1) / WMMA_N;
-    constexpr int num_tiles_k = (D + WMMA_K - 1) / WMMA_K;
-
-    constexpr int total_tiles = num_tiles_m * num_tiles_n;
-    constexpr int tiles_per_warp = (total_tiles + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
+    constexpr int num_tiles_m     = (BLOCK_X + WMMA_M - 1) / WMMA_M;
+    constexpr int num_tiles_n     = (BLOCK_Y + WMMA_N - 1) / WMMA_N;
+    constexpr int num_tiles_k     = (D + WMMA_K - 1) / WMMA_K;
+    constexpr int total_tiles     = num_tiles_m * num_tiles_n;
+    constexpr int tiles_per_warp  = (total_tiles + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
 
     using a_layout = std::conditional_t<static_cast<uint8_t>(TYPE) & 0x2, col_major, row_major>;
     using b_layout = std::conditional_t<static_cast<uint8_t>(TYPE) & 0x4, col_major, row_major>;
@@ -62,7 +60,6 @@ __device__ __forceinline__ void WMMA_GEMM_SCORES(
 
         const int tile_m_idx = tile_idx / num_tiles_n;
         const int tile_n_idx = tile_idx % num_tiles_n;
-
         const int tile_m = tile_m_idx * WMMA_M;
         const int tile_n = tile_n_idx * WMMA_N;
 
@@ -82,7 +79,7 @@ __device__ __forceinline__ void WMMA_GEMM_SCORES(
             mma_sync(acc_frag, a_frag, b_frag, acc_frag);
         }
 
-        if constexpr (NEED_MASKING) {
+        if constexpr (APPLY_MASK && IS_CAUSAL) {
             if constexpr (!HAS_FEATURES) {
                 #pragma unroll
                 for (int i = 0; i < acc_frag.num_elements; ++i) {
@@ -92,7 +89,7 @@ __device__ __forceinline__ void WMMA_GEMM_SCORES(
                     const int global_n = GLOBAL_N + tile_n + col;
                     const bool in_bounds = (global_m < GLOBAL_M + VALID_M) && (global_n < GLOBAL_N + VALID_N);
 
-                    acc_frag.x[i] = in_bounds ? (((global_n - SEQLEN) > global_m) ? NEG_INF : acc_frag.x[i] * SOFTMAX_SCALE) : NEG_INF;
+                    acc_frag.x[i] = in_bounds ? (((global_n - SEQLEN_OFFSET) > global_m) ? NEG_INF : acc_frag.x[i] * SOFTMAX_SCALE) : NEG_INF;
                 }
             } else {
                 const float softcap_rcp = IS_SOFTCAP ? (1.0f / SOFTCAP) : 0.0f;
@@ -103,17 +100,17 @@ __device__ __forceinline__ void WMMA_GEMM_SCORES(
                     const int global_m = GLOBAL_M + tile_m + row;
                     const int global_n = GLOBAL_N + tile_n + col;
                     const bool in_bounds = (global_m < GLOBAL_M + VALID_M) && (global_n < GLOBAL_N + VALID_N);
-                    bool is_masked = !in_bounds || ((global_n - SEQLEN) > global_m);
+                    bool is_masked = !in_bounds || ((global_n - SEQLEN_OFFSET) > global_m);
 
                     if constexpr (IS_WINDOW) {
-                        is_masked = is_masked || (WIN_L >= 0 && (global_n - SEQLEN) < global_m - WIN_L) || (WIN_R >= 0 && (global_n - SEQLEN) > global_m + WIN_R);
+                        is_masked = is_masked || (WIN_L >= 0 && (global_n - SEQLEN_OFFSET) < global_m - WIN_L) || (WIN_R >= 0 && (global_n - SEQLEN_OFFSET) > global_m + WIN_R);
                     }
 
                     float val = acc_frag.x[i] * SOFTMAX_SCALE;
                     if (!is_masked) {
                         if constexpr (IS_ALIBI) {
                             // A bias of (-alibi_slope * |i + seqlen_k - seqlen_q - j|)
-                            val = __fmaf_rn(-ALIBI_SLOPE, fabsf(static_cast<float>(global_m - (global_n - SEQLEN))), val);
+                            val = __fmaf_rn(-ALIBI_SLOPE, fabsf(static_cast<float>(global_m - (global_n - SEQLEN_OFFSET))), val);
                         }
                         if constexpr (IS_SOFTCAP) {
                             val = __fmul_rn(SOFTCAP, __tanhf(__fmul_rn(val, softcap_rcp)));
@@ -123,6 +120,34 @@ __device__ __forceinline__ void WMMA_GEMM_SCORES(
                     }
                     acc_frag.x[i] = val;
                 }
+            }
+        } else if constexpr (APPLY_MASK && !IS_CAUSAL && HAS_FEATURES) {
+            const float softcap_rcp = IS_SOFTCAP ? (1.0f / SOFTCAP) : 0.0f;
+            #pragma unroll
+            for (int i = 0; i < acc_frag.num_elements; ++i) {
+                const unsigned col = col_causal + (i & 0b1) + ((i >> 2) & 0b1) * 4;
+                const unsigned row = row_causal + ((i >> 1) & 0b1) * 2;
+                const int global_m = GLOBAL_M + tile_m + row;
+                const int global_n = GLOBAL_N + tile_n + col;
+                const bool in_bounds = (global_m < GLOBAL_M + VALID_M) && (global_n < GLOBAL_N + VALID_N);
+
+                bool is_masked = !in_bounds;
+                if constexpr (IS_WINDOW) {
+                    is_masked = is_masked || (WIN_L >= 0 && (global_n - SEQLEN_OFFSET) < global_m - WIN_L) || (WIN_R >= 0 && (global_n - SEQLEN_OFFSET) > global_m + WIN_R);
+                }
+
+                float val = acc_frag.x[i] * SOFTMAX_SCALE;
+                if (!is_masked) {
+                    if constexpr (IS_ALIBI) {
+                        val = __fmaf_rn(-ALIBI_SLOPE, fabsf(static_cast<float>(global_m - (global_n - SEQLEN_OFFSET))), val);
+                    }
+                    if constexpr (IS_SOFTCAP) {
+                        val = __fmul_rn(SOFTCAP, __tanhf(__fmul_rn(val, softcap_rcp)));
+                    }
+                } else {
+                    val = NEG_INF;
+                }
+                acc_frag.x[i] = val;
             }
         } else {
             #pragma unroll
