@@ -244,7 +244,7 @@ flash_attention_forward_varlen_kernel(
         WMMA_GEMM_DROPOUT<Config, BLOCK_M, BLOCK_N, N_STRIDE, IS_DROPOUT>(
           sP, dmask_ptr ? dmask_ptr + start_kv : nullptr,
           block.valid_q_rows, valid_kv_rows,
-          block.q_base + block.start_q, start_kv, block.seqlen_k,
+          block.q_base + block.start_q, start_kv, max_seqlen_k, H_Q * max_seqlen_k,
           p_dropout, dropout_seed, dropout_offset, tid);
         __syncthreads();
 
