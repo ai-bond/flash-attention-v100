@@ -41,6 +41,7 @@ flash_attention_forward_varlen_kernel(
     const int      H_Q,
     const int      H_K,
     const int      T_Q,
+    const int      max_seqlen_q,
     const int      max_seqlen_k,
     const int      block_page,
     const int      block_table_stride,
@@ -368,7 +369,7 @@ void launcher_flash_attention_forward_varlen(
             q_ptr, k_ptr, v_ptr, out_ptr, lse_ptr, dmask_ptr,
             cu_seqlens_q_ptr, cu_seqlens_k_ptr,
             seqused_k_ptr, leftpad_k_ptr, block_table_ptr,
-            B, H_Q, H_K, T_Q, max_seqlen_k,
+            B, H_Q, H_K, T_Q, max_seqlen_q, max_seqlen_k,
             block_page, block_table_stride, kv_block_stride,
             softmax_scale, softcap, alibi_slopes, alibi_batch, window_left, window_right,
             p_dropout, dropout_seed, dropout_offset

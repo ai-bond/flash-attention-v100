@@ -45,6 +45,8 @@ flash_attention_backward_varlen_kernel(
     const int      T_K,
     const int      grid_dq,
     const int      grid_dkv,
+    const int      max_seqlen_q,
+    const int      max_seqlen_k,
     const float    softmax_scale,
     const float    softcap,
     const float*   alibi_slopes,
@@ -103,14 +105,14 @@ flash_attention_backward_varlen_kernel(
         // Writes deterministic zeros to dQ and softmax_d for numerical stability.
         // ======================================================================================
         if (block.block_min >= block.block_max || block.seqlen_k == 0) {
-            const size_t dq_base   = block.q_offset(D, H_Q, T_Q);
-            const size_t dlse_base = block.lse_offset(H_Q, T_Q);
+            const size_t dq_offset  = block.q_offset(D, H_Q, T_Q);
+            const size_t lse_offset = block.lse_offset(H_Q, T_Q);
             for (int row = threadIdx.x; row < block.valid_q_rows; row += blockDim.x) {
                 #pragma unroll
-                for (int d = 0; d < D; ++d) {
-                    dQ[dq_base + row * H_Q * D + d] = __float2half(0.0f);
+                for (int idx = 0; idx < D; ++idx) {
+                    dQ[dq_offset + row * H_Q * D + idx] = __float2half(0.0f);
                 }
-                softmax_d[dlse_base + row] = 0.0f;
+                softmax_d[lse_offset + row] = 0.0f;
             }
             return;
         }
@@ -180,9 +182,9 @@ flash_attention_backward_varlen_kernel(
         // Layout:   o_ptr[valid_q_rows, H_Q * D] ⊙ sdO[valid_q_rows, D_STRIDE] -> sRowDot[valid_q_rows]
         // Template: D_STRIDE=D_STRIDE, HEAD_STRIDE=D_STRIDE
         // ======================================================================================
-        WMMA_GEMM_DOT_PRODUCT<Config, GemmType::rowdot_dQ, D_STRIDE>(
+        WMMA_GEMM_DOT_PRODUCT<Config, GemmType::rowdot_dQ, D_STRIDE, D>(
           o_ptr, sdO, lse_ptr, sLse, sRowDot,
-          D, block.valid_q_rows, 0, tid);
+          H_Q * D, block.valid_q_rows, 0, tid);
         __syncthreads();
 
         // ======================================================================================
@@ -330,41 +332,44 @@ flash_attention_backward_varlen_kernel(
 
         // ======================================================================================
         // EARLY EXIT: No valid Q blocks attend to this KV block.
-        // Writes deterministic zeros to dK and dV for ALL mapped Q-heads (GQA/MQA safe).
+        // Writes deterministic zeros to dK and dV for Q-head only
         // ======================================================================================
         if (block.block_min >= block.block_max || block.seqlen_q == 0) {
-            for (int group = 0; group < (H_Q / H_K); ++group) {
-                const int q_head = block.kv_head_idx * (H_Q / H_K) + group;
-                const size_t dk_base = static_cast<size_t>(block.k_base + block.start_kv) * H_Q * D + static_cast<size_t>(q_head) * D;
-                const size_t dv_base = static_cast<size_t>(block.k_base + block.start_kv) * H_Q * D + static_cast<size_t>(q_head) * D;
-                for (int row = threadIdx.x; row < block.valid_kv_rows; row += blockDim.x) {
-                    #pragma unroll
-                    for (int d = 0; d < D; ++d) {
-                        dK[dk_base + row * H_Q * D + d] = __float2half(0.0f);
-                        dV[dv_base + row * H_Q * D + d] = __float2half(0.0f);
-                    }
+            const size_t dkdv_offset = static_cast<size_t>(block.k_base + block.start_kv) * H_Q * D + static_cast<size_t>(block.head_idx) * D;
+            for (int row = threadIdx.x; row < block.valid_kv_rows; row += blockDim.x) {
+                #pragma unroll
+                for (int idx = 0; idx < D; ++idx) {
+                    dK[dkdv_offset + row * H_Q * D + idx] = __float2half(0.0f);
+                    dV[dkdv_offset + row * H_Q * D + idx] = __float2half(0.0f);
                 }
             }
             return;
         }
-
         // ======================================================================================
         // Init:   thread/warp/lane IDs for WMMA coordination
         // ======================================================================================
         const int tid     = threadIdx.x;
         const int warp_id = tid >> 5;
         const int lane_id = tid & 31;
+        // Alibi slope only for valid block + batch
+        const int   alibi_idx   = (alibi_batch > 0) ? (block.batch_idx * alibi_batch + block.head_idx) : block.head_idx;
+        const float alibi_slope = (alibi_slopes != nullptr) ? alibi_slopes[alibi_idx] : 0.0f;
 
         // ======================================================================================
-        // RAGGED POINTERS (Base for KV)
         // Layout:
-        //   K/V:       [T_K, H_K, D]            offset follows k_base (K, H_K, D)
-        //   dK/dV:     [T_K, H_Q, D] expanded   offset follows k_base + start_kv (KV, H_Q, D)
+        //   K/V:      [T_K, H_K, D] offset follows k_base, kv_head_idx
+        //   Q/O/dO:   [T_Q, H_Q, D] base follows q_base, head_idx (sequence offset added inside loop)
+        //   LSE:      [H_Q, T_Q]    base follows head_idx * T_Q + q_base
+        //   dK/dV:    [T_K, H_Q, D] offset follows k_base + start_kv, head_idx
         // ======================================================================================
-        const __half* __restrict__ k_ptr  = K  + block.kv_offset(D, H_K, T_K);
-        const __half* __restrict__ v_ptr  = V  + block.kv_offset(D, H_K, T_K);
-        __half* __restrict__ dK_ptr_base  = dK + static_cast<size_t>(block.k_base + block.start_kv) * H_Q * D;
-        __half* __restrict__ dV_ptr_base  = dV + static_cast<size_t>(block.k_base + block.start_kv) * H_Q * D;
+        const __half* __restrict__ k_ptr   = K  + block.kv_offset(D, H_K, T_K);
+        const __half* __restrict__ v_ptr   = V  + block.kv_offset(D, H_K, T_K);
+        const __half* __restrict__ q_ptr   = Q  + static_cast<size_t>(block.q_base) * H_Q * D + static_cast<size_t>(block.head_idx) * D;
+        const __half* __restrict__ o_ptr   = O  + static_cast<size_t>(block.q_base) * H_Q * D + static_cast<size_t>(block.head_idx) * D;
+        const __half* __restrict__ dO_ptr  = dO + static_cast<size_t>(block.q_base) * H_Q * D + static_cast<size_t>(block.head_idx) * D;
+        const  float* __restrict__ lse_ptr = softmax_lse + static_cast<size_t>(block.head_idx) * T_Q + block.q_base;
+              __half* __restrict__ dK_ptr  = dK + static_cast<size_t>(block.k_base + block.start_kv) * H_Q * D + static_cast<size_t>(block.head_idx) * D;
+              __half* __restrict__ dV_ptr  = dV + static_cast<size_t>(block.k_base + block.start_kv) * H_Q * D + static_cast<size_t>(block.head_idx) * D;
 
         // ======================================================================================
         // INIT SHARED MEMORY
@@ -402,155 +407,135 @@ flash_attention_backward_varlen_kernel(
           H_K * D, block.valid_kv_rows, tid);
         __syncthreads();
 
+        // ==================================================================================
+        // Q-TILES LOOP (Iterate over Q-tiles for to this KV-block for Q-head)
+        // ==================================================================================
+        for (int block_q = block.block_min; block_q < block.block_max; ++block_q) {
+            const int start_q      = block_q * BLOCK_N;
+            const int valid_q_rows = min(BLOCK_N, block.seqlen_q - start_q);
+            if (valid_q_rows <= 0) break;
+
+            // ======================================================================================
+            // Load:     Q tile from global to sQ shared memory
+            // Layout:   Q: global[row: BLOCK_N, H_Q * D] -> shared[row: BLOCK_N, D_STRIDE]
+            // Template: DUAL_LOAD=false, SMEM_STRIDE=D_STRIDE, GLOBAL_WIDTH=D (varlen sub-tile)
+            // ======================================================================================
+            WMMA_GEMM_LOAD_TILE<Config, false, D_STRIDE, D>(
+              q_ptr + start_q * H_Q * D, sQ,
+              nullptr,                   nullptr,
+              H_Q * D, valid_q_rows, tid);
+            __syncthreads();
+
+            // ======================================================================================
+            // Compute:  S = Q @ K^T
+            // Layout:   sQ[valid_q_rows, D_STRIDE] @ sK^T -> sS[valid_q_rows, M_STRIDE]
+            // Template: BLOCK_M/BLOCK_N static, valid_q/valid_kv dynamic (varlen ragged tiles)
+            // Note:     M/N swapped for dKV phase (transposed layout)
+            // ======================================================================================
+            WMMA_GEMM_SCORES<Config, GemmType::sQ_KT, D, IS_CAUSAL, IS_ALIBI, IS_SOFTCAP, IS_WINDOW, BLOCK_N, BLOCK_M, D_STRIDE, M_STRIDE>(
+              sQ, sK, sS,
+              valid_q_rows,          block.valid_kv_rows,
+              start_q,               block.start_kv,
+              block.seqlen_offset,
+              softmax_scale, softcap, alibi_slope, window_left, window_right,
+              warp_id, lane_id);
+            __syncthreads();
+
+            // ======================================================================================
+            // Load:     dO tile from global to sdO shared memory
+            // Layout:   dO: global[row: BLOCK_N, H_Q * D] -> shared[row: BLOCK_N, D_STRIDE]
+            // Template: DUAL_LOAD=false, SMEM_STRIDE=D_STRIDE, GLOBAL_WIDTH=D (varlen sub-tile)
+            // ======================================================================================
+            WMMA_GEMM_LOAD_TILE<Config, false, D_STRIDE, D>(
+              dO_ptr + start_q * H_Q * D, sdO,
+              nullptr,                    nullptr,
+              H_Q * D, valid_q_rows, tid);
+            __syncthreads();
+
+            // ======================================================================================
+            // Compute:  row_dot = sum(O ⊙ dO) element-wise
+            // Layout:   o_ptr[start_q:valid_q_rows, H_Q * D] ⊙ sdO -> sRowDot[valid_q_rows]
+            // Template: D_STRIDE=D_STRIDE
+            // ======================================================================================
+            WMMA_GEMM_DOT_PRODUCT<Config, GemmType::rowdot_dKV, D_STRIDE, D>(
+              o_ptr + start_q * H_Q * D, sdO, lse_ptr, sLse, sRowDot,
+              H_Q * D, valid_q_rows, start_q, tid);
+            __syncthreads();
+
+            // ======================================================================================
+            // Compute:  dOV = dO @ V^T
+            // Layout:   sdO[valid_q_rows, D_STRIDE] @ sV^T -> sdOV[valid_q_rows, M_STRIDE]
+            // Template: BLOCK_N/BLOCK_M static, valid_q/valid_kv dynamic (varlen ragged tiles)
+            // Note:     M/N swapped for dKV phase (transposed layout)
+            // ======================================================================================
+            WMMA_GEMM_SCORES<Config, GemmType::dOV_dOVT, D, IS_CAUSAL, IS_ALIBI, IS_SOFTCAP, IS_WINDOW, BLOCK_N, BLOCK_M, D_STRIDE, M_STRIDE>(
+              sdO, sV, sdOV,
+              valid_q_rows,          block.valid_kv_rows,
+              0,                     0,
+              0,
+              1.0f, 0.0f, 0.0f, -1, -1,
+              warp_id, lane_id);
+            __syncthreads();
+
+            // ======================================================================================
+            // Compute:  P = softmax(S), dS = P * (dOV - row_dot) * softmax_scale
+            // Layout:   sS[valid_q_rows, M_STRIDE] -> sP[valid_q_rows, M_STRIDE]
+            //           sdS[valid_q_rows, M_STRIDE]
+            // Varlen:   GLOBAL_N=block.seqlen_k for correct dropout RNG stride
+            // Template: IS_DROPOUT guards compile-time; runtime p_dropout > 0 enables execution
+            // ======================================================================================
+            WMMA_GEMM_SOFTMAX_GRADIENT<Config, GemmType::compute_P_dS, IS_SOFTCAP, IS_DROPOUT, M_STRIDE, BLOCK_M, BLOCK_N, BLOCK_M>(
+              sS, sdOV, sLse, sRowDot, sP, sdS,
+              valid_q_rows, block.valid_kv_rows,
+              softmax_scale, softcap,
+              p_dropout, dropout_seed, dropout_offset,
+              block.q_base + start_q, block.start_kv, block.seqlen_k,
+              tid);
+            __syncthreads();
+
+            // ======================================================================================
+            // Compute:  dV += P^T @ dO
+            // Layout:   sP^T[valid_kv_rows, M_STRIDE] @ sdO[valid_q_rows, D_STRIDE] += sdV
+            // Template: BLOCK_M/BLOCK_N static, valid_kv/valid_q dynamic (varlen ragged tiles)
+            // ======================================================================================
+            WMMA_GEMM_GRADIENTS<Config, GemmType::dV_PTdO, D, BLOCK_M, BLOCK_N, BLOCK_M, D_STRIDE>(
+              sP, sdO, sdV,
+              block.valid_kv_rows, valid_q_rows,
+              warp_id, lane_id);
+            __syncthreads();
+
+            // ==================================================================================
+            // Load:     Q tile from global to sQ(reuse) shared memory
+            // Layout:   Q: global[row: BLOCK_N, D] -> shared[row: BLOCK_N, D_STRIDE]
+            // Template: DUAL_LOAD=false, SRC_STRIDE=D, DST_STRIDE=D_STRIDE
+            // ==================================================================================
+            WMMA_GEMM_LOAD_TILE<Config, false, D_STRIDE, D>(
+              q_ptr + start_q * H_Q * D, sQ,
+              nullptr, nullptr,
+              H_Q * D, valid_q_rows, tid);
+            __syncthreads();
+
+            // ======================================================================================
+            // Compute:  dK += dS^T @ Q
+            // Layout:   sdS^T[valid_kv_rows, M_STRIDE] @ sQ[valid_q_rows, D_STRIDE] += sdK
+            // Template: BLOCK_M/BLOCK_N static, valid_kv/valid_q dynamic (varlen ragged tiles)
+            // ======================================================================================
+            WMMA_GEMM_GRADIENTS<Config, GemmType::dK_dSTQ, D, BLOCK_M, BLOCK_N, BLOCK_M, D_STRIDE>(
+              sdS, sQ, sdK,
+              block.valid_kv_rows, valid_q_rows,
+              warp_id, lane_id);
+            __syncthreads();
+        }  // END Q-TILES LOOP
         // ======================================================================================
-        // Q-HEADS LOOP (GQA/MQA Expansion)
-        // Iterates over all Q-heads that map to the current KV-head
+        // Compute:  Store dK & dV for current Q-head to global memory (Expanded Layout)
+        // Layout:   sdK[row: valid_kv_rows, D_STRIDE] -> dK_ptr[row: valid_kv_rows, H_Q * D]
+        //           sdV[row: valid_kv_rows, D_STRIDE] -> dV_ptr[row: valid_kv_rows, H_Q * D]
+        // Template: DUAL_STORE=true, SMEM_STRIDE=D_STRIDE, GLOBAL_WIDTH=D (varlen sub-tile store)
         // ======================================================================================
-        for (int group = 0; group < (H_Q / H_K); ++group) {
-
-            if (H_Q > H_K) {
-                WMMA_GEMM_INIT_SMEM<Config>(smem_raw);
-                __syncthreads();
-            }
-
-            // ======================================================================================
-            // RAGGED POINTERS for current Q-head
-            // Layout:
-            //   Q/O/dO:    [T_Q, H_Q, D]   offset follows q_base + bthd_idx * D
-            //   LSE:       [H_Q, T_Q]       offset follows bthd_idx * T_Q + q_base
-            //   dK/dV:     [T_K, H_Q, D]    offset follows k_base + start_kv + bthd_idx * D
-            // ======================================================================================
-            const size_t q_head_off = static_cast<size_t>(block.q_base) * H_Q * D + static_cast<size_t>(bthd_idx) * D;
-            const __half* __restrict__ q_ptr   = Q  + q_head_off;
-            const __half* __restrict__ o_ptr   = O  + q_head_off;
-            const __half* __restrict__ dO_ptr  = dO + q_head_off;
-            const float*  __restrict__ lse_ptr = softmax_lse + static_cast<size_t>(bthd_idx) * T_Q + block.q_base;
-            // Alibi slope only for valid block + batch
-            const int   alibi_idx   = (alibi_batch > 0) ? (block.batch_idx * alibi_batch + (block.kv_head_idx * (H_Q / H_K) + group)) : block.kv_head_idx * (H_Q / H_K) + group;
-            const float alibi_slope = (alibi_slopes != nullptr) ? alibi_slopes[alibi_idx] : 0.0f;
-
-            __half* __restrict__ dK_ptr = dK_ptr_base + static_cast<size_t>(bthd_idx) * D;
-            __half* __restrict__ dV_ptr = dV_ptr_base + static_cast<size_t>(bthd_idx) * D;
-
-            // ======================================================================================
-            // Q-HEADS LOOP (Iterate over Q-head groups sharing this KV-head)
-            // ======================================================================================
-            for (int block_q = block.block_min; block_q < block.block_max; ++block_q) {
-                const int start_q      = block_q * BLOCK_N;
-                const int valid_q_rows = min(BLOCK_N, block.seqlen_q - start_q);
-                if (valid_q_rows <= 0) break;
-
-                // ======================================================================================
-                // Load:     Q tile from global to sQ shared memory
-                // Layout:   Q: global[row: BLOCK_N, H_Q * D] -> shared[row: BLOCK_N, D_STRIDE]
-                // Template: DUAL_LOAD=false, SMEM_STRIDE=D_STRIDE, GLOBAL_WIDTH=D (varlen sub-tile)
-                // ======================================================================================
-                WMMA_GEMM_LOAD_TILE<Config, false, D_STRIDE, D>(
-                  q_ptr + start_q * H_Q * D, sQ,
-                  nullptr,                   nullptr,
-                  H_Q * D, valid_q_rows, tid);
-                __syncthreads();
-
-                // ======================================================================================
-                // Compute:  S = Q @ K^T
-                // Layout:   sQ[valid_q_rows, D_STRIDE] @ sK^T -> sS[valid_q_rows, M_STRIDE]
-                // Template: BLOCK_M/BLOCK_N static, valid_q/valid_kv dynamic (varlen ragged tiles)
-                // Note:     M/N swapped for dKV phase (transposed layout)
-                // ======================================================================================
-                WMMA_GEMM_SCORES<Config, GemmType::sQ_KT, D, IS_CAUSAL, IS_ALIBI, IS_SOFTCAP, IS_WINDOW, BLOCK_N, BLOCK_M, D_STRIDE, M_STRIDE>(
-                  sQ, sK, sS,
-                  valid_q_rows,          block.valid_kv_rows,
-                  start_q,               block.start_kv,
-                  block.seqlen_offset,
-                  softmax_scale, softcap, alibi_slope, window_left, window_right,
-                  warp_id, lane_id);
-                __syncthreads();
-
-                // ======================================================================================
-                // Load:     dO tile from global to sdO shared memory
-                // Layout:   dO: global[row: BLOCK_N, H_Q * D] -> shared[row: BLOCK_N, D_STRIDE]
-                // Template: DUAL_LOAD=false, SMEM_STRIDE=D_STRIDE, GLOBAL_WIDTH=D (varlen sub-tile)
-                // ======================================================================================
-                WMMA_GEMM_LOAD_TILE<Config, false, D_STRIDE, D>(
-                  dO_ptr + start_q * H_Q * D, sdO,
-                  nullptr,                    nullptr,
-                  H_Q * D, valid_q_rows, tid);
-                __syncthreads();
-
-                // ======================================================================================
-                // Compute:  row_dot = sum(O ⊙ dO) element-wise
-                // Layout:   o_ptr[start_q:valid_q_rows, H_Q * D] ⊙ sdO -> sRowDot[valid_q_rows]
-                // Template: D_STRIDE=D_STRIDE
-                // ======================================================================================
-                WMMA_GEMM_DOT_PRODUCT<Config, GemmType::rowdot_dKV, D_STRIDE>(
-                  o_ptr + start_q * H_Q * D, sdO, lse_ptr, sLse, sRowDot,
-                  D, valid_q_rows, start_q, tid);
-                __syncthreads();
-
-                // ======================================================================================
-                // Compute:  dOV = dO @ V^T
-                // Layout:   sdO[valid_q_rows, D_STRIDE] @ sV^T -> sdOV[valid_q_rows, M_STRIDE]
-                // Template: BLOCK_N/BLOCK_M static, valid_q/valid_kv dynamic (varlen ragged tiles)
-                // Note:     M/N swapped for dKV phase (transposed layout)
-                // ======================================================================================
-                WMMA_GEMM_SCORES<Config, GemmType::dOV_dOVT, D, IS_CAUSAL, IS_ALIBI, IS_SOFTCAP, IS_WINDOW, BLOCK_N, BLOCK_M, D_STRIDE, M_STRIDE>(
-                  sdO, sV, sdOV,
-                  valid_q_rows,          block.valid_kv_rows,
-                  0,                     0,
-                  0,
-                  1.0f, 0.0f, 0.0f, -1, -1,
-                  warp_id, lane_id);
-                __syncthreads();
-
-                // ======================================================================================
-                // Compute:  P = softmax(S), dS = P * (dOV - row_dot) * softmax_scale
-                // Layout:   sS[valid_q_rows, M_STRIDE] -> sP[valid_q_rows, M_STRIDE]
-                //           sdS[valid_q_rows, M_STRIDE]
-                // Varlen:   GLOBAL_N=block.seqlen_k for correct dropout RNG stride
-                // Template: IS_DROPOUT guards compile-time; runtime p_dropout > 0 enables execution
-                // ======================================================================================
-                WMMA_GEMM_SOFTMAX_GRADIENT<Config, GemmType::compute_P_dS, IS_SOFTCAP, IS_DROPOUT, M_STRIDE, BLOCK_M, BLOCK_N, BLOCK_M>(
-                  sS, sdOV, sLse, sRowDot, sP, sdS,
-                  valid_q_rows, block.valid_kv_rows,
-                  softmax_scale, softcap,
-                  p_dropout, dropout_seed, dropout_offset,
-                  block.q_base + start_q, block.start_kv, block.seqlen_k,
-                  tid);
-                __syncthreads();
-
-                // ======================================================================================
-                // Compute:  dV += P^T @ dO
-                // Layout:   sP^T[valid_kv_rows, M_STRIDE] @ sdO[valid_q_rows, D_STRIDE] += sdV
-                // Template: BLOCK_M/BLOCK_N static, valid_kv/valid_q dynamic (varlen ragged tiles)
-                // ======================================================================================
-                WMMA_GEMM_GRADIENTS<Config, GemmType::dV_PTdO, D, BLOCK_M, BLOCK_N, BLOCK_M, D_STRIDE>(
-                  sP, sdO, sdV,
-                  block.valid_kv_rows, valid_q_rows,
-                  warp_id, lane_id);
-                __syncthreads();
-
-                // ======================================================================================
-                // Compute:  dK += dS^T @ Q
-                // Layout:   sdS^T[valid_kv_rows, M_STRIDE] @ sQ[valid_q_rows, D_STRIDE] += sdK
-                // Template: BLOCK_M/BLOCK_N static, valid_kv/valid_q dynamic (varlen ragged tiles)
-                // ======================================================================================
-                WMMA_GEMM_GRADIENTS<Config, GemmType::dK_dSTQ, D, BLOCK_M, BLOCK_N, BLOCK_M, D_STRIDE>(
-                  sdS, sQ, sdK,
-                  block.valid_kv_rows, valid_q_rows,
-                  warp_id, lane_id);
-                __syncthreads();
-            } // END Q-TILES LOOP
-            // ======================================================================================
-            // Compute:  Store dK & dV for current Q-head to global memory (Expanded Layout)
-            // Layout:   sdK[row: valid_kv_rows, D_STRIDE] -> dK_ptr[row: valid_kv_rows, H_Q * D]
-            //           sdV[row: valid_kv_rows, D_STRIDE] -> dV_ptr[row: valid_kv_rows, H_Q * D]
-            // Template: DUAL_STORE=true, SMEM_STRIDE=D_STRIDE, GLOBAL_WIDTH=D (varlen sub-tile store)
-            // ======================================================================================
-            WMMA_GEMM_EPILOGUE<Config, GemmType::write_dKV, D_STRIDE, D>(
-              sdK,     dK_ptr,
-              sdV,     dV_ptr,
-              nullptr, H_Q * D, block.valid_kv_rows, tid);
-        } // END Q-HEADS LOOP
+        WMMA_GEMM_EPILOGUE<Config, GemmType::write_dKV, D_STRIDE, D>(
+          sdK,     dK_ptr,
+          sdV,     dV_ptr,
+          nullptr, H_Q * D, block.valid_kv_rows, tid);
     }
 }
 
@@ -624,7 +609,7 @@ void launcher_flash_attention_backward_varlen(
     const int*    cu_seqlens_k_ptr = cu_seqlens_k.data_ptr<int>();
 
     dispatch_attention_features(is_causal, is_alibi, is_softcap, is_window, is_dropout, is_paged, is_rope, is_interleaved,
-    [&](auto CAUSAL, auto ALIBI, auto SOFTCAP, auto WINDOW, auto DROPOUT, auto PAGED, auto /*ROPE*/, auto /*INTERLEAVED*/) {
+    [&](auto CAUSAL, auto ALIBI, auto SOFTCAP, auto WINDOW, auto DROPOUT, auto /*PAGED*/, auto /*ROPE*/, auto /*INTERLEAVED*/) {
         constexpr bool IS_CAUSAL  = decltype(CAUSAL)::value;
         constexpr bool IS_ALIBI   = decltype(ALIBI)::value;
         constexpr bool IS_SOFTCAP = decltype(SOFTCAP)::value;
@@ -638,7 +623,7 @@ void launcher_flash_attention_backward_varlen(
             q_ptr, k_ptr, v_ptr, o_ptr, dO_ptr, lse_ptr,
             dq_ptr, dk_ptr, dv_ptr, softmax_d_ptr,
             cu_seqlens_q_ptr, cu_seqlens_k_ptr,
-            B, H_Q, H_K, T_Q, T_K, grid_dq, grid_dkv,
+            B, H_Q, H_K, T_Q, T_K, grid_dq, grid_dkv, max_seqlen_q, max_seqlen_k,
             softmax_scale, softcap, alibi_slopes, alibi_batch, window_left, window_right,
             p_dropout, dropout_seed, dropout_offset
         );

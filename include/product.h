@@ -8,15 +8,6 @@
 #include <cuda_fp16.h>
 
 // ======================================================================================
-// * Copyright (c) 2025, D.Skryabin / tg @ai_bond007 SPDX-License: BSD-3-Clause
-// ======================================================================================
-#pragma once
-
-#include <cuda.h>
-#include <cuda_runtime.h>
-#include <cuda_fp16.h>
-
-// ======================================================================================
 // COMPUTE_ROW_DOT
 // ======================================================================================
 template <typename Config, GemmType TYPE, int SMEM_STRIDE, int GLOBAL_WIDTH = -1>
@@ -31,7 +22,6 @@ __device__ __forceinline__ void WMMA_GEMM_DOT_PRODUCT(
     int OFFSET,
     int THREAD_ID
 ) {
-    constexpr int THREADS_PER_BLOCK = Config::THREADS_PER_BLOCK;
     constexpr bool PHASE            = static_cast<uint8_t>(TYPE) & 0x1;
     constexpr int THREADS_PER_ROW   = PHASE ? Config::DKV::THREADS_PER_ROW : Config::DQ::THREADS_PER_ROW;
 
