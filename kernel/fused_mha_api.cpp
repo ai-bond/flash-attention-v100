@@ -5,9 +5,7 @@
 #include <ATen/ATen.h>
 #include <stdexcept>
 #include <optional>
-
 #include "mha.h"
-
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
@@ -23,6 +21,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("varlen_fwd",   &flash_attention_varlen_forward, "FlashAttention Forward Pass (variable length)");
     m.def("varlen_bwd",   &flash_attention_varlen_backward,"FlashAttention Backward Pass (variable length)");
     m.def("fwd_kvcache",  &flash_attention_kvcache,        "Forward pass with KV-cache");
+}
+
+PYBIND11_MODULE(flash_attn_2_cuda, n) {
+    n.doc() = "FA2 compatibility wrapper";
+    n.def("fwd",          &flash_attention_forward,        "FlashAttention Forward Pass");
+    n.def("bwd",          &flash_attention_backward,       "FlashAttention Backward Pass");
+    n.def("varlen_fwd",   &flash_attention_varlen_forward, "FlashAttention Forward Pass (variable length)");
+    n.def("varlen_bwd",   &flash_attention_varlen_backward,"FlashAttention Backward Pass (variable length)");
+    n.def("fwd_kvcache",  &flash_attention_kvcache,        "Forward pass with KV-cache");
 }
 
 // ======================================================================================

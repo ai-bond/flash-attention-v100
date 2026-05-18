@@ -5,6 +5,7 @@
 
 import os
 import shutil
+import pathlib
 from pathlib import Path
 from packaging.version import parse
 from setuptools import setup
@@ -13,6 +14,29 @@ from setuptools.command.install import install
 from torch.utils.cpp_extension import CUDAExtension, BuildExtension
 
 this_dir = Path(__file__).parent.resolve()
+
+def auto_tune():
+    if os.environ.get("MAX_JOBS") and os.environ.get("NVCC_THREADS"):
+        return
+
+    try:
+        import psutil
+
+        cores = os.cpu_count() or 4
+        mem_sys  = psutil.virtual_memory().available / (1024**3)
+        max_jobs = max(1, int((mem_sys * 0.9) / 2.5))
+        max_jobs = min(max_jobs, cores)
+        max_thrd = max_jobs
+        os.environ["MAX_JOBS"]     = str(max_jobs)
+        os.environ["NVCC_THREADS"] = str(max_thrd)
+
+        print(f"autoset max_jobs={max_jobs}, nvcc_threads={max_thrd} (current {cores} cores, {mem_sys:.1f}GB free mem)")
+    except Exception as e:
+        print(f"Warning: could not auto-tune build params: {e}")
+        os.environ.setdefault("MAX_JOBS", "4")
+        os.environ.setdefault("NVCC_THREADS", "4")
+
+auto_tune()
 
 def get_ext_modules():
     try:
@@ -112,38 +136,28 @@ def get_cmdclass():
         def build_extensions(self):
             import torch
 
-            if not os.environ.get("MAX_JOBS"):
-                try:
-                    import psutil
-
-                    nvcc_threads = int(os.environ.get("NVCC_THREADS", 4))
-                    cores = os.cpu_count() or 4
-                    free_mem_gb = psutil.virtual_memory().available / (1024**3)
-
-                    mem_per_job_gb = 2.5
-
-                    max_jobs_mem = max(1, int(free_mem_gb / mem_per_job_gb))
-                    max_jobs_cores = max(1, (cores - 2) // nvcc_threads)
-
-                    jobs = max(1, min(max_jobs_mem, max_jobs_cores, 6))
-
-                    if free_mem_gb >= 10 and cores >= 8:
-                        jobs = max(jobs, 4)
-
-                    os.environ["MAX_JOBS"] = str(jobs)
-                    os.environ["NVCC_THREADS"] = str(nvcc_threads)
-
-                    print(f"autoset max_jobs={jobs}, nvcc_threads={nvcc_threads} "
-                          f"(current {cores} cores, {free_mem_gb:.1f}GB free mem)")
-                except Exception as e:
-                    print(f"Warning: could not auto-tune build params: {e}")
-                    pass
-
             if not torch.cuda.is_available():
                 raise RuntimeError("CUDA is required but not available.")
             if parse(torch.version.cuda) < parse("12.9"):
                 raise RuntimeError(f"CUDA version {torch.version.cuda} < 12.9 is not supported.")
+
             super().build_extensions()
+
+            try:
+                import pathlib
+
+                src_lib = pathlib.Path(self.get_ext_fullpath("flash_attn_v100_cuda"))
+
+                if src_lib.exists():
+                    dst_lib = src_lib.parent / "flash_attn_2_cuda.so"
+
+                    if dst_lib.exists() or dst_lib.is_symlink():
+                       dst_lib.unlink()
+
+                    dst_lib.symlink_to(src_lib.name)
+                    print(f"Created symlink: {dst_lib.name} -> {src_lib.name}")
+            except Exception as e:
+                print(f"Warning: Failed to create flash_attn_2_cuda.so symlink: {e}")
 
     return {"build_ext": BuildAttention, "build_py": CopyAttention, 'install': InstallAttention}
 

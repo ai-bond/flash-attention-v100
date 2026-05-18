@@ -402,7 +402,7 @@ std::vector<at::Tensor> flash_attention_varlen_forward(
     const float  softcap,
     const bool   return_softmax,
     std::optional<at::Generator> gen,
-    int          num_splits
+    int          num_splits = 0
 ) {
     // Device guard for multi-GPU / pipeline-parallelism
     at::cuda::CUDAGuard device_guard{q.device()};
