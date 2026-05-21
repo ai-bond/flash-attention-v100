@@ -11,7 +11,7 @@
 // ======================================================================================
 // WMMA_GEMM_SOFTMAX: Online softmax with O-scaling
 // ======================================================================================
-template<typename Config, int BLOCK_M, int BLOCK_N, int SCORE_STRIDE, int HEAD_STRIDE, bool TILES = false>
+template<typename Config, int BLOCK_M, int BLOCK_N, int SCORE_STRIDE, int HEAD_STRIDE, bool TAIL = false>
 __device__ __forceinline__ void WMMA_GEMM_SOFTMAX(
     float*  __restrict__ SMEM_S,
     __half* __restrict__ SMEM_P,
@@ -27,21 +27,21 @@ __device__ __forceinline__ void WMMA_GEMM_SOFTMAX(
 
     constexpr int  THREADS_PER_ROW = Config::DO::THREADS_PER_ROW;
 
-    const int row      = THREAD_ID / THREADS_PER_ROW;
-    const int thread   = THREAD_ID % THREADS_PER_ROW;
+    const int row    = THREAD_ID / THREADS_PER_ROW;
+    const int thread = THREAD_ID % THREADS_PER_ROW;
+    const int cols   =  VALID_KV >> 2;
+    const int tail   = (VALID_KV >> 2) << 2;
 
-    float thread_max = NEG_INF, new_max = NEG_INF;
-    float thread_sum = 0.0f, exp_diff = 1.0f;
+    float thread_max = NEG_INF, new_max  = NEG_INF;
+    float thread_sum = 0.0f,    exp_diff = 1.0f;
 
     __half2 half_buffer[8];
+      float tail_buffer[4];
 
       float* sS_float  = SMEM_S + row * SCORE_STRIDE;
      float4* sS_float4 = reinterpret_cast<float4*>(sS_float);
      __half* sP_half   = SMEM_P + row * SCORE_STRIDE;
     __half2* sP_half2  = reinterpret_cast<__half2*>(sP_half);
-
-    const int cols =  VALID_KV >> 2;
-    const int tail = (VALID_KV >> 2) << 2;
 
     if (row < VALID_Q) {
         #pragma unroll 4
@@ -49,7 +49,7 @@ __device__ __forceinline__ void WMMA_GEMM_SOFTMAX(
             float4 buffer = sS_float4[idx];
             thread_max = fmaxf(thread_max, fmaxf(fmaxf(buffer.x, buffer.y), fmaxf(buffer.z, buffer.w)));
         }
-        if constexpr (TILES) {
+        if constexpr (TAIL) {
             for (int idx = tail + thread; idx < VALID_KV; idx += THREADS_PER_ROW) {
                 thread_max = fmaxf(thread_max, sS_float[idx]);
             }
@@ -80,13 +80,14 @@ __device__ __forceinline__ void WMMA_GEMM_SOFTMAX(
             half_buffer[rb_idx++] = __float22half2_rn(make_float2(e2, e3));
         }
 
-        if constexpr (TILES) {
-            #pragma unroll 4
-            for (int idx = tail + thread; idx < BLOCK_N; idx += THREADS_PER_ROW) {
-                float      v = (idx < VALID_KV) ? sS_float[idx] : NEG_INF;
-                float      e = __expf(fmaxf(v - new_max, -80.0f));
-                thread_sum  += (idx < VALID_KV) ? e : 0.0f;
-                sP_half[idx] = (idx < VALID_KV) ? __float2half_rn(e) : __float2half(0.f);
+        int tr_idx = 0;
+        if constexpr (TAIL) {
+            #pragma unroll
+            for (int idx = tail + thread; idx < VALID_KV; idx += THREADS_PER_ROW) {
+                float v  = sS_float[idx];
+                tail_buffer[tr_idx] = __expf(fmaxf(v - new_max, -80.0f));
+                thread_sum += tail_buffer[tr_idx];
+                tr_idx++;
             }
         }
 
@@ -96,6 +97,14 @@ __device__ __forceinline__ void WMMA_GEMM_SOFTMAX(
             int base = idx * 2;
             sP_half2[base]     = half_buffer[wb_idx++];
             sP_half2[base + 1] = half_buffer[wb_idx++];
+        }
+
+        if constexpr (TAIL) {
+            int tw_idx = 0;
+            #pragma unroll
+            for (int idx = tail + thread; idx < VALID_KV; idx += THREADS_PER_ROW) {
+                sP_half[idx] = __float2half_rn(tail_buffer[tw_idx++]);
+            }
         }
     }
 

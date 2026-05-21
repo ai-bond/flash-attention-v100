@@ -24,12 +24,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 }
 
 PYBIND11_MODULE(flash_attn_2_cuda, n) {
-    n.doc() = "FA2 compatibility wrapper";
-    n.def("fwd",          &flash_attention_forward,        "FlashAttention Forward Pass");
-    n.def("bwd",          &flash_attention_backward,       "FlashAttention Backward Pass");
-    n.def("varlen_fwd",   &flash_attention_varlen_forward, "FlashAttention Forward Pass (variable length)");
-    n.def("varlen_bwd",   &flash_attention_varlen_backward,"FlashAttention Backward Pass (variable length)");
-    n.def("fwd_kvcache",  &flash_attention_kvcache,        "Forward pass with KV-cache");
+    n.doc() = "FlashAttention-2 CUDA implementation";
+    n.def("fwd",          &flash_attention_forward,        "Forward pass");
+    n.def("bwd",          &flash_attention_backward,       "Backward pass");
+    n.def("varlen_fwd",   &flash_attention_varlen_forward, "Forward pass for variable-length sequences)");
+    n.def("varlen_bwd",   &flash_attention_varlen_backward,"Backward pass for variable-length sequences");
+    n.def("fwd_kvcache",  &flash_attention_kvcache,        "Forward pass with KV-cache for incremental decoding");
 }
 
 // ======================================================================================
