@@ -36,7 +36,7 @@ __device__ __forceinline__ void WMMA_GEMM_SOFTMAX(
     float thread_sum = 0.0f,    exp_diff = 1.0f;
 
     __half2 half_buffer[8];
-      float tail_buffer[4];
+    __half  tail_buffer[4];
 
       float* sS_float  = SMEM_S + row * SCORE_STRIDE;
      float4* sS_float4 = reinterpret_cast<float4*>(sS_float);
@@ -80,14 +80,14 @@ __device__ __forceinline__ void WMMA_GEMM_SOFTMAX(
             half_buffer[rb_idx++] = __float22half2_rn(make_float2(e2, e3));
         }
 
-        int tr_idx = 0;
         if constexpr (TAIL) {
+            int tr_idx = 0;
             #pragma unroll
             for (int idx = tail + thread; idx < VALID_KV; idx += THREADS_PER_ROW) {
                 float v  = sS_float[idx];
-                tail_buffer[tr_idx] = __expf(fmaxf(v - new_max, -80.0f));
-                thread_sum += tail_buffer[tr_idx];
-                tr_idx++;
+                float e  = __expf(fmaxf(v - new_max, -80.0f));
+                thread_sum += e;
+                tail_buffer[tr_idx++] = __float2half_rn(e);
             }
         }
 
@@ -103,7 +103,12 @@ __device__ __forceinline__ void WMMA_GEMM_SOFTMAX(
             int tw_idx = 0;
             #pragma unroll
             for (int idx = tail + thread; idx < VALID_KV; idx += THREADS_PER_ROW) {
-                sP_half[idx] = __float2half_rn(tail_buffer[tw_idx++]);
+                sP_half[idx] = tail_buffer[tw_idx++];
+            }
+
+            #pragma unroll
+            for (int idx = VALID_KV + thread; idx < BLOCK_N; idx += THREADS_PER_ROW) {
+                sP_half[idx] = __float2half(0.0f);
             }
         }
     }
