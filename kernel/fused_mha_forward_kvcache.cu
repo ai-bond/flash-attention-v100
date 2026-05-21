@@ -131,13 +131,13 @@ flash_attention_kvcache_kernel(
     // ==================================================================================
     // KV-CACHE UPDATE
     // ==================================================================================
-    WMMA_GEMM_UPDATE_KVCACHE<Config, D, IS_ROPE, IS_INTERLEAVED>(
-      K_new, V_new, K_cache, V_cache, rotary_cos, rotary_sin,
+    WMMA_GEMM_UPDATE_KVCACHE<Config, D, IS_PAGED, IS_ROPE, IS_INTERLEAVED>(
+      K_new, V_new, K_cache, V_cache, rotary_cos, rotary_sin, block_table,
       T_NEW, H_K,
       stride_n_b, stride_n_s, stride_n_h,
       stride_k_b, stride_k_s, stride_k_h,
       batch_idx, kv_head_idx, cache_bidx, cache_seqlen, rotary_dim,
-      leftpad, tid);
+      leftpad, block_page, block_table_stride, tid);
     __syncthreads();
 
     // ==================================================================================
@@ -172,7 +172,6 @@ flash_attention_kvcache_kernel(
 
     if (tid < BLOCK_M) {
         sRowMax[tid] = NEG_INF;
-        sRowSum[tid] = 0.0f;
     }
 
     // ==================================================================================
@@ -181,7 +180,8 @@ flash_attention_kvcache_kernel(
     WMMA_GEMM_TILE_ROTARY<Config, D_STRIDE, IS_CAUSAL, IS_WINDOW, IS_ROPE, IS_INTERLEAVED, D>(
       q_ptr, sQ, rotary_cos, rotary_sin,
       stride_q_s, block.valid_q_rows,
-      cache_seqlen, rotary_dim, leftpad, tid);
+      cache_seqlen, rotary_dim, leftpad,
+      block.start_q, tid);
     __syncthreads();
 
     // ==================================================================================
@@ -524,6 +524,9 @@ std::vector<at::Tensor> flash_attention_kvcache(
         TORCH_CHECK(v_tensor.size(1) == T_NEW, "v seqlen mismatch");
         TORCH_CHECK(v_tensor.size(2) == H_K, "v heads mismatch");
         TORCH_CHECK(v_tensor.size(3) == D, "v head_dim mismatch");
+    } else {
+        k_tensor = torch::empty({0}, q.options());
+        v_tensor = torch::empty({0}, q.options());
     }
 
     // seqlens_k
@@ -631,15 +634,9 @@ std::vector<at::Tensor> flash_attention_kvcache(
     auto stream = at::cuda::getCurrentCUDAStream().stream();
 
     #define LAUNCH_KERNEL(DIM) \
-    launcher_flash_attention_kvcache<DIM>( \
-        q, k_tensor, v_tensor, \
-        kcache, vcache, out_fp16, softmax_lse, \
-        seqlens_tensor, cbi_tensor, leftpad_tensor, block_table_tensor, \
-        cos_tensor, sin_tensor, \
-        T_NEW, max_seqlen_k, is_rope, is_interleaved, rotary_dim, \
-        softmax_scale, is_causal, softcap, alibi_ptr, alibi_batch, \
-        window_left, window_right, is_paged, stream);
-
+    launcher_flash_attention_kvcache<DIM>(q, k_tensor, v_tensor, kcache, vcache, out_fp16, softmax_lse, seqlens_tensor, cbi_tensor, \
+                                    leftpad_tensor, block_table_tensor, cos_tensor, sin_tensor, T_NEW, max_seqlen_k, is_rope, is_interleaved, rotary_dim, \
+                                    softmax_scale, is_causal, softcap, alibi_ptr, alibi_batch, window_left, window_right, is_paged, stream);
     switch (D) {
         case 16:  LAUNCH_KERNEL(16); break;
         case 32:  LAUNCH_KERNEL(32); break;
