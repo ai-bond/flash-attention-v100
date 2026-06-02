@@ -317,9 +317,8 @@ def flash_attn_varlen_func(
         traceback.print_exc()
         raise
 
-
 # ======================================================================================
-# KV ATTENTION (B, M, H, D) -> (B, H, M, D)
+# KV ATTENTION (B, M, H, D) -> (B, M, H, D)
 # ======================================================================================
 def flash_attn_with_kvcache(
     q: torch.Tensor,
@@ -352,39 +351,26 @@ def flash_attn_with_kvcache(
 
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
 
-    q_ = q.permute(0, 2, 1, 3).contiguous()
-    k_cache_ = k_cache
-    v_cache_ = v_cache
-
-    if k is not None:
-        k_ = k.permute(0, 2, 1, 3).contiguous()
-    else:
-        k_ = None
-
-    if v is not None:
-        v_ = v.permute(0, 2, 1, 3).contiguous()
-    else:
-        v_ = None
-
     if softmax_scale is None:
-        softmax_scale = q_.shape[-1] ** (-0.5)
+        softmax_scale = q.shape[-1] ** (-0.5)
 
     if cache_seqlens is not None and isinstance(cache_seqlens, int):
         cache_seqlens = torch.full(
-            (q_.shape[0],), cache_seqlens, dtype=torch.int32, device=k_cache_.device
+            (q.shape[0],), cache_seqlens, dtype=torch.int32, device=k_cache.device
         )
-        cache_seqlens = maybe_contiguous(cache_seqlens)
 
+    cache_seqlens = maybe_contiguous(cache_seqlens)
     cache_batch_idx = maybe_contiguous(cache_batch_idx)
     block_table = maybe_contiguous(block_table)
-    out_ = torch.empty_like(q_)
 
-    out_, softmax_lse = flash_attn_v100_cuda.fwd_kvcache(
-        q_,
-        k_cache_,
-        v_cache_,
-        k_,
-        v_,
+    out = torch.empty_like(q)
+
+    out, softmax_lse = flash_attn_v100_cuda.fwd_kvcache(
+        q,
+        k_cache,
+        v_cache,
+        k,
+        v,
         cache_seqlens,
         rotary_cos,
         rotary_sin,
@@ -392,7 +378,7 @@ def flash_attn_with_kvcache(
         cache_leftpad,
         block_table,
         alibi_slopes,
-        out_,
+        out,
         softmax_scale,
         causal,
         window_size[0],
@@ -402,12 +388,9 @@ def flash_attn_with_kvcache(
         num_splits,
     )
 
-    out = out_.permute(0, 2, 1, 3).contiguous()
-
     if return_softmax_lse:
         return out, softmax_lse
     return out
-
 
 flash_attn_gpu = flash_attn_func
 flash_attn_varlen_gpu = flash_attn_varlen_func
