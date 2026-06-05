@@ -13,7 +13,7 @@ requires = [
 
 [project]
 name = "flash_attn_v100"
-version = "26.04"
+version = "26.06"
 description = "Flash Attention 2 for Tesla v100"
 readme = "README.md"
 requires-python = ">=3.10"

@@ -1,19 +1,19 @@
 # FlashAttention for unsupported Tesla v100
 
-This repository want to implement the official implementation of FlashAttention and [FlashAttention-2](https://github.com/ai-bond/flash-attention-v100/blob/main/docs/attention.md) under unsupported in TriDao repo [Nvidia Tesla V100](https://github.com/ai-bond/flash-attention-v100/blob/main/docs/volta.md)
+This repository implementation of [FlashAttention-2](https://github.com/ai-bond/flash-attention-v100/blob/main/utils/docs/attention.md) under unsupported in TriDao repo [Nvidia Tesla V100](https://github.com/ai-bond/flash-attention-v100/blob/main/utils/docs/volta.md)
 
-> This repo is attempt to build flash attention from scratch without "Vibe Code" for self education. 
-
-According to [Nvidia Deprecated Architectures](https://docs.nvidia.com/cuda/cuda-toolkit-release-notes/index.html#deprecated-architectures): Architecture support for Volta is considered feature-complete. Offline compilation and library support for these architectures have been removed in CUDA Toolkit 13.0 major version release.
+> It attempt to build flash attention from scratch without "Vibe Code" for self education.
 
 Last one available CUDA for Volta:
 -------------
+
+According to [Nvidia Deprecated Architectures](https://docs.nvidia.com/cuda/cuda-toolkit-release-notes/index.html#deprecated-architectures): Architecture support for Volta is considered feature-complete. Offline compilation and library support for these architectures have been removed in CUDA Toolkit 13.0 major version release.
+
 ```
 # Download package
 wget https://developer.download.nvidia.com/compute/cuda/12.9.1/local_installers/cuda_12.9.1_575.57.08_linux.run
 
-# Install, this cuda package with NVIDIA driver version
-#      575.57.08 that can be installed together
+# Install, this cuda package with NVIDIA driver version 575.57.08 that can be installed together
 sudo sh cuda_12.9.1_575.57.08_linux.run
 
 # Export and apply
@@ -23,7 +23,6 @@ export PATH=/usr/local/cuda/bin:$PATH
 EOF
 source ~/.bashrc
 ```
-
 
 Deployment and compilation
 -------------
@@ -61,7 +60,7 @@ or
 
 pip install . --no-build-isolation -v
 ```
-Also after
+Also after you can final check ready venv
 
 ```
 Successfully built flash_attn_v100
@@ -84,55 +83,88 @@ Summary: Flash Attention for Tesla V100
 
 And gl and hf :)
 
-Debug
+How to use FlashAttention
 -------------
-Now by default code will compile with fused m16n16k16 library. Youcan back or use
 
-`--mma-native` Use native CUDA mma.h with (16x16x16, m32n8k16, m8n32k16)
+The main functions implement scaled dot product attention (softmax(Q @ K^T * softmax_scale) @ V):
+```
+from flash_attn      import flash_attn_func, flash_attn_varlen_func, flash_attn_with_kvcache
+from flash_attn_v100 import flash_attn_func, flash_attn_varlen_func, flash_attn_with_kvcache
+```
+```
+flash_attn_func(q, k, v, dropout_p=0.0, softmax_scale=None, causal=False,
+                window_size=(-1, -1), softcap=0.0, alibi_slopes=None, deterministic=False):
+"""
+FlashAttention for dense tensors.
 
-`--mma-884` Use fused 8x8x4 MMA library
+Arguments:
+    q, k, v      : (batch_size, seqlen, nheads, headdim)
+    dropout_p    : float. Dropout probability (set to 0.0 for evaluation).
+    softmax_scale: float. Scaling of QK^T. Default: 1/sqrt(headdim).
+    causal       : bool. Apply causal attention mask.
+    window_size  : (left, right). Sliding window attention. (-1, -1) means full attention.
+    softcap      : float. Softcap for attention scores (0.0 disables).
+    alibi_slopes : (nheads,) or (batch_size, nheads). ALiBi bias.
+    deterministic: bool. Deterministic backward (not fully supported).
+Return:
+    out: (batch_size, seqlen, nheads, headdim) or (out, lse, dmask)
+"""
+```
+```
+flash_attn_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
+                       dropout_p=0.0, softmax_scale=None, causal=False,
+                       window_size=(-1, -1), softcap=0.0, alibi_slopes=None,
+                       deterministic=False, return_attn_probs=False, block_table=None):
+"""
+FlashAttention for variable-length sequences.
 
- `--debug` Enable debug mode, preserve build artifacts, generate assembly extraction tool
+Arguments:
+    q, k, v                   : (total_seqlen, nheads, headdim) - packed sequences
+    cu_seqlens_q, cu_seqlens_k: (batch_size+1,) Cumulative sequence lengths
+    max_seqlen_q, max_seqlen_k: int. Maximum sequence lengths
+    dropout_p                 : float. Dropout probability (set to 0.0 for evaluation)
+    softmax_scale             : float. Scaling of QK^T. Default: 1/sqrt(headdim)
+    causal                    : bool. Apply causal attention mask
+    window_size               : (left, right). Sliding window attention. (-1, -1) means full attention
+    softcap                   : float. Softcap for attention scores (0.0 disables)
+    alibi_slopes              : (nheads,) or (batch_size, nheads). ALiBi bias
+    deterministic             : bool. Deterministic backward (not fully supported)
+    return_attn_probs         : bool. Return attention probabilities and log-sum-exp
+    block_table               : Optional. PagedAttention block table
 
+Return:
+    out: (total_seqlen, nheads, headdim) or (out, lse, dmask)
+"""
+```
+```
+flash_attn_with_kvcache(q, k_cache, v_cache, k=None, v=None, rotary_cos=None, 
+                        rotary_sin=None, cache_seqlens=None, cache_batch_idx=None,
+                        cache_leftpad=None, block_table=None, softmax_scale=None,
+                        causal=False, window_size=(-1, -1), softcap=0.0,
+                        rotary_interleaved=True, alibi_slopes=None, num_splits=0,
+                        return_softmax_lse=False):
+"""
+FlashAttention for incremental decoding with KV cache.
 
+Arguments:
+    q                     : (batch_size, seqlen_q, nheads, headdim) - New queries
+    k_cache, v_cache      : (batch_size, max_seqlen_k, nheads_k, headdim) - KV cache (updated inplace)
+    k, v                  : Optional. New KV to append to cache (batch_size, seqlen_k, nheads_k, headdim)
+    rotary_cos, rotary_sin: Optional. Rotary embeddings for positional encoding
+    cache_seqlens         : Optional. Current sequence lengths per batch (batch_size,) 
+    cache_batch_idx       : Optional. Batch index remapping for cache
+    cache_leftpad         : Optional. Left padding information for cache
+    block_table           : Optional. PagedAttention block table
+    softmax_scale         : float. Scaling of QK^T. Default: 1/sqrt(headdim)
+    causal                : bool. Apply causal attention mask (typically True for autoregressive decoding)
+    window_size           : (left, right). Sliding window attention. (-1, -1) means full attention
+    softcap               : float. Softcap for attention scores (0.0 disables)
+    rotary_interleaved    : bool. Whether to use interleaved rotary embeddings
+    alibi_slopes          : (nheads,) or (batch_size, nheads). ALiBi bias
+    num_splits            : int. Number of splits for parallel computation (0 = auto)
+    return_softmax_lse    : bool. Return log-sum-exp with output
 
-## Debug Markers
-
-### Available Stages
-
-| Stage | Description | Location |
-|-------|-------------|----------|
-| `SMEM` | Shared memory initialization check | After smem init, before any loads |
-| `TILE` | Tile load validation (Q, K, V) | After each tile load from global memory |
-| `SQKT` | Score matrix (Q·K^T) validation | After matrix multiplication, before softmax |
-| `SOFTMAX` | Online softmax validation | After softmax computation |
-| `DOVT` | dO·V^T validation (backward) | After gradient computation for dP |
-| `DOPV` | Output accumulation (P·V) validation | After each P·V multiplication |
-| `DQDSK` | dQ from dS·K validation (backward) | After dQ gradient computation |
-| `DVPTDO` | dV from P^T·dO validation (backward) | After dV gradient computation |
-| `DKDSTQ` | dK from S^T·dQ validation (backward) | After dK gradient computation |
-| `ROWDQ` | Row-wise operations for dQ | During dQ reduction |
-| `ROWDKV` | Row-wise operations for dK/dV | During dK/dV reduction |
-| `WRITEO` | Final output write validation | Before writing O to global memory |
-| `WRITEQ` | dQ write validation (backward) | Before writing dQ to global memory |
-| `WRITEKV` | dK/dV write validation (backward) | Before writing dK/dV to global memory |
-| `NONE` | No debug stage | Default/disabled state |
-
-### Extracted Checks
-
-- `__CHECK_INIT`      - Verifies buffer zeroing (Q, K, O)
-- `__CHECK_ERRORS`    - Detects inf/nan in shared memory matrices
-- `__PRINT_MATRIX`    - Dumps matrix content (optional)
-- `__PRINT_RESULT`    - Traces row sums for online softmax
-- `__ASM_DEBUG_BEGIN` - Put begin of ptx and sass insertion
-- `__ASM_DEBUG_BEGIN` - Put end of ptx and sass insertion
-
-When running with `--debug` flag, the kernels insert assembly-level markers for PTX/SASS extraction using `asm_extract.sh` script.
-
-```bash
-# Extract PTX block
-./build/asm_extract.sh ./build/fused_mha_forward.ptx SQKT ptx
-
-# Extract SASS block  
-./build/asm_extract.sh ./build/fused_mha_backward.cubin DOPV sass
-
+Return:
+    out: (batch_size, seqlen_q, nheads, headdim) or (out, softmax_lse)
+"""
+```

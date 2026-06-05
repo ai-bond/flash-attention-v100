@@ -190,11 +190,13 @@ flash_attention_forward_kernel(
         // Layout:   P[BLOCK_M, BLOCK_N] (in SMEM) -> P_masked (in SMEM) Optionally store mask to dmask[BLOCK_M, BLOCK_N] in GMEM
         // Template: BLOCK_M, BLOCK_N, N_STRIDE, IS_DROPOUT
         // ==================================================================================
-        WMMA_GEMM_DROPOUT<Config, BLOCK_M, BLOCK_N, N_STRIDE, IS_DROPOUT>(
-          sP, dmask_ptr ? dmask_ptr + block.start_q * N + start_kv : nullptr,
-          block.valid_q_rows, valid_kv_rows,
-          block.start_q, start_kv, N, N,
-          p_dropout, dropout_seed, dropout_offset, tid);
+        if constexpr (IS_DROPOUT) {
+            WMMA_GEMM_DROPOUT<Config, BLOCK_M, BLOCK_N, N_STRIDE, IS_DROPOUT>(
+              sP, dmask_ptr ? dmask_ptr + block.start_q * N + start_kv : nullptr,
+              block.valid_q_rows, valid_kv_rows,
+              block.start_q, start_kv, N, N,
+              p_dropout, dropout_seed, dropout_offset, tid);
+        }
         __syncthreads();
 
         // ==================================================================================

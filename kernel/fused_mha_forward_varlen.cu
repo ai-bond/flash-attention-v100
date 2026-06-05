@@ -241,11 +241,13 @@ flash_attention_forward_varlen_kernel(
         // Varlen:   GLOBAL_N=block.seqlen_k (actual KV length) for correct RNG stride
         // Template: IS_DROPOUT guards compile-time; runtime p_dropout > 0 enables execution
         // ======================================================================================
-        WMMA_GEMM_DROPOUT<Config, BLOCK_M, BLOCK_N, N_STRIDE, IS_DROPOUT>(
-          sP, dmask_ptr ? dmask_ptr + start_kv : nullptr,
-          block.valid_q_rows, valid_kv_rows,
-          block.q_base + block.start_q, start_kv, max_seqlen_k, H_Q * max_seqlen_k,
-          p_dropout, dropout_seed, dropout_offset, tid);
+        if constexpr (IS_DROPOUT) {
+            WMMA_GEMM_DROPOUT<Config, BLOCK_M, BLOCK_N, N_STRIDE, IS_DROPOUT>(
+              sP, dmask_ptr ? dmask_ptr + start_kv : nullptr,
+              block.valid_q_rows, valid_kv_rows,
+              block.q_base + block.start_q, start_kv, max_seqlen_k, H_Q * max_seqlen_k,
+              p_dropout, dropout_seed, dropout_offset, tid);
+        }
         __syncthreads();
 
         // ======================================================================================

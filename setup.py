@@ -66,9 +66,9 @@ def get_ext_modules():
         nvcc_flags.extend([
             "-DKERNEL_DEBUG",
             "-g",
-            "-Xptxas", "-v",
             "--keep",
             "--keep-dir", str(this_dir / "build"),
+            "-Xptxas", "-v",
         ])
         (this_dir / "build").mkdir(exist_ok=True)
 
@@ -169,7 +169,7 @@ except FileNotFoundError:
 
 setup(
     name="flash_attn_v100",
-    version="26.04",
+    version="26.06",
     packages=["flash_attn_v100"],
     ext_modules=get_ext_modules(),
     cmdclass=get_cmdclass(),
