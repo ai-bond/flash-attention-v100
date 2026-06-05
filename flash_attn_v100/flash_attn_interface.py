@@ -318,7 +318,7 @@ def flash_attn_varlen_func(
         raise
 
 # ======================================================================================
-# KV ATTENTION (B, M, H, D) -> (B, M, H, D)
+# KV ATTENTION
 # ======================================================================================
 def flash_attn_with_kvcache(
     q: torch.Tensor,
@@ -342,9 +342,7 @@ def flash_attn_with_kvcache(
     return_softmax_lse: bool = False,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     """
-    FlashAttention with KV cache (B, M, H, D) for incremental decoding.
-    If k and v are not None, k_cache and v_cache will be updated *inplace* with the new values.
-    Note: Does not support backward pass.
+    FlashAttention with KV cache (B, M, H, D).
     """
     assert k_cache.stride(-1) == 1, "k_cache must have contiguous last dimension"
     assert v_cache.stride(-1) == 1, "v_cache must have contiguous last dimension"
