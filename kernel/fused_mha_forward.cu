@@ -18,7 +18,6 @@
 #include "gemm_smem.h"
 #include "mat_mul.h"
 #include "softmax.h"
-#include "dropout.h"
 
 // ======================================================================================
 // FORWARD KERNEL
@@ -175,28 +174,16 @@ flash_attention_forward_kernel(
         __syncthreads();
 
         // ==================================================================================
-        // Compute:  Online Softmax + O-scaling
+        // Compute:  Online Softmax + O-scaling + Dropout
         // Layout:   S[BLOCK_M, BLOCK_N] -> P[BLOCK_M, BLOCK_N], O[BLOCK_M, D] scaled
-        // Template: BLOCK_M, BLOCK_N, N_STRIDE, D_STRIDE
+        // Template: BLOCK_M, BLOCK_N, N_STRIDE, D_STRIDE, TAIL=false, IS_DROPOUT
         // ==================================================================================
-        WMMA_GEMM_SOFTMAX<Config, BLOCK_M, BLOCK_N, N_STRIDE, D_STRIDE>(
+        WMMA_GEMM_SOFTMAX<Config, BLOCK_M, BLOCK_N, N_STRIDE, D_STRIDE, IS_DROPOUT>(
           sS, sP, sO,
-          sRowMax, sRowSum,
-          block.valid_q_rows, valid_kv_rows, tid, block_q);
-        __syncthreads();
-
-        // ==================================================================================
-        // Compute:  Apply dropout to P tile and generate dropout mask
-        // Layout:   P[BLOCK_M, BLOCK_N] (in SMEM) -> P_masked (in SMEM) Optionally store mask to dmask[BLOCK_M, BLOCK_N] in GMEM
-        // Template: BLOCK_M, BLOCK_N, N_STRIDE, IS_DROPOUT
-        // ==================================================================================
-        if constexpr (IS_DROPOUT) {
-            WMMA_GEMM_DROPOUT<Config, BLOCK_M, BLOCK_N, N_STRIDE, IS_DROPOUT>(
-              sP, dmask_ptr ? dmask_ptr + block.start_q * N + start_kv : nullptr,
-              block.valid_q_rows, valid_kv_rows,
-              block.start_q, start_kv, N, N,
-              p_dropout, dropout_seed, dropout_offset, tid);
-        }
+          sRowMax, sRowSum, dmask_ptr ? dmask_ptr + block.start_q * N + start_kv : nullptr,
+          block.valid_q_rows, valid_kv_rows, tid, block_q,
+          block.start_q, start_kv, N,
+          p_dropout, dropout_seed, dropout_offset, N);
         __syncthreads();
 
         // ==================================================================================

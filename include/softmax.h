@@ -18,17 +18,25 @@
 // SWIZZLE:  S read via ld_float4/ld_float(addr, row). P stored via st_half2/st_half(addr, row).
 //           O rescaled via ld_float4/st_float4(addr, row) when BLOCK_ID > 0.
 // ======================================================================================
-template <typename Config, int BLOCK_M, int BLOCK_N, int SCORE_STRIDE, int HEAD_STRIDE, bool TAIL = false>
+template <typename Config, int BLOCK_M, int BLOCK_N, int SCORE_STRIDE, int HEAD_STRIDE, bool IS_DROPOUT, bool TAIL = false>
 __device__ __forceinline__ void WMMA_GEMM_SOFTMAX(
     float*   __restrict__ SMEM_S,
     __half*  __restrict__ SMEM_P,
     float*   __restrict__ SMEM_O,
     float*   __restrict__ SMEM_MAX,
     float*   __restrict__ SMEM_SUM,
-    int VALID_Q,
-    int VALID_KV,
-    int THREAD_ID,
-    int BLOCK_ID
+   __half*   __restrict__ GMEM_MASK,
+    int      VALID_Q,
+    int      VALID_KV,
+    int      THREAD_ID,
+    int      BLOCK_ID,
+    int      GLOBAL_ROW_OFFSET,
+    int      GLOBAL_COL_OFFSET,
+    int      GLOBAL_N,
+    float    P_DROPOUT,
+    uint64_t DROPOUT_SEED,
+    uint64_t DROPOUT_OFFSET,
+    int      STRIDE_GMEM_MASK
 ) {
     if (VALID_Q == 0 || VALID_KV == 0) return;
     constexpr int THREADS_PER_ROW = Config::DO::THREADS_PER_ROW;
@@ -38,6 +46,9 @@ __device__ __forceinline__ void WMMA_GEMM_SOFTMAX(
     const int thread = THREAD_ID % THREADS_PER_ROW;
     const int cols   = VALID_KV >> 2;
     const int tail   = (VALID_KV >> 2) << 2;
+
+    const float rp_dropout  = IS_DROPOUT ? (1.0f / (1.0f - P_DROPOUT)) : 1.0f;
+    const uint32_t drop_thr = IS_DROPOUT ? static_cast<uint32_t>((1.0f - P_DROPOUT) * 4294967295.0f) : 0;
 
     float thread_max = NEG_INF, new_max  = NEG_INF;
     float thread_sum = 0.0f,    exp_diff = 1.0f;
@@ -81,6 +92,38 @@ __device__ __forceinline__ void WMMA_GEMM_SOFTMAX(
             float e3 = __expf(fmaxf(buffer.w - new_max, -80.0f));
 
             thread_sum += (e0 + e1) + (e2 + e3);
+
+            if constexpr (IS_DROPOUT) {
+                uint64_t  idx_base = static_cast<uint64_t>(GLOBAL_ROW_OFFSET + row) * GLOBAL_N + (GLOBAL_COL_OFFSET + idx * 4);
+                PhiloxState philox = init_philox(DROPOUT_SEED, DROPOUT_OFFSET + (idx_base >> 2));
+                uint4 rng = philox.next();
+
+                uint32_t r0 = ((idx_base + 0) & 3) == 0 ? rng.x : ((idx_base + 0) & 3) == 1 ? rng.y : ((idx_base + 0) & 3) == 2 ? rng.z : rng.w;
+                uint32_t r1 = ((idx_base + 1) & 3) == 0 ? rng.x : ((idx_base + 1) & 3) == 1 ? rng.y : ((idx_base + 1) & 3) == 2 ? rng.z : rng.w;
+                uint32_t r2 = ((idx_base + 2) & 3) == 0 ? rng.x : ((idx_base + 2) & 3) == 1 ? rng.y : ((idx_base + 2) & 3) == 2 ? rng.z : rng.w;
+                uint32_t r3 = ((idx_base + 3) & 3) == 0 ? rng.x : ((idx_base + 3) & 3) == 1 ? rng.y : ((idx_base + 3) & 3) == 2 ? rng.z : rng.w;
+
+                uint32_t k0 = (r0 <= drop_thr);
+                uint32_t k1 = (r1 <= drop_thr);
+                uint32_t k2 = (r2 <= drop_thr);
+                uint32_t k3 = (r3 <= drop_thr);
+
+                e0 = k0 ? (e0 * rp_dropout) : 0.0f;
+                e1 = k1 ? (e1 * rp_dropout) : 0.0f;
+                e2 = k2 ? (e2 * rp_dropout) : 0.0f;
+                e3 = k3 ? (e3 * rp_dropout) : 0.0f;
+
+                if (GMEM_MASK != nullptr) {
+                    ushort g0 = 0x3C00 | (k0 ? 0 : 0x8000);
+                    ushort g1 = 0x3C00 | (k1 ? 0 : 0x8000);
+                    ushort g2 = 0x3C00 | (k2 ? 0 : 0x8000);
+                    ushort g3 = 0x3C00 | (k3 ? 0 : 0x8000);
+                    uint64_t g_addr = __cvta_generic_to_global(GMEM_MASK + row * STRIDE_GMEM_MASK + idx * 4);
+                    asm volatile("st.global.v4.u16 [%0], {%1, %2, %3, %4};\n"
+                                 :: "l"(g_addr), "h"(g0), "h"(g1), "h"(g2), "h"(g3) : "memory");
+                }
+            }
+
             half_buffer[rb_idx++] = __float22half2_rn(make_float2(e0, e1));
             half_buffer[rb_idx++] = __float22half2_rn(make_float2(e2, e3));
         }
@@ -92,6 +135,23 @@ __device__ __forceinline__ void WMMA_GEMM_SOFTMAX(
                 float v  = ld_float(sS_base + idx * 4, row);
                 float e  = __expf(fmaxf(v - new_max, -80.0f));
                 thread_sum += e;
+
+                if constexpr (IS_DROPOUT) {
+                    uint64_t idx_base_tail = static_cast<uint64_t>(GLOBAL_ROW_OFFSET + row) * GLOBAL_N + (GLOBAL_COL_OFFSET + idx);
+                    PhiloxState philox = init_philox(DROPOUT_SEED, DROPOUT_OFFSET + (idx_base_tail >> 2));
+                    uint4 rng = philox.next();
+                    uint32_t r = (idx_base_tail & 3) == 0 ? rng.x : (idx_base_tail & 3) == 1 ? rng.y : (idx_base_tail & 3) == 2 ? rng.z : rng.w;
+
+                    uint32_t k = (r <= drop_thr);
+                    e = k ? (e * rp_dropout) : 0.0f;
+
+                    if (GMEM_MASK != nullptr) {
+                        ushort g = 0x3C00 | (k ? 0 : 0x8000);
+                        uint64_t g_addr = __cvta_generic_to_global(GMEM_MASK + row * STRIDE_GMEM_MASK + idx);
+                        asm volatile("st.global.u16 [%0], %1;\n" :: "l"(g_addr), "h"(g) : "memory");
+                    }
+                }
+
                 tail_buffer[tr_idx++] = __float2half_rn(e);
             }
         }
