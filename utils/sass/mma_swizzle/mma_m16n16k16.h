@@ -11,12 +11,13 @@
 // * 4. DATA PACKING:    f16x2 passed as uint32_t to prevent compiler repacking.
 // * 5. ALIGNMENT:       Base pointers require 16B alignment. ldm in elements.
 // * 6. THREAD MAPPING:  Hardware-fixed distribution. Do not shuffle fragments.
-// * 7. SWIZZLE POLICY:  ABSOLUTE XOR applied independently to each absolute address.
 // ======================================================================================
 #pragma once
+
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ != 700)
 #error "Volta WMMA: This header is for sm_70 ONLY! Compile with -arch=sm_70"
 #endif
+
 #include <cuda_fp16.h>
 #include <cstdint>
 
@@ -112,30 +113,30 @@ __device__ __forceinline__ void fill_fragment(fragment<accumulator, M, N, K, flo
 // Replication:     Bit 3 ignored L0-7 & L16-23 duplicate rows 0-7.
 //                  L8-15 & L24-31 duplicate rows 8-15. (Hardware 2x crossbar routing)
 // Memory access:   Contiguous row storage 2x ld.shared.v4.u32 (128-bit loads).
-// Swizzle:         ABSOLUTE XOR applied independently to each absolute address.
 // ======================================================================================
-__device__ __forceinline__ void load_matrix_sync(fragment<matrix_a, 16, 16, 16, half, row_major>& frag, const half* __restrict__ smem_ptr, unsigned ldm) {
+__device__ __forceinline__ void load_matrix_sync(
+    fragment<matrix_a, 16, 16, 16, half, row_major>& frag,
+    const half* __restrict__ smem_ptr, unsigned ldm) {
+
     unsigned smem_addr = __cvta_generic_to_shared(smem_ptr);
+
     asm volatile(
         "{\n\t"
-        ".reg .u32 lid, r_base, off0, off1, a0, a1, sw, t;\n\t"
+        ".reg .u32 lid, r_base, base, t;\n\t"
         "mov.u32 lid, %%laneid;\n\t"
+
         // row = (lid & 3) + ((lid >> 4) & 1) * 4 + ((lid >> 2) & 1) * 8
         "and.b32 r_base, lid, 3;\n\t"
         "shr.b32 t, lid, 4; and.b32 t, t, 1; mad.lo.u32 r_base, t, 4, r_base;\n\t"
         "shr.b32 t, lid, 2; and.b32 t, t, 1; mad.lo.u32 r_base, t, 8, r_base;\n\t"
-        // off0 = row * ldm * sizeof(half)
-        "mul.lo.u32 off0, r_base, %9;\n\t"
-        "shl.b32 off0, off0, 1;\n\t"
-        "add.u32 off1, off0, 16;\n\t"
-        // Absolute swizzle: Compute absolute addresses first
-        "add.u32 a0, off0, %8;\n\t"
-        "add.u32 a1, off1, %8;\n\t"
-        // Then apply XOR to absolute addresses
-        "shr.b32 sw, a0, 7; and.b32 sw, sw, 3; shl.b32 sw, sw, 4; xor.b32 a0, a0, sw;\n\t"
-        "shr.b32 sw, a1, 7; and.b32 sw, sw, 3; shl.b32 sw, sw, 4; xor.b32 a1, a1, sw;\n\t"
-        "ld.shared.v4.u32 {%0, %1, %2, %3}, [a0];\n\t"
-        "ld.shared.v4.u32 {%4, %5, %6, %7}, [a1];\n\t"
+
+        // base = smem_addr + row * ldm * sizeof(half)
+        "mul.lo.u32 base, r_base, %9;\n\t"
+        "shl.b32 base, base, 1;\n\t"
+        "add.u32 base, base, %8;\n\t"
+
+        "ld.shared.v4.u32 {%0, %1, %2, %3}, [base];\n\t"
+        "ld.shared.v4.u32 {%4, %5, %6, %7}, [base+16];\n\t"
         "}"
         : "=r"(frag.x[0]), "=r"(frag.x[1]), "=r"(frag.x[2]), "=r"(frag.x[3]),
           "=r"(frag.x[4]), "=r"(frag.x[5]), "=r"(frag.x[6]), "=r"(frag.x[7])
@@ -148,37 +149,39 @@ __device__ __forceinline__ void load_matrix_sync(fragment<matrix_a, 16, 16, 16, 
 // LOAD: matrix_a m16n16k16 (COL MAJOR)
 // ======================================================================================
 // Data per lane:   4 vertical chunks of 4 halves (16 halves total)
-// Lane mapping:    c_base = lid & 3 | r_base = ((lid >> 2) & 1) * 8 + ((lid >> 4) & 1) * 4
+// Lane mapping:    c_base = lid & 3 r_base = ((lid >> 2) & 1) * 8 + ((lid >> 4) & 1) * 4
 // Replication:     Bit 3 ignored L0==L8, L4==L12, etc. (2x crossbar replication)
 // Memory access:   Strided columns base + k*(4*ldm). Vectorized via ld.shared.v2.u32.
-// Swizzle:         ABSOLUTE XOR applied independently to each absolute address.
 // ======================================================================================
-__device__ __forceinline__ void load_matrix_sync(fragment<matrix_a, 16, 16, 16, half, col_major>& frag, const half* __restrict__ smem_ptr, unsigned ldm) {
+__device__ __forceinline__ void load_matrix_sync(
+    fragment<matrix_a, 16, 16, 16, half, col_major>& frag,
+    const half* __restrict__ smem_ptr, unsigned ldm) {
+
     unsigned smem_addr = __cvta_generic_to_shared(smem_ptr);
+
     asm volatile(
         "{\n\t"
-        ".reg .u32 lid, r_base, c_base, off0, stride, a0, a1, a2, a3, sw, t;\n\t"
+        ".reg .u32 lid, r_base, c_base, base, stride, a0, a1, a2, a3, t;\n\t"
         "mov.u32 lid, %%laneid;\n\t"
+
         // c_base = lid & 3
         "and.b32 c_base, lid, 3;\n\t"
         // r_base = ((lid >> 2) & 1) * 8 + ((lid >> 4) & 1) * 4
         "shr.b32 t, lid, 2; and.b32 t, t, 1; shl.b32 r_base, t, 3;\n\t"
         "shr.b32 t, lid, 4; and.b32 t, t, 1; mad.lo.u32 r_base, t, 4, r_base;\n\t"
-        // off0 = (r_base + c_base * ldm) * sizeof(half)
-        "mad.lo.u32 off0, c_base, %9, r_base;\n\t"
-        "shl.b32 off0, off0, 1;\n\t"
+
+        // base = smem_addr + (r_base + c_base * ldm) * sizeof(half)
+        "mad.lo.u32 base, c_base, %9, r_base;\n\t"
+        "shl.b32 base, base, 1;\n\t"
+        "add.u32 base, base, %8;\n\t"
+
         // stride = 4 columns * ldm * 2 bytes = 8 * ldm
         "shl.b32 stride, %9, 3;\n\t"
-        // Absolute swizzle: Compute absolute addresses first
-        "add.u32 a0, off0, %8;\n\t"
-        "add.u32 a1, a0, stride;\n\t"
+        "mov.u32 a0, base;\n\t"
+        "add.u32 a1, base, stride;\n\t"
         "add.u32 a2, a1, stride;\n\t"
         "add.u32 a3, a2, stride;\n\t"
-        // Then apply XOR independently to each absolute address
-        "shr.b32 sw, a0, 7; and.b32 sw, sw, 3; shl.b32 sw, sw, 4; xor.b32 a0, a0, sw;\n\t"
-        "shr.b32 sw, a1, 7; and.b32 sw, sw, 3; shl.b32 sw, sw, 4; xor.b32 a1, a1, sw;\n\t"
-        "shr.b32 sw, a2, 7; and.b32 sw, sw, 3; shl.b32 sw, sw, 4; xor.b32 a2, a2, sw;\n\t"
-        "shr.b32 sw, a3, 7; and.b32 sw, sw, 3; shl.b32 sw, sw, 4; xor.b32 a3, a3, sw;\n\t"
+
         "ld.shared.v2.u32 {%0, %1}, [a0];\n\t"
         "ld.shared.v2.u32 {%2, %3}, [a1];\n\t"
         "ld.shared.v2.u32 {%4, %5}, [a2];\n\t"
@@ -195,38 +198,40 @@ __device__ __forceinline__ void load_matrix_sync(fragment<matrix_a, 16, 16, 16, 
 // LOAD: matrix_b m16n16k16 (ROW MAJOR)
 // ======================================================================================
 // Data per lane:   4 contiguous chunks of 4 halves (16 halves total)
-// Lane mapping:    r_base = lid & 3 | c_base = ((lid >> 3) & 1) * 8 + ((lid >> 4) & 1) * 4
+// Lane mapping:    r_base = lid & 3 c_base = ((lid >> 3) & 1) * 8 + ((lid >> 4) & 1) * 4 (bits 3 & 4 swapped)
 // Replication:     Bit 2 ignored L0==L4, L8==L12, etc. (2x crossbar replication)
 // Memory access:   Strided rows base + k*(4*ldm). Vectorized via ld.shared.v2.u32.
-// Swizzle:         ABSOLUTE XOR applied independently to each absolute address.
 // ======================================================================================
-__device__ __forceinline__ void load_matrix_sync(fragment<matrix_b, 16, 16, 16, half, row_major>& frag, const half* __restrict__ smem_ptr, unsigned ldm) {
+__device__ __forceinline__ void load_matrix_sync(
+    fragment<matrix_b, 16, 16, 16, half, row_major>& frag,
+    const half* __restrict__ smem_ptr, unsigned ldm) {
+
     unsigned smem_addr = __cvta_generic_to_shared(smem_ptr);
+
     asm volatile(
         "{\n\t"
-        ".reg .u32 lid, r_base, c_base, off0, stride, a0, a1, a2, a3, sw, t1, t2;\n\t"
+        ".reg .u32 lid, r_base, c_base, base, stride, a0, a1, a2, a3, t1, t2;\n\t"
         "mov.u32 lid, %%laneid;\n\t"
+
         // r_base = lid & 3
         "and.b32 r_base, lid, 3;\n\t"
         // c_base = ((lid >> 3) & 1) * 8 + ((lid >> 4) & 1) * 4
         "shr.b32 t1, lid, 3; and.b32 t1, t1, 1; shl.b32 t1, t1, 3;\n\t"
         "shr.b32 t2, lid, 4; and.b32 t2, t2, 1; shl.b32 t2, t2, 2;\n\t"
         "add.u32 c_base, t1, t2;\n\t"
-        // off0 = (r_base * ldm + c_base) * sizeof(half)
-        "mad.lo.u32 off0, r_base, %9, c_base;\n\t"
-        "shl.b32 off0, off0, 1;\n\t"
+
+        // base = smem_addr + (r_base * ldm + c_base) * sizeof(half)
+        "mad.lo.u32 base, r_base, %9, c_base;\n\t"
+        "shl.b32 base, base, 1;\n\t"
+        "add.u32 base, base, %8;\n\t"
+
         // stride = 4 rows * ldm * 2 bytes = 8 * ldm
         "shl.b32 stride, %9, 3;\n\t"
-        // Absolute swizzle: Compute absolute addresses first
-        "add.u32 a0, off0, %8;\n\t"
-        "add.u32 a1, a0, stride;\n\t"
+        "mov.u32 a0, base;\n\t"
+        "add.u32 a1, base, stride;\n\t"
         "add.u32 a2, a1, stride;\n\t"
         "add.u32 a3, a2, stride;\n\t"
-        // Then apply XOR independently to each absolute address
-        "shr.b32 sw, a0, 7; and.b32 sw, sw, 3; shl.b32 sw, sw, 4; xor.b32 a0, a0, sw;\n\t"
-        "shr.b32 sw, a1, 7; and.b32 sw, sw, 3; shl.b32 sw, sw, 4; xor.b32 a1, a1, sw;\n\t"
-        "shr.b32 sw, a2, 7; and.b32 sw, sw, 3; shl.b32 sw, sw, 4; xor.b32 a2, a2, sw;\n\t"
-        "shr.b32 sw, a3, 7; and.b32 sw, sw, 3; shl.b32 sw, sw, 4; xor.b32 a3, a3, sw;\n\t"
+
         "ld.shared.v2.u32 {%0, %1}, [a0];\n\t"
         "ld.shared.v2.u32 {%2, %3}, [a1];\n\t"
         "ld.shared.v2.u32 {%4, %5}, [a2];\n\t"
@@ -243,39 +248,41 @@ __device__ __forceinline__ void load_matrix_sync(fragment<matrix_b, 16, 16, 16, 
 // LOAD: matrix_b m16n16k16 (COL MAJOR)
 // ======================================================================================
 // Data per lane:   1 complete column (16 contiguous halves = 8 uint32_t)
-// Lane mapping:    g = lid >> 2 | idx = ((g >> 2) & 1) | (g & 2) | c_base = (lid & 3) + (idx << 2)
+// Lane mapping:    g = lid >> 2 idx = ((g >> 2) & 1) | (g & 2) c_base = (lid & 3) + (idx << 2)
 // Replication:     L0-3 & L4-7 duplicate cols 0-3. Pattern repeats per column group.
+//                  (Hardware 2x crossbar replication via lane grouping)
 // Memory access:   Contiguous column storage 2x ld.shared.v4.u32 (128-bit loads).
-// Swizzle:         ABSOLUTE XOR applied independently to each absolute address.
 // ======================================================================================
-__device__ __forceinline__ void load_matrix_sync(fragment<matrix_b, 16, 16, 16, half, col_major>& frag, const half* __restrict__ smem_ptr, unsigned ldm) {
+__device__ __forceinline__ void load_matrix_sync(
+    fragment<matrix_b, 16, 16, 16, half, col_major>& frag,
+    const half* __restrict__ smem_ptr, unsigned ldm) {
+
     unsigned smem_addr = __cvta_generic_to_shared(smem_ptr);
+
     asm volatile(
         "{\n\t"
-        ".reg .u32 lid, g, idx, c_base, off0, off1, a0, a1, sw, t;\n\t"
+        ".reg .u32 lid, g, idx, c_base, base, t;\n\t"
         "mov.u32 lid, %%laneid;\n\t"
+
         // g = lid >> 2
         "shr.b32 g, lid, 2;\n\t"
         // idx = ((g >> 2) & 1) | (g & 2)
         "shr.b32 t, g, 2; and.b32 t, t, 1;\n\t"
         "and.b32 idx, g, 2;\n\t"
         "or.b32 idx, idx, t;\n\t"
+
         // col = (lid & 3) + (idx << 2)
         "and.b32 c_base, lid, 3;\n\t"
         "shl.b32 t, idx, 2;\n\t"
         "add.u32 c_base, c_base, t;\n\t"
-        // off0 = col * ldm * sizeof(half)
-        "mul.lo.u32 off0, c_base, %9;\n\t"
-        "shl.b32 off0, off0, 1;\n\t"
-        "add.u32 off1, off0, 16;\n\t"
-        // Absolute swizzle: Compute absolute addresses first
-        "add.u32 a0, off0, %8;\n\t"
-        "add.u32 a1, off1, %8;\n\t"
-        // Then apply XOR to absolute addresses
-        "shr.b32 sw, a0, 7; and.b32 sw, sw, 3; shl.b32 sw, sw, 4; xor.b32 a0, a0, sw;\n\t"
-        "shr.b32 sw, a1, 7; and.b32 sw, sw, 3; shl.b32 sw, sw, 4; xor.b32 a1, a1, sw;\n\t"
-        "ld.shared.v4.u32 {%0, %1, %2, %3}, [a0];\n\t"
-        "ld.shared.v4.u32 {%4, %5, %6, %7}, [a1];\n\t"
+
+        // base = smem_addr + col * ldm * sizeof(half)
+        "mul.lo.u32 base, c_base, %9;\n\t"
+        "shl.b32 base, base, 1;\n\t"
+        "add.u32 base, base, %8;\n\t"
+
+        "ld.shared.v4.u32 {%0, %1, %2, %3}, [base];\n\t"
+        "ld.shared.v4.u32 {%4, %5, %6, %7}, [base+16];\n\t"
         "}"
         : "=r"(frag.x[0]), "=r"(frag.x[1]), "=r"(frag.x[2]), "=r"(frag.x[3]),
           "=r"(frag.x[4]), "=r"(frag.x[5]), "=r"(frag.x[6]), "=r"(frag.x[7])
@@ -288,42 +295,44 @@ __device__ __forceinline__ void load_matrix_sync(fragment<matrix_b, 16, 16, 16, 
 // LOAD: accumulator m16n16k16 (ROW & COL MAJOR)
 // ======================================================================================
 // Data per lane:   8 floats total, distributed as 4 contiguous pairs.
-// Lane mapping:    r_base = ((lid>>2)&1)*8 + ((lid>>4)&1)*4 + (lid&1)
-//                  c_base = ((lid>>3)&1)*8 + ((lid>>1)&1)*2
+// Lane mapping:    r_base = ((lid>>2)&1)*8 + ((lid>>4)&1)*4 + (lid&1) c_base = ((lid>>3)&1)*8 + ((lid>>1)&1)*2
 // Replication:     Hardware 2x crossbar duplication via ignored lane bits.
 // Memory access:   ROW: Pairs row-contiguous. Stride=2*ldm*4B. Optimal: 4x v2.
 //                  COL: Pairs col-contiguous. Elements strided by ldm. Optimal: 8x scalar.
-// Swizzle:         ABSOLUTE XOR applied independently to each absolute address.
 // ======================================================================================
-__device__ __forceinline__ void load_matrix_sync(fragment<accumulator, 16, 16, 16, float>& frag, const float* __restrict__ smem_ptr, unsigned ldm, layout_t layout) {
+__device__ __forceinline__ void load_matrix_sync(
+    fragment<accumulator, 16, 16, 16, float>& frag,
+    const float* __restrict__ smem_ptr, unsigned ldm, layout_t layout) {
+
     unsigned smem_addr = __cvta_generic_to_shared(smem_ptr);
+
     if (layout == mem_row_major) {
         asm volatile(
             "{\n\t"
-            ".reg .u32 lid, r_base, c_base, off0, stride, a0, a1, a2, a3, sw, t;\n\t"
+            ".reg .u32 lid, r_base, c_base, base, stride, a0, a1, a2, a3, t;\n\t"
             "mov.u32 lid, %%laneid;\n\t"
+
             // r0 = ((lid>>2)&1)*8 + ((lid>>4)&1)*4 + (lid&1)
             "and.b32 r_base, lid, 1;\n\t"
             "shr.b32 t, lid, 2; and.b32 t, t, 1; shl.b32 t, t, 3; add.u32 r_base, r_base, t;\n\t"
             "shr.b32 t, lid, 4; and.b32 t, t, 1; shl.b32 t, t, 2; add.u32 r_base, r_base, t;\n\t"
+
             // c0 = ((lid>>3)&1)*8 + ((lid>>1)&1)*2
             "shr.b32 c_base, lid, 3; and.b32 c_base, c_base, 1; shl.b32 c_base, c_base, 3;\n\t"
             "shr.b32 t, lid, 1; and.b32 t, t, 1; shl.b32 t, t, 1; add.u32 c_base, c_base, t;\n\t"
-            // off0 = (r0 * ldm + c0) * sizeof(float)
-            "mad.lo.u32 off0, r_base, %9, c_base;\n\t"
-            "shl.b32 off0, off0, 2;\n\t"
+
+            // base = smem_addr + (r0 * ldm + c0) * sizeof(float)
+            "mad.lo.u32 base, r_base, %9, c_base;\n\t"
+            "shl.b32 base, base, 2;\n\t"
+            "add.u32 base, base, %8;\n\t"
+
             // stride = 2 rows * ldm * 4 bytes = ldm << 3
             "shl.b32 stride, %9, 3;\n\t"
-            // Absolute swizzle: Compute absolute addresses first
-            "add.u32 a0, off0, %8;\n\t"
-            "add.u32 a1, a0, stride;\n\t"
-            "add.u32 a2, a0, 16;\n\t"
+            "mov.u32 a0, base;\n\t"
+            "add.u32 a1, base, stride;\n\t"
+            "add.u32 a2, base, 16;\n\t"
             "add.u32 a3, a2, stride;\n\t"
-            // Then apply XOR independently
-            "shr.b32 sw, a0, 7; and.b32 sw, sw, 3; shl.b32 sw, sw, 4; xor.b32 a0, a0, sw;\n\t"
-            "shr.b32 sw, a1, 7; and.b32 sw, sw, 3; shl.b32 sw, sw, 4; xor.b32 a1, a1, sw;\n\t"
-            "shr.b32 sw, a2, 7; and.b32 sw, sw, 3; shl.b32 sw, sw, 4; xor.b32 a2, a2, sw;\n\t"
-            "shr.b32 sw, a3, 7; and.b32 sw, sw, 3; shl.b32 sw, sw, 4; xor.b32 a3, a3, sw;\n\t"
+
             "ld.shared.v2.f32 {%0, %1}, [a0];\n\t"
             "ld.shared.v2.f32 {%2, %3}, [a1];\n\t"
             "ld.shared.v2.f32 {%4, %5}, [a2];\n\t"
@@ -337,38 +346,36 @@ __device__ __forceinline__ void load_matrix_sync(fragment<accumulator, 16, 16, 1
     } else {
         asm volatile(
             "{\n\t"
-            ".reg .u32 lid, r_base, c_base, off0, sc, sc4, a0, a1, a2, a3, a4, a5, a6, a7, sw, t;\n\t"
+            ".reg .u32 lid, r_base, c_base, base, sc, sc4, a0, a1, a2, a3, a4, a5, a6, a7, t;\n\t"
             "mov.u32 lid, %%laneid;\n\t"
-            // r0 & c0 mapping
+
+            // r0 = ((lid>>2)&1)*8 + ((lid>>4)&1)*4 + (lid&1)
             "and.b32 r_base, lid, 1;\n\t"
             "shr.b32 t, lid, 2; and.b32 t, t, 1; shl.b32 t, t, 3; add.u32 r_base, r_base, t;\n\t"
             "shr.b32 t, lid, 4; and.b32 t, t, 1; shl.b32 t, t, 2; add.u32 r_base, r_base, t;\n\t"
+
+            // c0 = ((lid>>3)&1)*8 + ((lid>>1)&1)*2
             "shr.b32 c_base, lid, 3; and.b32 c_base, c_base, 1; shl.b32 c_base, c_base, 3;\n\t"
             "shr.b32 t, lid, 1; and.b32 t, t, 1; shl.b32 t, t, 1; add.u32 c_base, c_base, t;\n\t"
-            // off0 = (c0 * ldm + r0) * sizeof(float)
-            "mad.lo.u32 off0, c_base, %9, r_base;\n\t"
-            "shl.b32 off0, off0, 2;\n\t"
-            // strides
+
+            // base = smem_addr + (c0 * ldm + r0) * sizeof(float)
+            "mad.lo.u32 base, c_base, %9, r_base;\n\t"
+            "shl.b32 base, base, 2;\n\t"
+            "add.u32 base, base, %8;\n\t"
+
+            // strides: sc = ldm*4 (col step), sc4 = ldm*16 (col+4 step)
             "shl.b32 sc, %9, 2;\n\t"
             "shl.b32 sc4, %9, 4;\n\t"
-            // Absolute swizzle: Compute absolute all 8 addresses first
-            "add.u32 a0, off0, %8;\n\t"
-            "add.u32 a1, a0, sc;\n\t"
-            "add.u32 a2, a0, 8;\n\t"
+
+            "mov.u32 a0, base;\n\t"
+            "add.u32 a1, base, sc;\n\t"
+            "add.u32 a2, base, 8;\n\t"
             "add.u32 a3, a2, sc;\n\t"
-            "add.u32 a4, a0, sc4;\n\t"
+            "add.u32 a4, base, sc4;\n\t"
             "add.u32 a5, a4, sc;\n\t"
             "add.u32 a6, a4, 8;\n\t"
             "add.u32 a7, a6, sc;\n\t"
-            // Then apply XOR independently to each
-            "shr.b32 sw, a0, 7; and.b32 sw, sw, 3; shl.b32 sw, sw, 4; xor.b32 a0, a0, sw;\n\t"
-            "shr.b32 sw, a1, 7; and.b32 sw, sw, 3; shl.b32 sw, sw, 4; xor.b32 a1, a1, sw;\n\t"
-            "shr.b32 sw, a2, 7; and.b32 sw, sw, 3; shl.b32 sw, sw, 4; xor.b32 a2, a2, sw;\n\t"
-            "shr.b32 sw, a3, 7; and.b32 sw, sw, 3; shl.b32 sw, sw, 4; xor.b32 a3, a3, sw;\n\t"
-            "shr.b32 sw, a4, 7; and.b32 sw, sw, 3; shl.b32 sw, sw, 4; xor.b32 a4, a4, sw;\n\t"
-            "shr.b32 sw, a5, 7; and.b32 sw, sw, 3; shl.b32 sw, sw, 4; xor.b32 a5, a5, sw;\n\t"
-            "shr.b32 sw, a6, 7; and.b32 sw, sw, 3; shl.b32 sw, sw, 4; xor.b32 a6, a6, sw;\n\t"
-            "shr.b32 sw, a7, 7; and.b32 sw, sw, 3; shl.b32 sw, sw, 4; xor.b32 a7, a7, sw;\n\t"
+
             "ld.shared.f32 %0, [a0];\n\t"
             "ld.shared.f32 %1, [a1];\n\t"
             "ld.shared.f32 %2, [a2];\n\t"
@@ -390,37 +397,46 @@ __device__ __forceinline__ void load_matrix_sync(fragment<accumulator, 16, 16, 1
 // STORE: accumulator m16n16k16 (ROW & COL MAJOR)
 // ======================================================================================
 // Data per lane:   8 floats total, distributed as 4 contiguous pairs.
-// Lane mapping:    Same as accumulator load.
+// Lane mapping:    r_base = ((lid>>2)&1)*8 + ((lid>>4)&1)*4 + (lid&1) c_base = ((lid>>3)&1)*8 + ((lid>>1)&1)*2
 // Replication:     Hardware 2x crossbar duplication via ignored lane bits.
 // Memory access:   ROW: Pairs row-contiguous. Stride=2*ldm*4B. Optimal: 4x v2.
 //                  COL: Pairs col-contiguous. Elements strided by ldm. Optimal: 8x scalar.
-// Swizzle:         ABSOLUTE XOR applied independently to each absolute address.
 // ======================================================================================
-__device__ __forceinline__ void store_matrix_sync(float* __restrict__ smem_ptr, const fragment<accumulator, 16, 16, 16, float>& frag, unsigned ldm, layout_t layout) {
+__device__ __forceinline__ void store_matrix_sync(
+    float* __restrict__ smem_ptr,
+    const fragment<accumulator, 16, 16, 16, float>& frag,
+    unsigned ldm, layout_t layout) {
+
     unsigned smem_addr = __cvta_generic_to_shared(smem_ptr);
+
     if (layout == mem_row_major) {
         asm volatile(
             "{\n\t"
-            ".reg .u32 lid, r_base, c_base, off0, stride, a0, a1, a2, a3, sw, t;\n\t"
+            ".reg .u32 lid, r_base, c_base, base, stride, a0, a1, a2, a3, t;\n\t"
             "mov.u32 lid, %%laneid;\n\t"
+
+            // r0 = ((lid>>2)&1)*8 + ((lid>>4)&1)*4 + (lid&1)
             "and.b32 r_base, lid, 1;\n\t"
             "shr.b32 t, lid, 2; and.b32 t, t, 1; shl.b32 t, t, 3; add.u32 r_base, r_base, t;\n\t"
             "shr.b32 t, lid, 4; and.b32 t, t, 1; shl.b32 t, t, 2; add.u32 r_base, r_base, t;\n\t"
+
+            // c0 = ((lid>>3)&1)*8 + ((lid>>1)&1)*2
             "shr.b32 c_base, lid, 3; and.b32 c_base, c_base, 1; shl.b32 c_base, c_base, 3;\n\t"
             "shr.b32 t, lid, 1; and.b32 t, t, 1; shl.b32 t, t, 1; add.u32 c_base, c_base, t;\n\t"
-            "mad.lo.u32 off0, r_base, %9, c_base;\n\t"
-            "shl.b32 off0, off0, 2;\n\t"
+
+            // base = smem_addr + (r0 * ldm + c0) * sizeof(float)
+            "mad.lo.u32 base, r_base, %9, c_base;\n\t"
+            "shl.b32 base, base, 2;\n\t"
+            "add.u32 base, base, %8;\n\t"
+
+            // stride = 2 rows * ldm * 4 bytes = ldm << 3
             "shl.b32 stride, %9, 3;\n\t"
-            // Absolute swizzle: Compute absolute addresses first
-            "add.u32 a0, off0, %8;\n\t"
-            "add.u32 a1, a0, stride;\n\t"
-            "add.u32 a2, a0, 16;\n\t"
+
+            "mov.u32 a0, base;\n\t"
+            "add.u32 a1, base, stride;\n\t"
+            "add.u32 a2, base, 16;\n\t"
             "add.u32 a3, a2, stride;\n\t"
-            // Then apply XOR independently
-            "shr.b32 sw, a0, 7; and.b32 sw, sw, 3; shl.b32 sw, sw, 4; xor.b32 a0, a0, sw;\n\t"
-            "shr.b32 sw, a1, 7; and.b32 sw, sw, 3; shl.b32 sw, sw, 4; xor.b32 a1, a1, sw;\n\t"
-            "shr.b32 sw, a2, 7; and.b32 sw, sw, 3; shl.b32 sw, sw, 4; xor.b32 a2, a2, sw;\n\t"
-            "shr.b32 sw, a3, 7; and.b32 sw, sw, 3; shl.b32 sw, sw, 4; xor.b32 a3, a3, sw;\n\t"
+
             "st.shared.v2.f32 [a0], {%0, %1};\n\t"
             "st.shared.v2.f32 [a1], {%2, %3};\n\t"
             "st.shared.v2.f32 [a2], {%4, %5};\n\t"
@@ -435,35 +451,36 @@ __device__ __forceinline__ void store_matrix_sync(float* __restrict__ smem_ptr, 
     } else {
         asm volatile(
             "{\n\t"
-            ".reg .u32 lid, r_base, c_base, off0, sc, sc4, a0, a1, a2, a3, a4, a5, a6, a7, sw, t;\n\t"
+            ".reg .u32 lid, r_base, c_base, base, sc, sc4, a0, a1, a2, a3, a4, a5, a6, a7, t;\n\t"
             "mov.u32 lid, %%laneid;\n\t"
+
+            // r0 = ((lid>>2)&1)*8 + ((lid>>4)&1)*4 + (lid&1)
             "and.b32 r_base, lid, 1;\n\t"
             "shr.b32 t, lid, 2; and.b32 t, t, 1; shl.b32 t, t, 3; add.u32 r_base, r_base, t;\n\t"
             "shr.b32 t, lid, 4; and.b32 t, t, 1; shl.b32 t, t, 2; add.u32 r_base, r_base, t;\n\t"
+
+            // c0 = ((lid>>3)&1)*8 + ((lid>>1)&1)*2
             "shr.b32 c_base, lid, 3; and.b32 c_base, c_base, 1; shl.b32 c_base, c_base, 3;\n\t"
             "shr.b32 t, lid, 1; and.b32 t, t, 1; shl.b32 t, t, 1; add.u32 c_base, c_base, t;\n\t"
-            "mad.lo.u32 off0, c_base, %9, r_base;\n\t"
-            "shl.b32 off0, off0, 2;\n\t"
+
+            // base = smem_addr + (c0 * ldm + r0) * sizeof(float)
+            "mad.lo.u32 base, c_base, %9, r_base;\n\t"
+            "shl.b32 base, base, 2;\n\t"
+            "add.u32 base, base, %8;\n\t"
+
+             // strides: sc = ldm*4 (col step), sc4 = ldm*16 (col+4 step)
             "shl.b32 sc, %9, 2;\n\t"
             "shl.b32 sc4, %9, 4;\n\t"
-            // Absolute swizzle: Compute absolute all 8 addresses first
-            "add.u32 a0, off0, %8;\n\t"
-            "add.u32 a1, a0, sc;\n\t"
-            "add.u32 a2, a0, 8;\n\t"
+
+            "mov.u32 a0, base;\n\t"
+            "add.u32 a1, base, sc;\n\t"
+            "add.u32 a2, base, 8;\n\t"
             "add.u32 a3, a2, sc;\n\t"
-            "add.u32 a4, a0, sc4;\n\t"
+            "add.u32 a4, base, sc4;\n\t"
             "add.u32 a5, a4, sc;\n\t"
             "add.u32 a6, a4, 8;\n\t"
             "add.u32 a7, a6, sc;\n\t"
-            // Then apply XOR independently to each
-            "shr.b32 sw, a0, 7; and.b32 sw, sw, 3; shl.b32 sw, sw, 4; xor.b32 a0, a0, sw;\n\t"
-            "shr.b32 sw, a1, 7; and.b32 sw, sw, 3; shl.b32 sw, sw, 4; xor.b32 a1, a1, sw;\n\t"
-            "shr.b32 sw, a2, 7; and.b32 sw, sw, 3; shl.b32 sw, sw, 4; xor.b32 a2, a2, sw;\n\t"
-            "shr.b32 sw, a3, 7; and.b32 sw, sw, 3; shl.b32 sw, sw, 4; xor.b32 a3, a3, sw;\n\t"
-            "shr.b32 sw, a4, 7; and.b32 sw, sw, 3; shl.b32 sw, sw, 4; xor.b32 a4, a4, sw;\n\t"
-            "shr.b32 sw, a5, 7; and.b32 sw, sw, 3; shl.b32 sw, sw, 4; xor.b32 a5, a5, sw;\n\t"
-            "shr.b32 sw, a6, 7; and.b32 sw, sw, 3; shl.b32 sw, sw, 4; xor.b32 a6, a6, sw;\n\t"
-            "shr.b32 sw, a7, 7; and.b32 sw, sw, 3; shl.b32 sw, sw, 4; xor.b32 a7, a7, sw;\n\t"
+
             "st.shared.f32 [a0], %0;\n\t"
             "st.shared.f32 [a1], %1;\n\t"
             "st.shared.f32 [a2], %2;\n\t"
@@ -523,4 +540,4 @@ WMMA_MMA_F32(16, 16, 16, col, row)
 #undef WMMA_MMA_F32
 
 } // namespace wmma
-} // namespace volta_sw
+} // namespace volta

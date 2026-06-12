@@ -18,7 +18,6 @@
 #include "gemm_smem.h"
 #include "mat_mul.h"
 #include "softmax.h"
-#include "dropout.h"
 
 // ======================================================================================
 // FORWARD VARLEN KERNEL
@@ -224,30 +223,17 @@ flash_attention_forward_varlen_kernel(
         __syncthreads();
 
         // ======================================================================================
-        // Compute:  Online softmax + O rescaling (block_q > 0)
+        // Compute:  Online softmax + O rescaling + Dropout
         // Layout:   sS[valid_q_rows, N_STRIDE] -> sP[valid_q_rows, N_STRIDE]
         //           sO[valid_q_rows, D_STRIDE] *= exp(old_max - new_max)
-        // Template: SCORE_STRIDE=N_STRIDE, HEAD_STRIDE=D_STRIDE, TILES=true (varlen tail handling)
+        // Template: SCORE_STRIDE=N_STRIDE, HEAD_STRIDE=D_STRIDE, IS_DROPOUT, TILES=true
         // ======================================================================================
-        WMMA_GEMM_SOFTMAX<Config, BLOCK_M, BLOCK_N, N_STRIDE, D_STRIDE, true>(
+        WMMA_GEMM_SOFTMAX<Config, BLOCK_M, BLOCK_N, N_STRIDE, D_STRIDE, IS_DROPOUT, true>(
           sS, sP, sO,
-          sRowMax, sRowSum,
-          block.valid_q_rows, valid_kv_rows, tid, block_q);
-        __syncthreads();
-
-        // ======================================================================================
-        // Compute:  Dropout mask application
-        // Layout:   sP[row: valid_q_rows, N_STRIDE] masked, dmask stored if requested
-        // Varlen:   GLOBAL_N=block.seqlen_k (actual KV length) for correct RNG stride
-        // Template: IS_DROPOUT guards compile-time; runtime p_dropout > 0 enables execution
-        // ======================================================================================
-        if constexpr (IS_DROPOUT) {
-            WMMA_GEMM_DROPOUT<Config, BLOCK_M, BLOCK_N, N_STRIDE, IS_DROPOUT>(
-              sP, dmask_ptr ? dmask_ptr + start_kv : nullptr,
-              block.valid_q_rows, valid_kv_rows,
-              block.q_base + block.start_q, start_kv, max_seqlen_k, H_Q * max_seqlen_k,
-              p_dropout, dropout_seed, dropout_offset, tid);
-        }
+          sRowMax, sRowSum, dmask_ptr ? dmask_ptr + start_kv : nullptr,
+          block.valid_q_rows, valid_kv_rows, tid, block_q,
+          block.q_base + block.start_q, start_kv, max_seqlen_k,
+          p_dropout, dropout_seed, dropout_offset, H_Q * max_seqlen_k);
         __syncthreads();
 
         // ======================================================================================

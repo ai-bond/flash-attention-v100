@@ -241,15 +241,16 @@ flash_attention_kvcache_kernel(
         __syncthreads();
 
         // ======================================================================================
-        // Compute:  Online softmax + O rescaling (block_q > 0)
+        // Compute:  Online softmax + O rescaling
         // Layout:   sS[valid_q_rows, N_STRIDE] -> sP[valid_q_rows, N_STRIDE]
         //           sO[valid_q_rows, D_STRIDE] *= exp(old_max - new_max)
         // Template: SCORE_STRIDE=N_STRIDE, HEAD_STRIDE=D_STRIDE, TILES=true (varlen tail handling)
         // ======================================================================================
-        WMMA_GEMM_SOFTMAX<Config, BLOCK_M, BLOCK_N, N_STRIDE, D_STRIDE, true>(
+        WMMA_GEMM_SOFTMAX<Config, BLOCK_M, BLOCK_N, N_STRIDE, D_STRIDE, false, true>(
           sS, sP, sO,
-          sRowMax, sRowSum,
-          block.valid_q_rows, valid_kv_rows, tid, block_q);
+          sRowMax, sRowSum, nullptr,
+          block.valid_q_rows, valid_kv_rows, tid, block_q,
+          0, 0, 0, 0, 0, 0, 0);
         __syncthreads();
 
         // ======================================================================================

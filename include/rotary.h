@@ -6,6 +6,7 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include "swizzle.h"
 
 // ======================================================================================
 // KV-CACHE UPDATER: Global(K_NEW/V_NEW) -> Registers -> (RoPE on K) -> Global(K_CACHE/V_CACHE)
@@ -187,7 +188,7 @@ __device__ __forceinline__ void WMMA_GEMM_TILE_ROTARY(
         const int dst_off = row * dst_stride_uint4 + col;
 
         uint64_t src_addr = src_base + (static_cast<uint64_t>(src_off) << 4);
-        uint32_t dst_addr = dst_base + (static_cast<uint32_t>(dst_off) << 4);
+        uint32_t dst_addr = swizzle(dst_base + (static_cast<uint32_t>(dst_off) << 4), row);
 
         uint32_t r[4];
         asm volatile("ld.global.v4.u32 {%0, %1, %2, %3}, [%4];"
@@ -220,7 +221,7 @@ __device__ __forceinline__ void WMMA_GEMM_TILE_ROTARY(
             } else {
                 if (d_base < half_rot) {
                     uint64_t src_pair = src_addr + half_rot * 2;
-                    uint32_t dst_pair = dst_addr + half_rot * 2;
+                    uint32_t dst_pair = swizzle(dst_base + (static_cast<uint32_t>(dst_off) << 4) + half_rot * 2, row);
 
                     uint32_t r_pair[4];
                     asm volatile("ld.global.v4.u32 {%0, %1, %2, %3}, [%4];"

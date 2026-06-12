@@ -576,7 +576,7 @@ void run_test(int B, int H, int M, int N, float softmax_scale) {
 int main() {
 
     constexpr int   TEST_D   = 128;
-    constexpr int   TEST_PAD = 16;      // 0, 8, 16 to observe bank conflict scaling
+    constexpr int   TEST_PAD = 16;
     constexpr bool  TEST_CAUSAL = true;
     constexpr float SCALE = 0.125f;
 

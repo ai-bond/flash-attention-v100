@@ -6,6 +6,7 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include "swizzle.h"
 
 // ======================================================================================
 // COMPUTE_ROW_DOT
@@ -50,7 +51,7 @@ __device__ __forceinline__ void WMMA_GEMM_DOT_PRODUCT(
 
             uint32_t o_pack[4], d_pack[4];
             const uint64_t gmem_addr = gmem_base + static_cast<uint64_t>(col) * 2;
-            const uint32_t smem_addr = smem_base + static_cast<uint32_t>(col) * 2;
+            const uint32_t smem_addr = swizzle(smem_base + static_cast<uint32_t>(col) * 2, row);
 
             asm volatile(
                 "{\n\t"
