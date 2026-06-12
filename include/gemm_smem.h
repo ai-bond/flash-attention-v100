@@ -6,6 +6,7 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include "swizzle.h"
 
 // ======================================================================================
 // INIT SMEM LAYOUT
@@ -76,12 +77,12 @@ __device__ __forceinline__ void WMMA_GEMM_LOAD_TILE(
         const int dst_offset = row * dst_stride_uint4 + col;
 
         uint64_t src_addr0 = src_base0 + (static_cast<uint64_t>(src_offset) << 4);
-        uint32_t dst_addr0 = dst_base0 + (static_cast<uint32_t>(dst_offset) << 4);
+        uint32_t dst_addr0 = swizzle(dst_base0 + (static_cast<uint32_t>(dst_offset) << 4), row);
 
         uint32_t r0, r1, r2, r3;
         if constexpr (DUAL_LOAD) {
             uint64_t src_addr1 = src_base1 + (static_cast<uint64_t>(src_offset) << 4);
-            uint32_t dst_addr1 = dst_base1 + (static_cast<uint32_t>(dst_offset) << 4);
+            uint32_t dst_addr1 = swizzle(dst_base1 + (static_cast<uint32_t>(dst_offset) << 4), row);
 
             asm volatile(
                 "{\n\t"
@@ -148,9 +149,10 @@ __device__ __forceinline__ void WMMA_GEMM_EPILOGUE(
         const int pred = in_bounds ? 1 : 0;
 
         if (in_bounds) {
-            const float4 smem_01 = *reinterpret_cast<const float4*>(SMEM0 + row * SMEM_STRIDE + col);
-            const __half2 h0 = __float22half2_rn(make_float2(smem_01.x * norm, smem_01.y * norm));
-            const __half2 h1 = __float22half2_rn(make_float2(smem_01.z * norm, smem_01.w * norm));
+            uint32_t smem00_addr = __cvta_generic_to_shared(SMEM0 + row * SMEM_STRIDE) + col * 4;
+            float4   smem00      = ld_float4(smem00_addr, row);
+            const __half2 h0 = __float22half2_rn(make_float2(smem00.x * norm, smem00.y * norm));
+            const __half2 h1 = __float22half2_rn(make_float2(smem00.z * norm, smem00.w * norm));
 
             ushort v0 = __half_as_ushort(h0.x); ushort v1 = __half_as_ushort(h0.y);
             ushort v2 = __half_as_ushort(h1.x); ushort v3 = __half_as_ushort(h1.y);
@@ -173,9 +175,10 @@ __device__ __forceinline__ void WMMA_GEMM_EPILOGUE(
             );
 
             if constexpr (DUAL_STORE) {
-                const float4 smem_02 = *reinterpret_cast<const float4*>(SMEM1 + row * SMEM_STRIDE + col);
-                const __half2 h2 = __float22half2_rn(make_float2(smem_02.x * norm, smem_02.y * norm));
-                const __half2 h3 = __float22half2_rn(make_float2(smem_02.z * norm, smem_02.w * norm));
+                uint32_t smem01_addr = __cvta_generic_to_shared(SMEM1 + row * SMEM_STRIDE) + col * 4;
+                float4   smem01      = ld_float4(smem01_addr, row);
+                const __half2 h2 = __float22half2_rn(make_float2(smem01.x * norm, smem01.y * norm));
+                const __half2 h3 = __float22half2_rn(make_float2(smem01.z * norm, smem01.w * norm));
 
                 ushort v4 = __half_as_ushort(h2.x); ushort v5 = __half_as_ushort(h2.y);
                 ushort v6 = __half_as_ushort(h3.x); ushort v7 = __half_as_ushort(h3.y);

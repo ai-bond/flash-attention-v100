@@ -6,52 +6,57 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include "swizzle.h"
 #include "philox.h"
 
 // ======================================================================================
 // WMMA_GEMM_SOFTMAX: Online softmax with O-scaling
+// FA2 MATH: m_new   = max(m_old, rowmax(S))
+//           P       = exp(S - m_new)    [clamped > -80]
+//           l_new   = exp(m_old - m_new) * l_old + rowsum(P)
+//           O_new   = exp(m_old - m_new) * O_old
+// SWIZZLE:  S read via ld_float4/ld_float(addr, row). P stored via st_half2/st_half(addr, row).
+//           O rescaled via ld_float4/st_float4(addr, row) when BLOCK_ID > 0.
 // ======================================================================================
-template<typename Config, int BLOCK_M, int BLOCK_N, int SCORE_STRIDE, int HEAD_STRIDE, bool TAIL = false>
+template <typename Config, int BLOCK_M, int BLOCK_N, int SCORE_STRIDE, int HEAD_STRIDE, bool TAIL = false>
 __device__ __forceinline__ void WMMA_GEMM_SOFTMAX(
-    float*  __restrict__ SMEM_S,
-    __half* __restrict__ SMEM_P,
-    float*  __restrict__ SMEM_O,
-    float*  __restrict__ SMEM_MAX,
-    float*  __restrict__ SMEM_SUM,
+    float*   __restrict__ SMEM_S,
+    __half*  __restrict__ SMEM_P,
+    float*   __restrict__ SMEM_O,
+    float*   __restrict__ SMEM_MAX,
+    float*   __restrict__ SMEM_SUM,
     int VALID_Q,
     int VALID_KV,
     int THREAD_ID,
     int BLOCK_ID
 ) {
     if (VALID_Q == 0 || VALID_KV == 0) return;
-
-    constexpr int  THREADS_PER_ROW = Config::DO::THREADS_PER_ROW;
+    constexpr int THREADS_PER_ROW = Config::DO::THREADS_PER_ROW;
+    constexpr int BUFFER = (BLOCK_N / 4 + THREADS_PER_ROW - 1) / THREADS_PER_ROW;
 
     const int row    = THREAD_ID / THREADS_PER_ROW;
     const int thread = THREAD_ID % THREADS_PER_ROW;
-    const int cols   =  VALID_KV >> 2;
+    const int cols   = VALID_KV >> 2;
     const int tail   = (VALID_KV >> 2) << 2;
 
     float thread_max = NEG_INF, new_max  = NEG_INF;
     float thread_sum = 0.0f,    exp_diff = 1.0f;
 
-    __half2 half_buffer[8];
-    __half  tail_buffer[4];
+    __half2 half_buffer[BUFFER * 2];
+    __half  tail_buffer[3];
 
-      float* sS_float  = SMEM_S + row * SCORE_STRIDE;
-     float4* sS_float4 = reinterpret_cast<float4*>(sS_float);
-     __half* sP_half   = SMEM_P + row * SCORE_STRIDE;
-    __half2* sP_half2  = reinterpret_cast<__half2*>(sP_half);
+    uint32_t sS_base = __cvta_generic_to_shared(SMEM_S + row * SCORE_STRIDE);
+    uint32_t sP_base = __cvta_generic_to_shared(SMEM_P + row * SCORE_STRIDE);
 
     if (row < VALID_Q) {
         #pragma unroll 4
         for (int idx = thread; idx < cols; idx += THREADS_PER_ROW) {
-            float4 buffer = sS_float4[idx];
+            float4 buffer = ld_float4(sS_base + idx * 16, row);
             thread_max = fmaxf(thread_max, fmaxf(fmaxf(buffer.x, buffer.y), fmaxf(buffer.z, buffer.w)));
         }
         if constexpr (TAIL) {
             for (int idx = tail + thread; idx < VALID_KV; idx += THREADS_PER_ROW) {
-                thread_max = fmaxf(thread_max, sS_float[idx]);
+                thread_max = fmaxf(thread_max, ld_float(sS_base + idx * 4, row));
             }
         }
     }
@@ -69,7 +74,7 @@ __device__ __forceinline__ void WMMA_GEMM_SOFTMAX(
         int rb_idx = 0;
         #pragma unroll 4
         for (int idx = thread; idx < cols; idx += THREADS_PER_ROW) {
-            float4 buffer = sS_float4[idx];
+            float4 buffer = ld_float4(sS_base + idx * 16, row);
             float e0 = __expf(fmaxf(buffer.x - new_max, -80.0f));
             float e1 = __expf(fmaxf(buffer.y - new_max, -80.0f));
             float e2 = __expf(fmaxf(buffer.z - new_max, -80.0f));
@@ -84,7 +89,7 @@ __device__ __forceinline__ void WMMA_GEMM_SOFTMAX(
             int tr_idx = 0;
             #pragma unroll
             for (int idx = tail + thread; idx < VALID_KV; idx += THREADS_PER_ROW) {
-                float v  = sS_float[idx];
+                float v  = ld_float(sS_base + idx * 4, row);
                 float e  = __expf(fmaxf(v - new_max, -80.0f));
                 thread_sum += e;
                 tail_buffer[tr_idx++] = __float2half_rn(e);
@@ -95,20 +100,20 @@ __device__ __forceinline__ void WMMA_GEMM_SOFTMAX(
         #pragma unroll 4
         for (int idx = thread; idx < cols; idx += THREADS_PER_ROW) {
             int base = idx * 2;
-            sP_half2[base]     = half_buffer[wb_idx++];
-            sP_half2[base + 1] = half_buffer[wb_idx++];
+            st_half2(sP_base + base  * 4,      half_buffer[wb_idx++], row);
+            st_half2(sP_base + (base + 1) * 4, half_buffer[wb_idx++], row);
         }
 
         if constexpr (TAIL) {
             int tw_idx = 0;
             #pragma unroll
             for (int idx = tail + thread; idx < VALID_KV; idx += THREADS_PER_ROW) {
-                sP_half[idx] = tail_buffer[tw_idx++];
+                st_half(sP_base + idx * 2, tail_buffer[tw_idx++], row);
             }
 
             #pragma unroll
             for (int idx = VALID_KV + thread; idx < BLOCK_N; idx += THREADS_PER_ROW) {
-                sP_half[idx] = __float2half(0.0f);
+                st_half(sP_base + idx * 2, __float2half(0.0f), row);
             }
         }
     }
@@ -124,13 +129,15 @@ __device__ __forceinline__ void WMMA_GEMM_SOFTMAX(
     }
 
     if (row < VALID_Q && BLOCK_ID > 0) {
-        float4* sO_float4 = reinterpret_cast<float4*>(SMEM_O + row * HEAD_STRIDE);
+        uint32_t sO_base = __cvta_generic_to_shared(SMEM_O + row * HEAD_STRIDE);
         #pragma unroll 4
         for (int idx = thread; idx < ((HEAD_STRIDE + 3) >> 2); idx += THREADS_PER_ROW) {
-            float4 buffer = sO_float4[idx];
-            buffer.x *= exp_diff; buffer.y *= exp_diff;
-            buffer.z *= exp_diff; buffer.w *= exp_diff;
-            sO_float4[idx] = buffer;
+            float4 buffer = ld_float4(sO_base + idx * 16, row);
+            buffer.x *= exp_diff;
+            buffer.y *= exp_diff;
+            buffer.z *= exp_diff;
+            buffer.w *= exp_diff;
+            st_float4(sO_base + idx * 16, buffer, row);
         }
     }
 }
@@ -141,6 +148,9 @@ __device__ __forceinline__ void WMMA_GEMM_SOFTMAX(
 //           P_drop = P_orig * mask / (1-p)
 //           dS     = (P_drop * dOV - P_orig * D) * softmax_scale
 //           if softcap: dS *= (1 - (S/c)^2)  [S is already softcapped]
+// SWIZZLE:  S/dOV read via ld_float(addr, row). P/dS stored via st_half/st_half2(row).
+//           Phase 1 (dQ):  load_matrix_sync(row_major) -> swizzle by r_base=row
+//           Phase 2 (dKV): load_matrix_sync(col_major) -> swizzle by c_base=row
 // ======================================================================================
 template<typename Config, GemmType TYPE, bool IS_SOFTCAP, bool IS_DROPOUT, int SMEM_LDS_STRIDE, int SMEM_LDO_STRIDE, int TILE_X, int TILE_Y>
 __device__ __forceinline__ void WMMA_GEMM_SOFTMAX_GRADIENT(
@@ -173,7 +183,9 @@ __device__ __forceinline__ void WMMA_GEMM_SOFTMAX_GRADIENT(
 
     __half2  prev_ds = __float22half2_rn(make_float2(0.0f, 0.0f));
     int      prev_ldo0 = -1;
-    uint32_t prev_aux = 0;
+    uint32_t prev_aux  =  0;
+    int      prev_row0 = -1;
+    int      prev_row1 = -1;
 
     #pragma unroll 1
     for (int i = THREAD_ID; i < TOTAL_PAIRS; i += THREADS_PER_BLOCK) {
@@ -196,13 +208,20 @@ __device__ __forceinline__ void WMMA_GEMM_SOFTMAX_GRADIENT(
         const int lds0 = row0 * SMEM_LDS_STRIDE + col0;
         const int lds1 = has_pair ? (row1 * SMEM_LDS_STRIDE + col1) : 0;
 
-        float s0 = in0 ? SMEM_S[lds0] : NEG_INF;
-        float s1 = in1 ? SMEM_S[lds1] : NEG_INF;
-        float dov0 = (s0 != NEG_INF) ? SMEM_DOV[lds0] : 0.0f;
-        float dov1 = (s1 != NEG_INF) ? SMEM_DOV[lds1] : 0.0f;
+        uint32_t addr_s0   = __cvta_generic_to_shared(SMEM_S + lds0);
+        uint32_t addr_s1   = __cvta_generic_to_shared(SMEM_S + lds1);
+        uint32_t addr_dov0 = __cvta_generic_to_shared(SMEM_DOV + lds0);
+        uint32_t addr_dov1 = __cvta_generic_to_shared(SMEM_DOV + lds1);
+
+        float s0 = in0 ? ld_float(addr_s0, row0) : NEG_INF;
+        float s1 = in1 ? ld_float(addr_s1, row1) : NEG_INF;
+
+        float dov0 = (s0 != NEG_INF) ? ld_float(addr_dov0, row0) : 0.0f;
+        float dov1 = (s1 != NEG_INF) ? ld_float(addr_dov1, row1) : 0.0f;
 
         float sh0 = s0 - lse0;
         float sh1 = s1 - lse1;
+
         float p0_orig = (s0 == NEG_INF || sh0 < -80.0f) ? 0.0f : __expf(sh0);
         float p1_orig = (s1 == NEG_INF || sh1 < -80.0f) ? 0.0f : __expf(sh1);
 
@@ -239,68 +258,88 @@ __device__ __forceinline__ void WMMA_GEMM_SOFTMAX_GRADIENT(
 
         if constexpr (!PHASE) {
             if (prev_ldo0 >= 0) {
-                const int p_ldo1 = prev_aux & 0xFFFF;
-                const bool p_has = (prev_aux >> 16) & 1;
-                const bool vec = p_has && ((prev_ldo0 & 1) == 0);
+                const int  p_ldo1 = prev_aux & 0xFFFF;
+                const bool p_has  = (prev_aux >> 16) & 1;
+                const bool vec    = p_has && ((prev_ldo0 & 1) == 0);
+
+                uint32_t addr_ds0 = __cvta_generic_to_shared(SMEM_DS + prev_ldo0);
+                uint32_t addr_ds1 = p_has ? __cvta_generic_to_shared(SMEM_DS + p_ldo1) : 0;
 
                 if (vec) {
-                    uintptr_t addr = reinterpret_cast<uintptr_t>(SMEM_DS + prev_ldo0);
-                    if ((addr & 0x3) == 0) {
-                        *reinterpret_cast<__half2*>(SMEM_DS + prev_ldo0) = prev_ds;
+                    if ((addr_ds0 & 0x3) == 0) {
+                        st_half2(addr_ds0, prev_ds, prev_row0);
                     } else {
-                        SMEM_DS[prev_ldo0] = prev_ds.x;
-                        if (p_has) SMEM_DS[p_ldo1] = prev_ds.y;
+                        st_half(addr_ds0, prev_ds.x, prev_row0);
+                        if (p_has) {
+                            st_half(addr_ds1, prev_ds.y, prev_row1);
+                        }
                     }
                 } else {
-                    SMEM_DS[prev_ldo0] = prev_ds.x;
-                    if (p_has) SMEM_DS[p_ldo1] = prev_ds.y;
+                    st_half(addr_ds0, prev_ds.x, prev_row0);
+                    if (p_has) {
+                        st_half(addr_ds1, prev_ds.y, prev_row1);
+                    }
                 }
             }
 
             prev_ds   = __float22half2_rn(make_float2(ds0, ds1));
             prev_ldo0 = ldo0;
             prev_aux  = (static_cast<uint32_t>(ldo1) & 0xFFFF) | (static_cast<uint32_t>(has_pair) << 16);
+            prev_row0 = row0;
+            prev_row1 = row1;
 
         } else {
             const __half2 h2_ds = __float22half2_rn(make_float2(ds0, ds1));
             const __half2 h2_p  = __float22half2_rn(make_float2(p0_drop, p1_drop));
 
+            uint32_t addr_ds0 = __cvta_generic_to_shared(SMEM_DS + ldo0);
+            uint32_t addr_p0  = __cvta_generic_to_shared(SMEM_P  + ldo0);
+
             const bool vec = has_pair && (row1 == row0) && ((ldo0 & 1) == 0);
+
             if (vec) {
-                uintptr_t addr_ds = reinterpret_cast<uintptr_t>(SMEM_DS + ldo0);
-                uintptr_t addr_p  = reinterpret_cast<uintptr_t>(SMEM_P  + ldo0);
-                if (((addr_ds & 0x3) == 0) && ((addr_p & 0x3) == 0)) {
-                    *reinterpret_cast<__half2*>(SMEM_DS + ldo0) = h2_ds;
-                    *reinterpret_cast<__half2*>(SMEM_P  + ldo0) = h2_p;
+                if (((addr_ds0 & 0x3) == 0) && ((addr_p0 & 0x3) == 0)) {
+                    st_half2(addr_ds0, h2_ds, row0);
+                    st_half2(addr_p0,  h2_p,  row0);
                     continue;
                 }
             }
-            SMEM_DS[ldo0] = h2_ds.x;
-            SMEM_P [ldo0] = h2_p.x;
+
+            st_half(addr_ds0, h2_ds.x, row0);
+            st_half(addr_p0,  h2_p.x,  row0);
+
             if (has_pair) {
-                SMEM_DS[ldo1] = h2_ds.y;
-                SMEM_P [ldo1] = h2_p.y;
+                uint32_t addr_ds1 = __cvta_generic_to_shared(SMEM_DS + ldo1);
+                uint32_t addr_p1  = __cvta_generic_to_shared(SMEM_P  + ldo1);
+                st_half(addr_ds1, h2_ds.y, row1);
+                st_half(addr_p1,  h2_p.y,  row1);
             }
         }
     }
 
     if constexpr (!PHASE) {
         if (prev_ldo0 >= 0) {
-            const int p_ldo1 = prev_aux & 0xFFFF;
-            const bool p_has = (prev_aux >> 16) & 1;
-            const bool vec   = p_has && ((prev_ldo0 & 1) == 0);
+            const int  p_ldo1 = prev_aux & 0xFFFF;
+            const bool p_has  = (prev_aux >> 16) & 1;
+            const bool vec    = p_has && ((prev_ldo0 & 1) == 0);
+
+            uint32_t addr_ds0 = __cvta_generic_to_shared(SMEM_DS + prev_ldo0);
+            uint32_t addr_ds1 = p_has ? __cvta_generic_to_shared(SMEM_DS + p_ldo1) : 0;
 
             if (vec) {
-                uintptr_t addr = reinterpret_cast<uintptr_t>(SMEM_DS + prev_ldo0);
-                if ((addr & 0x3) == 0) {
-                    *reinterpret_cast<__half2*>(SMEM_DS + prev_ldo0) = prev_ds;
+                if ((addr_ds0 & 0x3) == 0) {
+                    st_half2(addr_ds0, prev_ds, prev_row0);
                 } else {
-                    SMEM_DS[prev_ldo0] = prev_ds.x;
-                    if (p_has) SMEM_DS[p_ldo1] = prev_ds.y;
+                    st_half(addr_ds0, prev_ds.x, prev_row0);
+                    if (p_has) {
+                        st_half(addr_ds1, prev_ds.y, prev_row1);
+                    }
                 }
             } else {
-                SMEM_DS[prev_ldo0] = prev_ds.x;
-                if (p_has) SMEM_DS[p_ldo1] = prev_ds.y;
+                st_half(addr_ds0, prev_ds.x, prev_row0);
+                if (p_has) {
+                    st_half(addr_ds1, prev_ds.y, prev_row1);
+                }
             }
         }
     }
