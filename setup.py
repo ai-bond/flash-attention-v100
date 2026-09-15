@@ -82,12 +82,12 @@ def get_ext_modules():
         CUDAExtension(
             name="flash_attn_v100_cuda",
             sources=[
-                "kernel/fused_mha_api.cpp",
-                "kernel/fused_mha_forward.cu",
-                "kernel/fused_mha_forward_varlen.cu",
-                "kernel/fused_mha_backward.cu",
-                "kernel/fused_mha_backward_varlen.cu",
-                "kernel/fused_mha_forward_kvcache.cu",
+                "kernel/api.cpp",
+                "kernel/forward.cu",
+                "kernel/forward_varlen.cu",
+                "kernel/backward.cu",
+                "kernel/backward_varlen.cu",
+                "kernel/forward_kvcache.cu",
             ],
             include_dirs=[this_dir / "include"],
             extra_compile_args={
