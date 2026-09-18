@@ -124,10 +124,6 @@ flash_attention_backward_kernel(
         // ==================================================================================
         extern __shared__ char smem_raw[];
 
-        WMMA_GEMM_INIT_SMEM<Config>(smem_raw);
-
-        __syncthreads();
-
         auto& smem = *reinterpret_cast<typename Config::SmemLayout*>(smem_raw);
 
         __half* __restrict__ sQ      = smem.phase.bdq.q;
@@ -140,6 +136,9 @@ flash_attention_backward_kernel(
          float* __restrict__ sRowDot = smem.row_dot;
          float* __restrict__ sLse    = smem.lse;
          float* __restrict__ sdQ     = smem.phase.bdq.dQ;
+
+        WMMA_GEMM_INIT_SMEM<Config>(smem_raw);
+        __syncthreads();
 
         // ==================================================================================
         // Load:     Q(dO)  tile from global to sQ(sdO) shared memory
