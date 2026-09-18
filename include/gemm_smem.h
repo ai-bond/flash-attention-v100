@@ -9,28 +9,62 @@
 #include "swizzle.h"
 
 // ======================================================================================
+// SMEM CORE HELPER
+// ======================================================================================
+template<typename T>
+__device__ __forceinline__ uint32_t GET_PATTERN(T value) {
+    if constexpr (std::is_same_v<T, float>) {
+        return (value == 0.0f) ? 0u : __float_as_uint(value);
+    } else if constexpr (std::is_same_v<T, __half>) {
+        uint32_t h = __half_as_ushort(value);
+        return (h == 0u) ? 0u : ((h << 16) | h);
+    } else if constexpr (std::is_same_v<T, uint32_t> || std::is_same_v<T, int>) {
+        return static_cast<uint32_t>(value);
+    } else {
+        static_assert(sizeof(T) == 0, "SMEM: Unsupported type. Use float, __half, or uint32_t.");
+        return 0;
+    }
+}
+
+// ======================================================================================
 // INIT SMEM LAYOUT
 // ======================================================================================
-template<typename Config>
-__device__ __forceinline__ void WMMA_GEMM_INIT_SMEM(char* smem_raw) {
-    constexpr int UINT4  = Config::TOTAL_SMEM / 16;
+template<typename Config, typename T, size_t TOTAL_BYTES>
+__device__ __forceinline__ void INIT_SMEM_CORE(char* smem_ptr, T value) {
+    constexpr int CHUNKS = (TOTAL_BYTES + 15) / 16;
     constexpr int STRIDE = Config::THREADS_PER_BLOCK;
-    constexpr int ITERS  = (UINT4 + STRIDE - 1) / STRIDE;
+    constexpr int ITERS  = (CHUNKS + STRIDE - 1) / STRIDE;
 
-    uint32_t base    = static_cast<uint32_t>(__cvta_generic_to_shared(smem_raw));
+    uint32_t pattern = GET_PATTERN(value);
+    uint32_t base    = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+
     uint32_t str_ptr = base + ((threadIdx.x ^ (threadIdx.x >> 3)) << 4);
-    uint32_t end_ptr = base + (UINT4 << 4);
+    uint32_t end_ptr = base + (CHUNKS << 4);
     constexpr uint32_t step = STRIDE << 4;
 
     #pragma unroll
     for (int i = 0; i < ITERS; ++i) {
         asm volatile(
             "setp.lt.u32 %%p0, %0, %1;\n\t"
-            "@%%p0 st.shared.v4.u32 [%0], {0, 0, 0, 0};\n\t"
-            :: "r"(str_ptr), "r"(end_ptr)
+            "@%%p0 st.shared.v4.u32 [%0], {%2, %2, %2, %2};\n\t"
+            :: "r"(str_ptr), "r"(end_ptr), "r"(pattern) : "memory"
         );
         str_ptr += step;
     }
+}
+
+// ======================================================================================
+// WMMA_GEMM_INIT_SMEM OVERLOADS
+// ======================================================================================
+template<typename Config>
+__device__ __forceinline__ void WMMA_GEMM_INIT_SMEM(char* smem_raw) {
+    INIT_SMEM_CORE<Config, uint32_t, Config::TOTAL_SMEM>(smem_raw, 0u);
+}
+
+template<typename Config, typename T, int N>
+__device__ __forceinline__ void WMMA_GEMM_INIT_SMEM(T (&arr)[N], T VALUE) {
+    constexpr size_t TOTAL_BYTES = N * sizeof(T);
+    INIT_SMEM_CORE<Config, T, TOTAL_BYTES>(reinterpret_cast<char*>(arr), VALUE);
 }
 
 // ======================================================================================
@@ -76,6 +110,8 @@ __device__ __forceinline__ void WMMA_GEMM_LOAD_TILE(
         const int src_offset = row * src_stride_uint4 + col;
         const int dst_offset = row * dst_stride_uint4 + col;
 
+        const int pred = (col < src_stride_uint4) ? 1 : 0;
+
         uint64_t src_addr0 = src_base0 + (static_cast<uint64_t>(src_offset) << 4);
         uint32_t dst_addr0 = swizzle(dst_base0 + (static_cast<uint32_t>(dst_offset) << 4), row);
 
@@ -86,24 +122,40 @@ __device__ __forceinline__ void WMMA_GEMM_LOAD_TILE(
 
             asm volatile(
                 "{\n\t"
-                "  ld.global.v4.u32 {%0, %1, %2, %3}, [%4];\n\t"
-                "  st.shared.v4.u32 [%6], {%0, %1, %2, %3};\n\t"
-                "  ld.global.v4.u32 {%0, %1, %2, %3}, [%5];\n\t"
-                "  st.shared.v4.u32 [%7], {%0, %1, %2, %3};\n\t"
+                ".reg .pred p;\n\t"
+                "setp.ne.b32 p, %8, 0;\n\t"
+                "mov.u32 %0, 0;\n\t"
+                "mov.u32 %1, 0;\n\t"
+                "mov.u32 %2, 0;\n\t"
+                "mov.u32 %3, 0;\n\t"
+                "@p ld.global.v4.u32 {%0, %1, %2, %3}, [%4];\n\t"
+                "st.shared.v4.u32 [%6], {%0, %1, %2, %3};\n\t"
+                "mov.u32 %0, 0;\n\t"
+                "mov.u32 %1, 0;\n\t"
+                "mov.u32 %2, 0;\n\t"
+                "mov.u32 %3, 0;\n\t"
+                "@p ld.global.v4.u32 {%0, %1, %2, %3}, [%5];\n\t"
+                "st.shared.v4.u32 [%7], {%0, %1, %2, %3};\n\t"
                 "}\n\t"
                 : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
                 : "l"(src_addr0), "l"(src_addr1),
-                  "r"(dst_addr0), "r"(dst_addr1)
+                  "r"(dst_addr0), "r"(dst_addr1), "r"(pred)
                 : "memory"
             );
         } else {
             asm volatile(
                 "{\n\t"
-                "  ld.global.v4.u32 {%0, %1, %2, %3}, [%4];\n\t"
-                "  st.shared.v4.u32 [%5], {%0, %1, %2, %3};\n\t"
+                ".reg .pred p;\n\t"
+                "setp.ne.b32 p, %6, 0;\n\t"
+                "mov.u32 %0, 0;\n\t"
+                "mov.u32 %1, 0;\n\t"
+                "mov.u32 %2, 0;\n\t"
+                "mov.u32 %3, 0;\n\t"
+                "@p ld.global.v4.u32 {%0, %1, %2, %3}, [%4];\n\t"
+                "st.shared.v4.u32 [%5], {%0, %1, %2, %3};\n\t"
                 "}\n\t"
                 : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
-                : "l"(src_addr0), "r"(dst_addr0)
+                : "l"(src_addr0), "r"(dst_addr0), "r"(pred)
                 : "memory"
             );
         }
