@@ -249,7 +249,7 @@ flash_attention_forward_varlen_kernel(
         // Layout:   sP[valid_q_rows, N_STRIDE] @ sV[valid_kv_rows, D_STRIDE] += sO
         // Template: BLOCK_M/BLOCK_N static, valid_q/valid_kv dynamic (varlen ragged tiles)
         // ==============================================================================
-        WMMA_GEMM_GRADIENTS<Config, GemmType::dO_PV, D, BLOCK_M, BLOCK_N, N_STRIDE, D_STRIDE>(
+        WMMA_GEMM_GRADIENTS<Config, GemmType::dO_PV, D, BLOCK_M, BLOCK_N, N_STRIDE * 2, D_STRIDE>(
           sP, sV, sO,
           block.valid_q_rows, valid_kv_rows,
           warp_id, lane_id);

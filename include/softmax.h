@@ -40,7 +40,6 @@ __device__ __forceinline__ void WMMA_GEMM_SOFTMAX(
 ) {
     if (VALID_Q == 0 || VALID_KV == 0) return;
     constexpr int THREADS_PER_ROW = Config::DO::THREADS_PER_ROW;
-    constexpr int BUFFER = (BLOCK_N / 4 + THREADS_PER_ROW - 1) / THREADS_PER_ROW;
 
     const int  row     = THREAD_ID / THREADS_PER_ROW;
     const int  thread  = THREAD_ID % THREADS_PER_ROW;
@@ -48,19 +47,12 @@ __device__ __forceinline__ void WMMA_GEMM_SOFTMAX(
     const int  tail    = (VALID_KV >> 2) << 2;
     const bool IS_TAIL = (tail < VALID_KV);
 
-    const float rp_dropout  = IS_DROPOUT ? (1.0f / (1.0f - P_DROPOUT)) : 1.0f;
-    const uint32_t drop_thr = IS_DROPOUT ? static_cast<uint32_t>((1.0f - P_DROPOUT) * 4294967295.0f) : 0;
-
     float thread_max = NEG_INF, new_max  = NEG_INF;
     float thread_sum = 0.0f,    exp_diff = 1.0f;
 
-    __half2 half_buffer[BUFFER * 2];
-    __half  tail_buffer[3];
-
-    uint32_t sS_base = __cvta_generic_to_shared(SMEM_S + row * SCORE_STRIDE);
-    uint32_t sP_base = __cvta_generic_to_shared(SMEM_P + row * SCORE_STRIDE);
-
     if (row < VALID_Q) {
+        uint32_t sS_base = __cvta_generic_to_shared(SMEM_S + row * SCORE_STRIDE);
+
         #pragma unroll 4
         for (int idx = thread; idx < cols; idx += THREADS_PER_ROW) {
             float4 buffer = ld_float4(sS_base + idx * 16, row);
@@ -79,11 +71,12 @@ __device__ __forceinline__ void WMMA_GEMM_SOFTMAX(
     }
 
     if (row < VALID_Q) {
-        const float old_max = SMEM_MAX[row];
-        new_max  = fmaxf(old_max, thread_max);
-        exp_diff = __expf(old_max - new_max);
+        uint32_t sS_base = __cvta_generic_to_shared(SMEM_S + row * SCORE_STRIDE);
+        uint32_t sP_base = __cvta_generic_to_shared(SMEM_P + row * SCORE_STRIDE * 2);
 
-        int rb_idx = 0;
+        new_max  =  fmaxf(SMEM_MAX[row], thread_max);
+        exp_diff = __expf(SMEM_MAX[row] - new_max);
+
         #pragma unroll 4
         for (int idx = thread; idx < cols; idx += THREADS_PER_ROW) {
             float4 buffer = ld_float4(sS_base + idx * 16, row);
@@ -95,7 +88,9 @@ __device__ __forceinline__ void WMMA_GEMM_SOFTMAX(
             thread_sum += (e0 + e1) + (e2 + e3);
 
             if constexpr (IS_DROPOUT) {
-                uint64_t  idx_base = static_cast<uint64_t>(GLOBAL_ROW_OFFSET + row) * GLOBAL_N + (GLOBAL_COL_OFFSET + idx * 4);
+                const float  rp_dropout = (1.0f / (1.0f - P_DROPOUT));
+                const uint32_t drop_thr = static_cast<uint32_t>((1.0f - P_DROPOUT) * 4294967295.0f);
+                uint64_t       idx_base = static_cast<uint64_t>(GLOBAL_ROW_OFFSET + row) * GLOBAL_N + (GLOBAL_COL_OFFSET + idx * 4);
                 PhiloxState philox = init_philox(DROPOUT_SEED, DROPOUT_OFFSET + (idx_base >> 2));
                 uint4 rng = philox.next();
 
@@ -124,13 +119,11 @@ __device__ __forceinline__ void WMMA_GEMM_SOFTMAX(
                                  :: "l"(g_addr), "h"(g0), "h"(g1), "h"(g2), "h"(g3) : "memory");
                 }
             }
-
-            half_buffer[rb_idx++] = __float22half2_rn(make_float2(e0, e1));
-            half_buffer[rb_idx++] = __float22half2_rn(make_float2(e2, e3));
+            st_half2(sP_base +  (idx * 2) * 4,      __float22half2_rn(make_float2(e0, e1)), row);
+            st_half2(sP_base + ((idx * 2) + 1) * 4, __float22half2_rn(make_float2(e2, e3)), row);
         }
 
         if (IS_TAIL) {
-            int tr_idx = 0;
             #pragma unroll
             for (int idx = tail + thread; idx < VALID_KV; idx += THREADS_PER_ROW) {
                 float v  = ld_float(sS_base + idx * 4, row);
@@ -138,7 +131,9 @@ __device__ __forceinline__ void WMMA_GEMM_SOFTMAX(
                 thread_sum += e;
 
                 if constexpr (IS_DROPOUT) {
-                    uint64_t idx_base_tail = static_cast<uint64_t>(GLOBAL_ROW_OFFSET + row) * GLOBAL_N + (GLOBAL_COL_OFFSET + idx);
+                    const float  rp_dropout = (1.0f / (1.0f - P_DROPOUT));
+                    const uint32_t drop_thr = static_cast<uint32_t>((1.0f - P_DROPOUT) * 4294967295.0f);
+                    uint64_t  idx_base_tail = static_cast<uint64_t>(GLOBAL_ROW_OFFSET + row) * GLOBAL_N + (GLOBAL_COL_OFFSET + idx);
                     PhiloxState philox = init_philox(DROPOUT_SEED, DROPOUT_OFFSET + (idx_base_tail >> 2));
                     uint4 rng = philox.next();
                     uint32_t r = (idx_base_tail & 3) == 0 ? rng.x : (idx_base_tail & 3) == 1 ? rng.y : (idx_base_tail & 3) == 2 ? rng.z : rng.w;
@@ -152,24 +147,7 @@ __device__ __forceinline__ void WMMA_GEMM_SOFTMAX(
                         asm volatile("st.global.u16 [%0], %1;\n" :: "l"(g_addr), "h"(g) : "memory");
                     }
                 }
-
-                tail_buffer[tr_idx++] = __float2half_rn(e);
-            }
-        }
-
-        int wb_idx = 0;
-        #pragma unroll 4
-        for (int idx = thread; idx < cols; idx += THREADS_PER_ROW) {
-            int base = idx * 2;
-            st_half2(sP_base + base  * 4,      half_buffer[wb_idx++], row);
-            st_half2(sP_base + (base + 1) * 4, half_buffer[wb_idx++], row);
-        }
-
-        if (IS_TAIL) {
-            int tw_idx = 0;
-            #pragma unroll
-            for (int idx = tail + thread; idx < VALID_KV; idx += THREADS_PER_ROW) {
-                st_half(sP_base + idx * 2, tail_buffer[tw_idx++], row);
+                st_half(sP_base + idx * 2, __float2half_rn(e), row);
             }
         }
 

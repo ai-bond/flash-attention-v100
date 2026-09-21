@@ -198,7 +198,7 @@ flash_attention_forward_kernel(
         // Layout:   P[row: BLOCK_M, BLOCK_N], V[row: BLOCK_N, D] -> dO[row: BLOCK_M, D]
         // Template: BLOCK_X=BLOCK_M, BLOCK_Y=BLOCK_N
         // ==================================================================================
-        WMMA_GEMM_GRADIENTS<Config, GemmType::dO_PV, D, BLOCK_M, BLOCK_N, N_STRIDE, D_STRIDE>(
+        WMMA_GEMM_GRADIENTS<Config, GemmType::dO_PV, D, BLOCK_M, BLOCK_N, N_STRIDE * 2, D_STRIDE>(
           sP, sV, sO,
           block.valid_q_rows, valid_kv_rows, warp_id, lane_id);
         __syncthreads();
