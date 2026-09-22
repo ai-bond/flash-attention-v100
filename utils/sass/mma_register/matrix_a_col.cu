@@ -1,10 +1,15 @@
+// ======================================================================================
+// * Copyright (c) 2026, D.Skryabin / tg @ai_bond007 SPDX-License: BSD-3-Clause
+// ======================================================================================
 // Matrix A col_major register dump
+// ======================================================================================
 #include <cuda_fp16.h>
 #include <cstdint>
 #include <cstdio>
 
 #ifdef USE_VOLTA_MMA
     #include "mma_m16n16k16.h"
+    #include "swizzle.h"
     using namespace volta;
 #else
     #include <mma.h>
@@ -22,8 +27,16 @@ __global__ void dump_a_col_regs(
     if (threadIdx.x >= 32) return;
 
     __shared__ half smem_A[256];
+    unsigned smem_addr = __cvta_generic_to_shared(smem_A);
+
     for (int i = threadIdx.x; i < 256; i += 32) {
+#ifdef USE_VOLTA_MMA
+        int row = i / 16;
+        unsigned a = smem_addr + i * 2;
+        st_half(a, A[i], row);
+#else
         smem_A[i] = A[i];
+#endif
     }
     __syncthreads();
 
@@ -46,7 +59,6 @@ __global__ void dump_a_col_regs(
 int main() {
     printf("Matrix A col_major dump\n");
 
-    // A in COL-MAJOR: A[i][j] = i*16 + j, stored at offset i + j*16
     half h_A[256];
     for (int i = 0; i < 16; i++) {
         for (int j = 0; j < 16; j++) {

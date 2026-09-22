@@ -1,10 +1,15 @@
-// Accumulator load col_major register dump
+// ======================================================================================
+// * Copyright (c) 2026, D.Skryabin / tg @ai_bond007 SPDX-License: BSD-3-Clause
+// ======================================================================================
+// Accumulator load row_major register dump
+// ======================================================================================
 #include <cuda_fp16.h>
 #include <cstdint>
 #include <cstdio>
 
 #ifdef USE_VOLTA_MMA
     #include "mma_m16n16k16.h"
+    #include "swizzle.h"
     using namespace volta;
 #else
     #include <mma.h>
@@ -15,7 +20,7 @@
 #define WMMA_N 16
 #define WMMA_K 16
 
-__global__ void dump_acc_load_col_regs(
+__global__ void dump_acc_load_regs(
     const float* __restrict__ C,
     uint32_t* __restrict__ reg_dump) {
 
@@ -23,12 +28,18 @@ __global__ void dump_acc_load_col_regs(
 
     __shared__ float smem_C[256];
     for (int i = threadIdx.x; i < 256; i += 32) {
+#ifdef USE_VOLTA_MMA
+        int row = i / 16;
+        unsigned b = __cvta_generic_to_shared(smem_C) + i * 4;
+        st_float(b, C[i], row);
+#else
         smem_C[i] = C[i];
+#endif
     }
     __syncthreads();
 
     wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc_frag;
-    wmma::load_matrix_sync(acc_frag, smem_C, 16, wmma::mem_col_major);
+    wmma::load_matrix_sync(acc_frag, smem_C, 16, wmma::mem_row_major);
 
     __shared__ uint32_t smem_dump[32 * 8];
     uint32_t* dst = smem_dump + threadIdx.x * 8;
@@ -47,13 +58,13 @@ __global__ void dump_acc_load_col_regs(
 }
 
 int main() {
-    printf("Accumulator load col_major dump\n");
+    printf("Accumulator load row_major dump\n");
 
-    // C in COL-MAJOR: C[i][j] = i*16 + j, stored at offset i + j*16
+    // C in ROW-MAJOR: C[i][j] = i*16 + j (as float)
     float h_C[256];
     for (int i = 0; i < 16; i++) {
         for (int j = 0; j < 16; j++) {
-            h_C[i + j * 16] = (float)(i * 16 + j);
+            h_C[i * 16 + j] = (float)(i * 16 + j);
         }
     }
 
@@ -63,7 +74,7 @@ int main() {
     cudaMalloc(&d_regs, 32 * 8 * sizeof(uint32_t));
     cudaMemcpy(d_C, h_C, 256 * sizeof(float), cudaMemcpyHostToDevice);
 
-    dump_acc_load_col_regs<<<1, 32>>>(d_C, d_regs);
+    dump_acc_load_regs<<<1, 32>>>(d_C, d_regs);
     cudaDeviceSynchronize();
 
     uint32_t h_regs[32 * 8];

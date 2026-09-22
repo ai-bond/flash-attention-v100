@@ -12,7 +12,7 @@ launch__shared_mem_per_block,\
 launch__occupancy_limit_warps,\
 launch__occupancy_limit_registers,\
 launch__occupancy_limit_shared_mem" \
-./backward_kernel_volta
+./backward_kernel_native
 
 ncu --kernel-name-base "function" --kernel-name "flash_attention_backward_kernel" \
 --metrics "l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_ld.sum,\
@@ -26,4 +26,4 @@ launch__shared_mem_per_block,\
 launch__occupancy_limit_warps,\
 launch__occupancy_limit_registers,\
 launch__occupancy_limit_shared_mem" \
-./backward_kernel_swz_volta
+./backward_kernel_volta

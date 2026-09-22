@@ -335,11 +335,12 @@ __device__ __forceinline__ void load_matrix_sync(
 // LOAD: accumulator m16n16k16 (ROW & COL MAJOR)
 // ======================================================================================
 // Data per lane:   8 floats total, distributed as 4 contiguous pairs.
-// Lane mapping:    r_base = ((lid>>2)&1)*8 + ((lid>>4)&1)*4 + (lid&1) c_base = ((lid>>3)&1)*8 + ((lid>>1)&1)*2
+// Lane mapping:    r_base = ((lid>>2)&1)*8 + ((lid>>4)&1)*4 + (lid&1)
+//                  c_base = ((lid>>3)&1)*8 + ((lid>>1)&1)*2
 // Replication:     Hardware 2x crossbar duplication via ignored lane bits.
 // Memory access:   ROW: Pairs row-contiguous. Stride=2*ldm*4B. Optimal: 4x v2.
 //                  COL: Pairs col-contiguous. Elements strided by ldm. Optimal: 8x scalar.
-// Swizzle:         Tile-Relative Logical Swizzle applied to 16B chunk boundaries.
+// Swizzle:         Tile-Relative Logical Swizzle applied per logical row/col.
 // ======================================================================================
 __device__ __forceinline__ void load_matrix_sync(
     fragment<accumulator, 16, 16, 16, float>& frag,
@@ -350,19 +351,19 @@ __device__ __forceinline__ void load_matrix_sync(
     if (layout == mem_row_major) {
         asm volatile(
             "{\n\t"
-            ".reg .u32 lid, r_base, c_base, base, stride, a0, a1, a2, a3, swz, tmp, t;\n\t"
+            ".reg .u32 lid, r_base, c_base, base, stride, a0, a1, a2, a3, swz0, swz1, tmp;\n\t"
             "mov.u32 lid, %%laneid;\n\t"
 
-            // r0 = ((lid>>2)&1)*8 + ((lid>>4)&1)*4 + (lid&1)
+            // r_base = (lid & 1) | ((lid>>2)&1)<<3 | ((lid>>4)&1)<<2
             "and.b32 r_base, lid, 1;\n\t"
             "shr.b32 tmp, lid, 2; and.b32 tmp, tmp, 1; shl.b32 tmp, tmp, 3; add.u32 r_base, r_base, tmp;\n\t"
             "shr.b32 tmp, lid, 4; and.b32 tmp, tmp, 1; shl.b32 tmp, tmp, 2; add.u32 r_base, r_base, tmp;\n\t"
 
-            // c0 = ((lid>>3)&1)*8 + ((lid>>1)&1)*2
+            // c_base = ((lid>>3)&1)<<3 | ((lid>>1)&1)<<1
             "shr.b32 c_base, lid, 3; and.b32 c_base, c_base, 1; shl.b32 c_base, c_base, 3;\n\t"
             "shr.b32 tmp, lid, 1; and.b32 tmp, tmp, 1; shl.b32 tmp, tmp, 1; add.u32 c_base, c_base, tmp;\n\t"
 
-            // base = smem_addr + (r0 * ldm + c0) * sizeof(float)
+            // base = smem_addr + (r_base * ldm + c_base) * sizeof(float)
             "mad.lo.u32 base, r_base, %9, c_base;\n\t"
             "shl.b32 base, base, 2;\n\t"
             "add.u32 base, base, %8;\n\t"
@@ -374,10 +375,17 @@ __device__ __forceinline__ void load_matrix_sync(
             "add.u32 a2, base, 16;\n\t"
             "add.u32 a3, a2, stride;\n\t"
 
-            // Swizzle a0, a2 (r_base)
-            "and.b32 swz, r_base, 3; shr.b32 tmp, r_base, 1; and.b32 tmp, tmp, 4; or.b32 swz, swz, tmp; shl.b32 swz, swz, 4; xor.b32 a0, a0, swz; xor.b32 a2, a2, swz;\n\t"
-            // Swizzle a1, a3 (r_base + 2)
-            "add.u32 t, r_base, 2; and.b32 swz, t, 3; shr.b32 tmp, t, 1; and.b32 tmp, tmp, 4; or.b32 swz, swz, tmp; shl.b32 swz, swz, 4; xor.b32 a1, a1, swz; xor.b32 a3, a3, swz;\n\t"
+            // Swizzle swz0 = swz(r_base) ; Swizzle swz1 = swz(r_base + 2) = swz0 | 0x20
+            "and.b32 swz0, r_base, 3;\n\t"
+            "shr.b32 tmp, r_base, 1; and.b32 tmp, tmp, 4; or.b32 swz0, swz0, tmp;\n\t"
+            "shl.b32 swz0, swz0, 4;\n\t"
+            "or.b32  swz1, swz0, 0x20;\n\t"
+
+            // a0,a2 are in row r_base ; a1,a3 are in row r_base+2
+            "xor.b32 a0, a0, swz0;\n\t"
+            "xor.b32 a2, a2, swz0;\n\t"
+            "xor.b32 a1, a1, swz1;\n\t"
+            "xor.b32 a3, a3, swz1;\n\t"
 
             "ld.shared.v2.f32 {%0, %1}, [a0];\n\t"
             "ld.shared.v2.f32 {%2, %3}, [a1];\n\t"
@@ -392,27 +400,30 @@ __device__ __forceinline__ void load_matrix_sync(
     } else {
         asm volatile(
             "{\n\t"
-            ".reg .u32 lid, r_base, c_base, base, sc, sc4, a0, a1, a2, a3, a4, a5, a6, a7, swz, tmp, t;\n\t"
+            ".reg .u32 lid, r_base, c_base, base, sc, sc4,"
+            " a0, a1, a2, a3, a4, a5, a6, a7, swz0, swz1, tmp;\n\t"
             "mov.u32 lid, %%laneid;\n\t"
 
-            // r0 = ((lid>>2)&1)*8 + ((lid>>4)&1)*4 + (lid&1)
+            // r_base = (lid & 1) | ((lid>>2)&1)<<3 | ((lid>>4)&1)<<2
             "and.b32 r_base, lid, 1;\n\t"
             "shr.b32 tmp, lid, 2; and.b32 tmp, tmp, 1; shl.b32 tmp, tmp, 3; add.u32 r_base, r_base, tmp;\n\t"
             "shr.b32 tmp, lid, 4; and.b32 tmp, tmp, 1; shl.b32 tmp, tmp, 2; add.u32 r_base, r_base, tmp;\n\t"
 
-            // c0 = ((lid>>3)&1)*8 + ((lid>>1)&1)*2
+            // c_base = ((lid>>3)&1)<<3 | ((lid>>1)&1)<<1
             "shr.b32 c_base, lid, 3; and.b32 c_base, c_base, 1; shl.b32 c_base, c_base, 3;\n\t"
             "shr.b32 tmp, lid, 1; and.b32 tmp, tmp, 1; shl.b32 tmp, tmp, 1; add.u32 c_base, c_base, tmp;\n\t"
 
-            // base = smem_addr + (c0 * ldm + r0) * sizeof(float)
+            // base = smem_addr + (c_base * ldm + r_base) * sizeof(float)
             "mad.lo.u32 base, c_base, %9, r_base;\n\t"
             "shl.b32 base, base, 2;\n\t"
             "add.u32 base, base, %8;\n\t"
 
-            // strides: sc = ldm*4 (col step), sc4 = ldm*16 (col+4 step)
-            "shl.b32 sc, %9, 2;\n\t"
+            // strides: sc = ldm * 4  (1 column step) ; sc4 = ldm * 16 (4 column step)
+            "shl.b32 sc,  %9, 2;\n\t"
             "shl.b32 sc4, %9, 4;\n\t"
 
+            // a0=(c,r)   a1=(c+1,r)   a2=(c,r+2)   a3=(c+1,r+2)
+            // a4=(c+4,r) a5=(c+5,r)   a6=(c+4,r+2) a7=(c+5,r+2)
             "mov.u32 a0, base;\n\t"
             "add.u32 a1, base, sc;\n\t"
             "add.u32 a2, base, 8;\n\t"
@@ -422,10 +433,22 @@ __device__ __forceinline__ void load_matrix_sync(
             "add.u32 a6, a4, 8;\n\t"
             "add.u32 a7, a6, sc;\n\t"
 
-            // Swizzle a0..a3 (c_base)
-            "and.b32 swz, c_base, 3; shr.b32 tmp, c_base, 1; and.b32 tmp, tmp, 4; or.b32 swz, swz, tmp; shl.b32 swz, swz, 4; xor.b32 a0, a0, swz; xor.b32 a1, a1, swz; xor.b32 a2, a2, swz; xor.b32 a3, a3, swz;\n\t"
-            // Swizzle a4..a7 (c_base + 4)
-            "add.u32 t, c_base, 4; and.b32 swz, t, 3; shr.b32 tmp, t, 1; and.b32 tmp, tmp, 4; or.b32 swz, swz, tmp; shl.b32 swz, swz, 4; xor.b32 a4, a4, swz; xor.b32 a5, a5, swz; xor.b32 a6, a6, swz; xor.b32 a7, a7, swz;\n\t"
+            // Swizzle swz0 = swz(c_base) ; Swizzle swz1 = swz(c_base + 1) = swz0 | 0x10
+            "and.b32 swz0, c_base, 3;\n\t"
+            "shr.b32 tmp, c_base, 1; and.b32 tmp, tmp, 4; or.b32 swz0, swz0, tmp;\n\t"
+            "shl.b32 swz0, swz0, 4;\n\t"
+            "or.b32  swz1, swz0, 0x10;\n\t"
+
+            // column c_base   -> Swizzle swz0 : a0, a2, a4, a6
+            // column c_base+1 -> Swizzle swz1 : a1, a3, a5, a7
+            "xor.b32 a0, a0, swz0;\n\t"
+            "xor.b32 a2, a2, swz0;\n\t"
+            "xor.b32 a4, a4, swz0;\n\t"
+            "xor.b32 a6, a6, swz0;\n\t"
+            "xor.b32 a1, a1, swz1;\n\t"
+            "xor.b32 a3, a3, swz1;\n\t"
+            "xor.b32 a5, a5, swz1;\n\t"
+            "xor.b32 a7, a7, swz1;\n\t"
 
             "ld.shared.f32 %0, [a0];\n\t"
             "ld.shared.f32 %1, [a1];\n\t"
@@ -448,11 +471,12 @@ __device__ __forceinline__ void load_matrix_sync(
 // STORE: accumulator m16n16k16 (ROW & COL MAJOR)
 // ======================================================================================
 // Data per lane:   8 floats total, distributed as 4 contiguous pairs.
-// Lane mapping:    r_base = ((lid>>2)&1)*8 + ((lid>>4)&1)*4 + (lid&1) c_base = ((lid>>3)&1)*8 + ((lid>>1)&1)*2
+// Lane mapping:    r_base = ((lid>>2)&1)*8 + ((lid>>4)&1)*4 + (lid&1)
+//                  c_base = ((lid>>3)&1)*8 + ((lid>>1)&1)*2
 // Replication:     Hardware 2x crossbar duplication via ignored lane bits.
 // Memory access:   ROW: Pairs row-contiguous. Stride=2*ldm*4B. Optimal: 4x v2.
 //                  COL: Pairs col-contiguous. Elements strided by ldm. Optimal: 8x scalar.
-// Swizzle:         Tile-Relative Logical Swizzle applied to 16B chunk boundaries.
+// Swizzle:         Tile-Relative Logical Swizzle, symmetric to load_matrix_sync.
 // ======================================================================================
 __device__ __forceinline__ void store_matrix_sync(
     float* __restrict__ smem_ptr,
@@ -464,35 +488,41 @@ __device__ __forceinline__ void store_matrix_sync(
     if (layout == mem_row_major) {
         asm volatile(
             "{\n\t"
-            ".reg .u32 lid, r_base, c_base, base, stride, a0, a1, a2, a3, swz, tmp, t;\n\t"
+            ".reg .u32 lid, r_base, c_base, base, stride, a0, a1, a2, a3, swz0, swz1, tmp;\n\t"
             "mov.u32 lid, %%laneid;\n\t"
 
-            // r0 = ((lid>>2)&1)*8 + ((lid>>4)&1)*4 + (lid&1)
+            // r_base = (lid & 1) | ((lid>>2)&1)<<3 | ((lid>>4)&1)<<2
             "and.b32 r_base, lid, 1;\n\t"
             "shr.b32 tmp, lid, 2; and.b32 tmp, tmp, 1; shl.b32 tmp, tmp, 3; add.u32 r_base, r_base, tmp;\n\t"
             "shr.b32 tmp, lid, 4; and.b32 tmp, tmp, 1; shl.b32 tmp, tmp, 2; add.u32 r_base, r_base, tmp;\n\t"
 
-            // c0 = ((lid>>3)&1)*8 + ((lid>>1)&1)*2
+            // c_base = ((lid>>3)&1)<<3 | ((lid>>1)&1)<<1
             "shr.b32 c_base, lid, 3; and.b32 c_base, c_base, 1; shl.b32 c_base, c_base, 3;\n\t"
             "shr.b32 tmp, lid, 1; and.b32 tmp, tmp, 1; shl.b32 tmp, tmp, 1; add.u32 c_base, c_base, tmp;\n\t"
 
-            // base = smem_addr + (r0 * ldm + c0) * sizeof(float)
+            // base = smem_addr + (r_base * ldm + c_base) * sizeof(float)
             "mad.lo.u32 base, r_base, %9, c_base;\n\t"
             "shl.b32 base, base, 2;\n\t"
             "add.u32 base, base, %8;\n\t"
 
             // stride = 2 rows * ldm * 4 bytes = ldm << 3
             "shl.b32 stride, %9, 3;\n\t"
-
             "mov.u32 a0, base;\n\t"
             "add.u32 a1, base, stride;\n\t"
             "add.u32 a2, base, 16;\n\t"
             "add.u32 a3, a2, stride;\n\t"
 
-            // Swizzle a0, a2 (r_base)
-            "and.b32 swz, r_base, 3; shr.b32 tmp, r_base, 1; and.b32 tmp, tmp, 4; or.b32 swz, swz, tmp; shl.b32 swz, swz, 4; xor.b32 a0, a0, swz; xor.b32 a2, a2, swz;\n\t"
-            // Swizzle a1, a3 (r_base + 2)
-            "add.u32 t, r_base, 2; and.b32 swz, t, 3; shr.b32 tmp, t, 1; and.b32 tmp, tmp, 4; or.b32 swz, swz, tmp; shl.b32 swz, swz, 4; xor.b32 a1, a1, swz; xor.b32 a3, a3, swz;\n\t"
+            // Swizzle swz0 = swz(r_base) ; Swizzle swz1 = swz(r_base + 2) = swz0 | 0x20
+            "and.b32 swz0, r_base, 3;\n\t"
+            "shr.b32 tmp, r_base, 1; and.b32 tmp, tmp, 4; or.b32 swz0, swz0, tmp;\n\t"
+            "shl.b32 swz0, swz0, 4;\n\t"
+            "or.b32  swz1, swz0, 0x20;\n\t"
+
+            // a0,a2 -> row r_base ; a1,a3 -> row r_base+2
+            "xor.b32 a0, a0, swz0;\n\t"
+            "xor.b32 a2, a2, swz0;\n\t"
+            "xor.b32 a1, a1, swz1;\n\t"
+            "xor.b32 a3, a3, swz1;\n\t"
 
             "st.shared.v2.f32 [a0], {%0, %1};\n\t"
             "st.shared.v2.f32 [a1], {%2, %3};\n\t"
@@ -508,27 +538,30 @@ __device__ __forceinline__ void store_matrix_sync(
     } else {
         asm volatile(
             "{\n\t"
-            ".reg .u32 lid, r_base, c_base, base, sc, sc4, a0, a1, a2, a3, a4, a5, a6, a7, swz, tmp, t;\n\t"
+            ".reg .u32 lid, r_base, c_base, base, sc, sc4,"
+            " a0, a1, a2, a3, a4, a5, a6, a7, swz0, swz1, tmp;\n\t"
             "mov.u32 lid, %%laneid;\n\t"
 
-            // r0 = ((lid>>2)&1)*8 + ((lid>>4)&1)*4 + (lid&1)
+            // r_base = (lid & 1) | ((lid>>2)&1)<<3 | ((lid>>4)&1)<<2
             "and.b32 r_base, lid, 1;\n\t"
             "shr.b32 tmp, lid, 2; and.b32 tmp, tmp, 1; shl.b32 tmp, tmp, 3; add.u32 r_base, r_base, tmp;\n\t"
             "shr.b32 tmp, lid, 4; and.b32 tmp, tmp, 1; shl.b32 tmp, tmp, 2; add.u32 r_base, r_base, tmp;\n\t"
 
-            // c0 = ((lid>>3)&1)*8 + ((lid>>1)&1)*2
+            // c_base = ((lid>>3)&1)<<3 | ((lid>>1)&1)<<1
             "shr.b32 c_base, lid, 3; and.b32 c_base, c_base, 1; shl.b32 c_base, c_base, 3;\n\t"
             "shr.b32 tmp, lid, 1; and.b32 tmp, tmp, 1; shl.b32 tmp, tmp, 1; add.u32 c_base, c_base, tmp;\n\t"
 
-            // base = smem_addr + (c0 * ldm + r0) * sizeof(float)
+            // base = smem_addr + (c_base * ldm + r_base) * sizeof(float)
             "mad.lo.u32 base, c_base, %9, r_base;\n\t"
             "shl.b32 base, base, 2;\n\t"
             "add.u32 base, base, %8;\n\t"
 
-             // strides: sc = ldm*4 (col step), sc4 = ldm*16 (col+4 step)
-            "shl.b32 sc, %9, 2;\n\t"
+            // strides: sc = ldm*4 (1 column step) ; sc4 = ldm*16 (4 column step)
+            "shl.b32 sc,  %9, 2;\n\t"
             "shl.b32 sc4, %9, 4;\n\t"
 
+            // a0=(c,r)   a1=(c+1,r)   a2=(c,r+2)   a3=(c+1,r+2)
+            // a4=(c+4,r) a5=(c+5,r)   a6=(c+4,r+2) a7=(c+5,r+2)
             "mov.u32 a0, base;\n\t"
             "add.u32 a1, base, sc;\n\t"
             "add.u32 a2, base, 8;\n\t"
@@ -538,10 +571,22 @@ __device__ __forceinline__ void store_matrix_sync(
             "add.u32 a6, a4, 8;\n\t"
             "add.u32 a7, a6, sc;\n\t"
 
-            // Swizzle a0..a3 (c_base)
-            "and.b32 swz, c_base, 3; shr.b32 tmp, c_base, 1; and.b32 tmp, tmp, 4; or.b32 swz, swz, tmp; shl.b32 swz, swz, 4; xor.b32 a0, a0, swz; xor.b32 a1, a1, swz; xor.b32 a2, a2, swz; xor.b32 a3, a3, swz;\n\t"
-            // Swizzle a4..a7 (c_base + 4)
-            "add.u32 t, c_base, 4; and.b32 swz, t, 3; shr.b32 tmp, t, 1; and.b32 tmp, tmp, 4; or.b32 swz, swz, tmp; shl.b32 swz, swz, 4; xor.b32 a4, a4, swz; xor.b32 a5, a5, swz; xor.b32 a6, a6, swz; xor.b32 a7, a7, swz;\n\t"
+            // Swizzle swz0 = swz(c_base) ; Swizzle swz1 = swz(c_base + 1) = swz0 | 0x10
+            "and.b32 swz0, c_base, 3;\n\t"
+            "shr.b32 tmp, c_base, 1; and.b32 tmp, tmp, 4; or.b32 swz0, swz0, tmp;\n\t"
+            "shl.b32 swz0, swz0, 4;\n\t"
+            "or.b32  swz1, swz0, 0x10;\n\t"
+
+            // column c_base   -> swz0 : a0, a2, a4, a6
+            // column c_base+1 -> swz1 : a1, a3, a5, a7
+            "xor.b32 a0, a0, swz0;\n\t"
+            "xor.b32 a2, a2, swz0;\n\t"
+            "xor.b32 a4, a4, swz0;\n\t"
+            "xor.b32 a6, a6, swz0;\n\t"
+            "xor.b32 a1, a1, swz1;\n\t"
+            "xor.b32 a3, a3, swz1;\n\t"
+            "xor.b32 a5, a5, swz1;\n\t"
+            "xor.b32 a7, a7, swz1;\n\t"
 
             "st.shared.f32 [a0], %0;\n\t"
             "st.shared.f32 [a1], %1;\n\t"
