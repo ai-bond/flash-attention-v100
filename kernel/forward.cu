@@ -111,10 +111,6 @@ flash_attention_forward_kernel(
     // ==================================================================================
     extern __shared__ char smem_raw[];
 
-    WMMA_GEMM_INIT_SMEM<Config>(smem_raw);
-
-    __syncthreads();
-
     auto& smem = *reinterpret_cast<typename Config::SmemLayout*>(smem_raw);
 
     __half* __restrict__ sQ      = smem.phase.fdo.q;
@@ -126,10 +122,10 @@ flash_attention_forward_kernel(
     float*  __restrict__ sRowSum = smem.row_sum;
     float*  __restrict__ sO      = smem.phase.fdo.o;
 
-    if (tid < BLOCK_M) {
-        sRowMax[tid] = NEG_INF;
-        sRowSum[tid] = 0.0f;
-    }
+    WMMA_GEMM_INIT_SMEM<Config>(smem_raw);
+    __syncthreads();
+    WMMA_GEMM_INIT_SMEM<Config>(smem.row_max, NEG_INF);
+    __syncthreads();
 
     // ==================================================================================
     // Load:     Q tile from global to sQ shared memory
@@ -202,7 +198,7 @@ flash_attention_forward_kernel(
         // Layout:   P[row: BLOCK_M, BLOCK_N], V[row: BLOCK_N, D] -> dO[row: BLOCK_M, D]
         // Template: BLOCK_X=BLOCK_M, BLOCK_Y=BLOCK_N
         // ==================================================================================
-        WMMA_GEMM_GRADIENTS<Config, GemmType::dO_PV, D, BLOCK_M, BLOCK_N, N_STRIDE, D_STRIDE>(
+        WMMA_GEMM_GRADIENTS<Config, GemmType::dO_PV, D, BLOCK_M, BLOCK_N, N_STRIDE * 2, D_STRIDE>(
           sP, sV, sO,
           block.valid_q_rows, valid_kv_rows, warp_id, lane_id);
         __syncthreads();

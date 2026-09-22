@@ -16,7 +16,7 @@
 #define BLOCK_N_64  128
 
 #define BLOCK_M_128 32
-#define BLOCK_N_128 160
+#define BLOCK_N_128 176
 
 #define BLOCK_M_256 32
 #define BLOCK_N_256 64
@@ -49,7 +49,7 @@ struct KernelConfig {
                 } reuse_kv;
                 union {
                     alignas(16) float  s      [DO::BLOCK_M * DO::N_STRIDE];
-                    alignas(16) __half p      [DO::BLOCK_M * DO::N_STRIDE];
+                    alignas(16) __half p      [DO::BLOCK_M * DO::N_STRIDE * 2];
                 } reuse_sp;
                     alignas(16) float  o      [DO::BLOCK_M * DO::D_STRIDE];
             } fdo;

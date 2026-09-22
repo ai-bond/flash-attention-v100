@@ -1,10 +1,15 @@
+// ======================================================================================
+// * Copyright (c) 2026, D.Skryabin / tg @ai_bond007 SPDX-License: BSD-3-Clause
+// ======================================================================================
 // Matrix B col_major register dump
+// ======================================================================================
 #include <cuda_fp16.h>
 #include <cstdint>
 #include <cstdio>
 
 #ifdef USE_VOLTA_MMA
     #include "mma_m16n16k16.h"
+    #include "swizzle.h"
     using namespace volta;
 #else
     #include <mma.h>
@@ -22,8 +27,16 @@ __global__ void dump_b_regs(
     if (threadIdx.x >= 32) return;
 
     __shared__ half smem_B[256];
+
     for (int i = threadIdx.x; i < 256; i += 32) {
+#ifdef USE_VOLTA_MMA
+        int row = i / 16;
+        unsigned b = __cvta_generic_to_shared(smem_B) + i * 2;
+        st_half(b, B[i], row);
+#else
         smem_B[i] = B[i];
+#endif
+
     }
     __syncthreads();
 

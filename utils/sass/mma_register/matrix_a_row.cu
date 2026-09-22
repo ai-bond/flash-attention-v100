@@ -1,10 +1,15 @@
+// ======================================================================================
+// * Copyright (c) 2026, D.Skryabin / tg @ai_bond007 SPDX-License: BSD-3-Clause
+// ======================================================================================
 // Matrix A row_major register dump
+// ======================================================================================
 #include <cuda_fp16.h>
 #include <cstdint>
 #include <cstdio>
 
 #ifdef USE_VOLTA_MMA
     #include "mma_m16n16k16.h"
+    #include "swizzle.h"
     using namespace volta;
 #else
     #include <mma.h>
@@ -22,8 +27,16 @@ __global__ void dump_wmma_regs(
     if (threadIdx.x >= 32) return;
 
     __shared__ half smem_A[256];
+    unsigned smem_addr = __cvta_generic_to_shared(smem_A);
+
     for (int i = threadIdx.x; i < 256; i += 32) {
+#ifdef USE_VOLTA_MMA
+        int row = i / 16;
+        unsigned a = smem_addr + i * 2;
+        st_half(a, A[i], row);
+#else
         smem_A[i] = A[i];
+#endif
     }
     __syncthreads();
 
@@ -32,12 +45,9 @@ __global__ void dump_wmma_regs(
 
     __shared__ uint32_t smem_dump[32 * 8];
     uint32_t* dst = smem_dump + threadIdx.x * 8;
-
     const uint32_t* src = reinterpret_cast<const uint32_t*>(a_frag.x);
     #pragma unroll
-    for (int i = 0; i < 8; i++) {
-        dst[i] = src[i];
-    }
+    for (int i = 0; i < 8; i++) dst[i] = src[i];
     __syncthreads();
 
     #pragma unroll
@@ -49,13 +59,10 @@ __global__ void dump_wmma_regs(
 int main() {
     printf("Matrix A row_major dump\n");
 
-    // Init matrix: A[i][j] = i * 16 + j (as half)
     half h_A[256];
-    for (int i = 0; i < 16; i++) {
-        for (int j = 0; j < 16; j++) {
+    for (int i = 0; i < 16; i++)
+        for (int j = 0; j < 16; j++)
             h_A[i * 16 + j] = __float2half((float)(i * 16 + j));
-        }
-    }
 
     half* d_A;
     uint32_t* d_regs;
@@ -72,14 +79,12 @@ int main() {
     for (int lane = 0; lane < 32; lane++) {
         printf("L%2d: ", lane);
         const half* v = reinterpret_cast<const half*>(&h_regs[lane * 8]);
-        for (int h = 0; h < 16; h++) {
+        for (int h = 0; h < 16; h++)
             printf("%.0f ", __half2float(v[h]));
-        }
         printf("\n");
     }
 
     cudaFree(d_A);
     cudaFree(d_regs);
-
     return 0;
 }

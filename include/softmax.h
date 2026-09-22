@@ -11,12 +11,14 @@
 
 // ======================================================================================
 // WMMA_GEMM_SOFTMAX: Online softmax with O-scaling
+// ======================================================================================
 // FA2 MATH: m_new   = max(m_old, rowmax(S))
 //           P       = exp(S - m_new)    [clamped > -80]
 //           l_new   = exp(m_old - m_new) * l_old + rowsum(P)
 //           O_new   = exp(m_old - m_new) * O_old
-// SWIZZLE:  S read via ld_float4/ld_float(addr, row). P stored via st_half2/st_half(addr, row).
-//           O rescaled via ld_float4/st_float4(addr, row) when BLOCK_ID > 0.
+// LAYOUT:   S [float], O [float] row-major, swizzled via ld_float4/st_float4(addr, row)
+//           P [half ]            row-major, swizzled via st_half4/st_half(addr, row)
+//           sS[row,k]            sP[row,2k], sP[row,2k+1]
 // ======================================================================================
 template <typename Config, int BLOCK_M, int BLOCK_N, int SCORE_STRIDE, int HEAD_STRIDE, bool IS_DROPOUT>
 __device__ __forceinline__ void WMMA_GEMM_SOFTMAX(
@@ -25,7 +27,7 @@ __device__ __forceinline__ void WMMA_GEMM_SOFTMAX(
     float*   __restrict__ SMEM_O,
     float*   __restrict__ SMEM_MAX,
     float*   __restrict__ SMEM_SUM,
-   __half*   __restrict__ GMEM_MASK,
+    __half*  __restrict__ GMEM_MASK,
     int      VALID_Q,
     int      VALID_KV,
     int      THREAD_ID,
@@ -39,36 +41,42 @@ __device__ __forceinline__ void WMMA_GEMM_SOFTMAX(
     int      STRIDE_GMEM_MASK
 ) {
     if (VALID_Q == 0 || VALID_KV == 0) return;
+
     constexpr int THREADS_PER_ROW = Config::DO::THREADS_PER_ROW;
-    constexpr int BUFFER = (BLOCK_N / 4 + THREADS_PER_ROW - 1) / THREADS_PER_ROW;
+    constexpr int MAX_ITERS       = ((BLOCK_N >> 2) + THREADS_PER_ROW - 1) / THREADS_PER_ROW;
+    constexpr int MAX_TAILS       = (4 + THREADS_PER_ROW - 1) / THREADS_PER_ROW;
 
-    const int  row     = THREAD_ID / THREADS_PER_ROW;
-    const int  thread  = THREAD_ID % THREADS_PER_ROW;
-    const int  cols    =  VALID_KV >> 2;
-    const int  tail    = (VALID_KV >> 2) << 2;
-    const bool IS_TAIL = (tail < VALID_KV);
-
-    const float rp_dropout  = IS_DROPOUT ? (1.0f / (1.0f - P_DROPOUT)) : 1.0f;
-    const uint32_t drop_thr = IS_DROPOUT ? static_cast<uint32_t>((1.0f - P_DROPOUT) * 4294967295.0f) : 0;
+    const int row     = THREAD_ID / THREADS_PER_ROW;
+    const int thread  = THREAD_ID % THREADS_PER_ROW;
+    const int cols    = VALID_KV >> 2;
+    const int tail    = (VALID_KV >> 2) << 2;
 
     float thread_max = NEG_INF, new_max  = NEG_INF;
     float thread_sum = 0.0f,    exp_diff = 1.0f;
 
-    __half2 half_buffer[BUFFER * 2];
-    __half  tail_buffer[3];
-
-    uint32_t sS_base = __cvta_generic_to_shared(SMEM_S + row * SCORE_STRIDE);
-    uint32_t sP_base = __cvta_generic_to_shared(SMEM_P + row * SCORE_STRIDE);
+    float4 sS[MAX_ITERS];
+    float  sS_tail[MAX_TAILS];
 
     if (row < VALID_Q) {
-        #pragma unroll 4
-        for (int idx = thread; idx < cols; idx += THREADS_PER_ROW) {
-            float4 buffer = ld_float4(sS_base + idx * 16, row);
-            thread_max = fmaxf(thread_max, fmaxf(fmaxf(buffer.x, buffer.y), fmaxf(buffer.z, buffer.w)));
+        uint32_t sS_base = __cvta_generic_to_shared(SMEM_S + row * SCORE_STRIDE);
+
+        #pragma unroll
+        for (int idx = 0; idx < MAX_ITERS; ++idx) {
+            const int addr = thread + idx * THREADS_PER_ROW;
+            if (addr < cols) {
+                sS[idx] = ld_float4(sS_base + addr * 16, row);
+                thread_max = fmaxf(thread_max, fmaxf(fmaxf(sS[idx].x, sS[idx].y), fmaxf(sS[idx].z, sS[idx].w)));
+            }
         }
-        if (IS_TAIL) {
-            for (int idx = tail + thread; idx < VALID_KV; idx += THREADS_PER_ROW) {
-                thread_max = fmaxf(thread_max, ld_float(sS_base + idx * 4, row));
+
+        if (tail < VALID_KV) {
+            #pragma unroll
+            for (int idx = 0; idx < MAX_TAILS; ++idx) {
+                const int addr = tail + thread + idx * THREADS_PER_ROW;
+                if (addr < VALID_KV) {
+                    sS_tail[idx] = ld_float(sS_base + addr * 4, row);
+                    thread_max = fmaxf(thread_max, sS_tail[idx]);
+                }
             }
         }
     }
@@ -79,97 +87,87 @@ __device__ __forceinline__ void WMMA_GEMM_SOFTMAX(
     }
 
     if (row < VALID_Q) {
-        const float old_max = SMEM_MAX[row];
-        new_max  = fmaxf(old_max, thread_max);
-        exp_diff = __expf(old_max - new_max);
+        uint32_t sP_base = __cvta_generic_to_shared(SMEM_P + row * SCORE_STRIDE * 2);
 
-        int rb_idx = 0;
-        #pragma unroll 4
-        for (int idx = thread; idx < cols; idx += THREADS_PER_ROW) {
-            float4 buffer = ld_float4(sS_base + idx * 16, row);
-            float e0 = __expf(fmaxf(buffer.x - new_max, -80.0f));
-            float e1 = __expf(fmaxf(buffer.y - new_max, -80.0f));
-            float e2 = __expf(fmaxf(buffer.z - new_max, -80.0f));
-            float e3 = __expf(fmaxf(buffer.w - new_max, -80.0f));
+        new_max  =  fmaxf(SMEM_MAX[row],  thread_max);
+        exp_diff = __expf(SMEM_MAX[row] - new_max);
 
-            thread_sum += (e0 + e1) + (e2 + e3);
+        #pragma unroll
+        for (int idx = 0; idx < MAX_ITERS; ++idx) {
+            const int addr = thread + idx * THREADS_PER_ROW;
+            if (addr < cols) {
+                float e0 = __expf(fmaxf(sS[idx].x - new_max, -80.0f));
+                float e1 = __expf(fmaxf(sS[idx].y - new_max, -80.0f));
+                float e2 = __expf(fmaxf(sS[idx].z - new_max, -80.0f));
+                float e3 = __expf(fmaxf(sS[idx].w - new_max, -80.0f));
 
-            if constexpr (IS_DROPOUT) {
-                uint64_t  idx_base = static_cast<uint64_t>(GLOBAL_ROW_OFFSET + row) * GLOBAL_N + (GLOBAL_COL_OFFSET + idx * 4);
-                PhiloxState philox = init_philox(DROPOUT_SEED, DROPOUT_OFFSET + (idx_base >> 2));
-                uint4 rng = philox.next();
-
-                uint32_t r0 = ((idx_base + 0) & 3) == 0 ? rng.x : ((idx_base + 0) & 3) == 1 ? rng.y : ((idx_base + 0) & 3) == 2 ? rng.z : rng.w;
-                uint32_t r1 = ((idx_base + 1) & 3) == 0 ? rng.x : ((idx_base + 1) & 3) == 1 ? rng.y : ((idx_base + 1) & 3) == 2 ? rng.z : rng.w;
-                uint32_t r2 = ((idx_base + 2) & 3) == 0 ? rng.x : ((idx_base + 2) & 3) == 1 ? rng.y : ((idx_base + 2) & 3) == 2 ? rng.z : rng.w;
-                uint32_t r3 = ((idx_base + 3) & 3) == 0 ? rng.x : ((idx_base + 3) & 3) == 1 ? rng.y : ((idx_base + 3) & 3) == 2 ? rng.z : rng.w;
-
-                uint32_t k0 = (r0 <= drop_thr);
-                uint32_t k1 = (r1 <= drop_thr);
-                uint32_t k2 = (r2 <= drop_thr);
-                uint32_t k3 = (r3 <= drop_thr);
-
-                e0 = k0 ? (e0 * rp_dropout) : 0.0f;
-                e1 = k1 ? (e1 * rp_dropout) : 0.0f;
-                e2 = k2 ? (e2 * rp_dropout) : 0.0f;
-                e3 = k3 ? (e3 * rp_dropout) : 0.0f;
-
-                if (GMEM_MASK != nullptr) {
-                    ushort g0 = 0x3C00 | (k0 ? 0 : 0x8000);
-                    ushort g1 = 0x3C00 | (k1 ? 0 : 0x8000);
-                    ushort g2 = 0x3C00 | (k2 ? 0 : 0x8000);
-                    ushort g3 = 0x3C00 | (k3 ? 0 : 0x8000);
-                    uint64_t g_addr = __cvta_generic_to_global(GMEM_MASK + row * STRIDE_GMEM_MASK + idx * 4);
-                    asm volatile("st.global.v4.u16 [%0], {%1, %2, %3, %4};\n"
-                                 :: "l"(g_addr), "h"(g0), "h"(g1), "h"(g2), "h"(g3) : "memory");
-                }
-            }
-
-            half_buffer[rb_idx++] = __float22half2_rn(make_float2(e0, e1));
-            half_buffer[rb_idx++] = __float22half2_rn(make_float2(e2, e3));
-        }
-
-        if (IS_TAIL) {
-            int tr_idx = 0;
-            #pragma unroll
-            for (int idx = tail + thread; idx < VALID_KV; idx += THREADS_PER_ROW) {
-                float v  = ld_float(sS_base + idx * 4, row);
-                float e  = __expf(fmaxf(v - new_max, -80.0f));
-                thread_sum += e;
+                thread_sum += (e0 + e1) + (e2 + e3);
 
                 if constexpr (IS_DROPOUT) {
-                    uint64_t idx_base_tail = static_cast<uint64_t>(GLOBAL_ROW_OFFSET + row) * GLOBAL_N + (GLOBAL_COL_OFFSET + idx);
-                    PhiloxState philox = init_philox(DROPOUT_SEED, DROPOUT_OFFSET + (idx_base_tail >> 2));
-                    uint4 rng = philox.next();
-                    uint32_t r = (idx_base_tail & 3) == 0 ? rng.x : (idx_base_tail & 3) == 1 ? rng.y : (idx_base_tail & 3) == 2 ? rng.z : rng.w;
+                    const float  rp_dropout = (1.0f / (1.0f - P_DROPOUT));
+                    const uint32_t drop_thr = static_cast<uint32_t>((1.0f - P_DROPOUT) * 4294967295.0f);
+                    uint64_t addr_plx = static_cast<uint64_t>(GLOBAL_ROW_OFFSET + row) * GLOBAL_N + (GLOBAL_COL_OFFSET + addr * 4);
 
-                    uint32_t k = (r <= drop_thr);
-                    e = k ? (e * rp_dropout) : 0.0f;
+                    PhiloxState philox = init_philox(DROPOUT_SEED, DROPOUT_OFFSET + (addr_plx >> 2));
+                    uint4 rng = philox.next();
+
+                    uint32_t r0 = ((addr_plx + 0) & 3) == 0 ? rng.x : ((addr_plx + 0) & 3) == 1 ? rng.y : ((addr_plx + 0) & 3) == 2 ? rng.z : rng.w;
+                    uint32_t r1 = ((addr_plx + 1) & 3) == 0 ? rng.x : ((addr_plx + 1) & 3) == 1 ? rng.y : ((addr_plx + 1) & 3) == 2 ? rng.z : rng.w;
+                    uint32_t r2 = ((addr_plx + 2) & 3) == 0 ? rng.x : ((addr_plx + 2) & 3) == 1 ? rng.y : ((addr_plx + 2) & 3) == 2 ? rng.z : rng.w;
+                    uint32_t r3 = ((addr_plx + 3) & 3) == 0 ? rng.x : ((addr_plx + 3) & 3) == 1 ? rng.y : ((addr_plx + 3) & 3) == 2 ? rng.z : rng.w;
+
+                    uint32_t k0 = (r0 <= drop_thr);
+                    uint32_t k1 = (r1 <= drop_thr);
+                    uint32_t k2 = (r2 <= drop_thr);
+                    uint32_t k3 = (r3 <= drop_thr);
+
+                    e0 = k0 ? (e0 * rp_dropout) : 0.0f;
+                    e1 = k1 ? (e1 * rp_dropout) : 0.0f;
+                    e2 = k2 ? (e2 * rp_dropout) : 0.0f;
+                    e3 = k3 ? (e3 * rp_dropout) : 0.0f;
 
                     if (GMEM_MASK != nullptr) {
-                        ushort g = 0x3C00 | (k ? 0 : 0x8000);
-                        uint64_t g_addr = __cvta_generic_to_global(GMEM_MASK + row * STRIDE_GMEM_MASK + idx);
-                        asm volatile("st.global.u16 [%0], %1;\n" :: "l"(g_addr), "h"(g) : "memory");
+                        ushort gmem0 = 0x3C00 | (k0 ? 0 : 0x8000);
+                        ushort gmem1 = 0x3C00 | (k1 ? 0 : 0x8000);
+                        ushort gmem2 = 0x3C00 | (k2 ? 0 : 0x8000);
+                        ushort gmem3 = 0x3C00 | (k3 ? 0 : 0x8000);
+                        uint64_t gmem_addr = __cvta_generic_to_global(GMEM_MASK + row * STRIDE_GMEM_MASK + addr * 4);
+                        asm volatile("st.global.v4.u16 [%0], {%1, %2, %3, %4};\n"
+                                     :: "l"(gmem_addr), "h"(gmem0), "h"(gmem1), "h"(gmem2), "h"(gmem3) : "memory");
                     }
                 }
-
-                tail_buffer[tr_idx++] = __float2half_rn(e);
+                st_half4(sP_base + addr * 8, __float22half2_rn(make_float2(e0, e1)), __float22half2_rn(make_float2(e2, e3)), row);
             }
         }
 
-        int wb_idx = 0;
-        #pragma unroll 4
-        for (int idx = thread; idx < cols; idx += THREADS_PER_ROW) {
-            int base = idx * 2;
-            st_half2(sP_base + base  * 4,      half_buffer[wb_idx++], row);
-            st_half2(sP_base + (base + 1) * 4, half_buffer[wb_idx++], row);
-        }
-
-        if (IS_TAIL) {
-            int tw_idx = 0;
+        if (tail < VALID_KV) {
             #pragma unroll
-            for (int idx = tail + thread; idx < VALID_KV; idx += THREADS_PER_ROW) {
-                st_half(sP_base + idx * 2, tail_buffer[tw_idx++], row);
+            for (int idx = 0; idx < MAX_TAILS; ++idx) {
+                const int addr = tail + thread + idx * THREADS_PER_ROW;
+                if (addr < VALID_KV) {
+                    float e = __expf(fmaxf(sS_tail[idx] - new_max, -80.0f));
+                    thread_sum += e;
+
+                    if constexpr (IS_DROPOUT) {
+                        const float  rp_dropout = (1.0f / (1.0f - P_DROPOUT));
+                        const uint32_t drop_thr = static_cast<uint32_t>((1.0f - P_DROPOUT) * 4294967295.0f);
+                        uint64_t addr_plx_tail  = static_cast<uint64_t>(GLOBAL_ROW_OFFSET + row) * GLOBAL_N + (GLOBAL_COL_OFFSET + addr);
+
+                        PhiloxState philox = init_philox(DROPOUT_SEED, DROPOUT_OFFSET + (addr_plx_tail >> 2));
+                        uint4 rng  = philox.next();
+                        uint32_t r = (addr_plx_tail & 3) == 0 ? rng.x : (addr_plx_tail & 3) == 1 ? rng.y : (addr_plx_tail & 3) == 2 ? rng.z : rng.w;
+
+                        uint32_t kk = (r <= drop_thr);
+                        e = kk ? (e * rp_dropout) : 0.0f;
+
+                        if (GMEM_MASK != nullptr) {
+                            ushort gmem = 0x3C00 | (kk ? 0 : 0x8000);
+                            uint64_t gmem_addr = __cvta_generic_to_global(GMEM_MASK + row * STRIDE_GMEM_MASK + addr);
+                            asm volatile("st.global.u16 [%0], %1;\n" :: "l"(gmem_addr), "h"(gmem) : "memory");
+                        }
+                    }
+                    st_half(sP_base + addr * 2, __float2half_rn(e), row);
+                }
             }
         }
 
@@ -195,25 +193,27 @@ __device__ __forceinline__ void WMMA_GEMM_SOFTMAX(
         uint32_t sO_base = __cvta_generic_to_shared(SMEM_O + row * HEAD_STRIDE);
         #pragma unroll 4
         for (int idx = thread; idx < ((HEAD_STRIDE + 3) >> 2); idx += THREADS_PER_ROW) {
-            float4 buffer = ld_float4(sO_base + idx * 16, row);
-            buffer.x *= exp_diff;
-            buffer.y *= exp_diff;
-            buffer.z *= exp_diff;
-            buffer.w *= exp_diff;
-            st_float4(sO_base + idx * 16, buffer, row);
+            float4 sO = ld_float4(sO_base + idx * 16, row);
+            sO.x *= exp_diff;
+            sO.y *= exp_diff;
+            sO.z *= exp_diff;
+            sO.w *= exp_diff;
+            st_float4(sO_base + idx * 16, sO, row);
         }
     }
 }
 
 // ======================================================================================
 // WMMA_GEMM_SOFTMAX_GRADIENT: Recompute P & dS for backward pass
+// ======================================================================================
 // FA2 MATH: P_orig = exp(S - lse)
 //           P_drop = P_orig * mask / (1-p)
 //           dS     = (P_drop * dOV - P_orig * D) * softmax_scale
-//           if softcap: dS *= (1 - (S/c)^2)  [S is already softcapped]
-// SWIZZLE:  S/dOV read via ld_float(addr, row). P/dS stored via st_half/st_half2(row).
-//           Phase 1 (dQ):  load_matrix_sync(row_major) -> swizzle by r_base=row
-//           Phase 2 (dKV): load_matrix_sync(col_major) -> swizzle by c_base=row
+//           if softcap: dS *= (1 - (S/c)^2)   [FMA form]
+//
+// LAYOUT:   S [float], dOV[float] row-major, stride SMEM_LDS_STRIDE (floats)
+//           P [half ], dS [half ] row-major, stride SMEM_LDO_STRIDE (halves)
+//           sS[row,k]             sP[row,2k],sP[row,2k+1]
 // ======================================================================================
 template<typename Config, GemmType TYPE, bool IS_SOFTCAP, bool IS_DROPOUT, int SMEM_LDS_STRIDE, int SMEM_LDO_STRIDE, int TILE_X, int TILE_Y>
 __device__ __forceinline__ void WMMA_GEMM_SOFTMAX_GRADIENT(
@@ -230,180 +230,110 @@ __device__ __forceinline__ void WMMA_GEMM_SOFTMAX_GRADIENT(
     float    P_DROPOUT,
     uint64_t DROPOUT_SEED,
     uint64_t DROPOUT_OFFSET,
-    int GLOBAL_ROW_OFFSET,
-    int GLOBAL_COL_OFFSET,
-    int GLOBAL_N,
-    int THREAD_ID
+    int      GLOBAL_ROW_OFFSET,
+    int      GLOBAL_COL_OFFSET,
+    int      GLOBAL_N,
+    int      THREAD_ID
 ) {
-    constexpr int  TOTAL_ELEMENTS    = TILE_X * TILE_Y;
-    constexpr int  TOTAL_PAIRS       = (TOTAL_ELEMENTS + 1) >> 1;
     constexpr bool PHASE             = static_cast<uint8_t>(TYPE) & 0x1;
     constexpr int  THREADS_PER_BLOCK = Config::THREADS_PER_BLOCK;
 
-    const float softcap_inv = IS_SOFTCAP ? (1.0f / SOFTCAP) : 0.0f;
-    const float rp_dropout  = IS_DROPOUT ? (1.0f / (1.0f - P_DROPOUT)) : 1.0f;
-    const uint32_t drop_thr = IS_DROPOUT ? static_cast<uint32_t>((1.0f - P_DROPOUT) * 4294967295.0f) : 0;
+    const float    softcap_inv = IS_SOFTCAP ? (1.0f / SOFTCAP) : 0.0f;
+    const float    rp_dropout  = IS_DROPOUT ? (1.0f / (1.0f - P_DROPOUT)) : 1.0f;
+    const uint32_t drop_thr    = IS_DROPOUT ? static_cast<uint32_t>((1.0f - P_DROPOUT) * 4294967295.0f) : 0u;
 
-    __half2  prev_ds = __float22half2_rn(make_float2(0.0f, 0.0f));
-    int      prev_ldo0 = -1;
-    uint32_t prev_aux  =  0;
-    int      prev_row0 = -1;
-    int      prev_row1 = -1;
+    float4  prev_ds  = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    int     prev_row  = -1;
+    int     prev_col  =  0;
+    bool    prev_has  = false;
 
     #pragma unroll 1
-    for (int i = THREAD_ID; i < TOTAL_PAIRS; i += THREADS_PER_BLOCK) {
-        const int idx0 = i << 1;
-        const int idx1 = idx0 + 1;
-        const int row0 = idx0 / TILE_Y;
-        const int col0 = idx0 % TILE_Y;
-        const bool has_pair = (idx1 < TOTAL_ELEMENTS);
-        const int row1 = has_pair ? (idx1 / TILE_Y) : row0;
-        const int col1 = has_pair ? (idx1 % TILE_Y) : (col0 + 1);
+    for (int i = THREAD_ID; i < (TILE_X * TILE_Y >> 2); i += THREADS_PER_BLOCK) {
+        const int idx = i << 2;
+        const int row = idx / TILE_Y;
+        const int col = idx % TILE_Y;
 
-        const bool in0 = (row0 < VALID_Q_ROWS) && (col0 < VALID_KV_ROWS);
-        const bool in1 = has_pair && (row1 < VALID_Q_ROWS) && (col1 < VALID_KV_ROWS);
+        const bool is_valid = (row < VALID_Q_ROWS);
+        const bool in0      = is_valid && (col       < VALID_KV_ROWS);
+        const bool in1      = is_valid && ((col + 1) < VALID_KV_ROWS);
+        const bool in2      = is_valid && ((col + 2) < VALID_KV_ROWS);
+        const bool in3      = is_valid && ((col + 3) < VALID_KV_ROWS);
 
-        const float lse0 = (row0 < VALID_Q_ROWS) ? SMEM_LSE[row0] : 0.0f;
-        const float lse1 = (row1 < VALID_Q_ROWS) ? SMEM_LSE[row1] : lse0;
-        const float dot0 = (row0 < VALID_Q_ROWS) ? SMEM_DOT[row0] : 0.0f;
-        const float dot1 = (row1 < VALID_Q_ROWS) ? SMEM_DOT[row1] : dot0;
+        const float lse = is_valid ? SMEM_LSE[row] : 0.0f;
+        const float dot = is_valid ? SMEM_DOT[row] : 0.0f;
 
-        const int lds0 = row0 * SMEM_LDS_STRIDE + col0;
-        const int lds1 = has_pair ? (row1 * SMEM_LDS_STRIDE + col1) : 0;
+        float4 sS, sdOV;
 
-        uint32_t addr_s0   = __cvta_generic_to_shared(SMEM_S + lds0);
-        uint32_t addr_s1   = __cvta_generic_to_shared(SMEM_S + lds1);
-        uint32_t addr_dov0 = __cvta_generic_to_shared(SMEM_DOV + lds0);
-        uint32_t addr_dov1 = __cvta_generic_to_shared(SMEM_DOV + lds1);
+        if (is_valid) {
+            const uint32_t sS_base   = __cvta_generic_to_shared(SMEM_S   + row * SMEM_LDS_STRIDE);
+            const uint32_t sDOV_base = __cvta_generic_to_shared(SMEM_DOV + row * SMEM_LDS_STRIDE);
+            sS   = ld_float4(sS_base   + col * 4, row);
+            sdOV = ld_float4(sDOV_base + col * 4, row);
+        } else {
+            sS   = make_float4(NEG_INF, NEG_INF, NEG_INF, NEG_INF);
+            sdOV = make_float4(0.0f,    0.0f,    0.0f,    0.0f);
+        }
 
-        float s0 = in0 ? ld_float(addr_s0, row0) : NEG_INF;
-        float s1 = in1 ? ld_float(addr_s1, row1) : NEG_INF;
+        if (!in0) { sS.x = NEG_INF; sdOV.x = 0.0f; }
+        if (!in1) { sS.y = NEG_INF; sdOV.y = 0.0f; }
+        if (!in2) { sS.z = NEG_INF; sdOV.z = 0.0f; }
+        if (!in3) { sS.w = NEG_INF; sdOV.w = 0.0f; }
 
-        float dov0 = (s0 != NEG_INF) ? ld_float(addr_dov0, row0) : 0.0f;
-        float dov1 = (s1 != NEG_INF) ? ld_float(addr_dov1, row1) : 0.0f;
+        float p0 = (sS.x == NEG_INF || (sS.x - lse) < -80.0f) ? 0.0f : __expf(sS.x - lse);
+        float p1 = (sS.y == NEG_INF || (sS.y - lse) < -80.0f) ? 0.0f : __expf(sS.y - lse);
+        float p2 = (sS.z == NEG_INF || (sS.z - lse) < -80.0f) ? 0.0f : __expf(sS.z - lse);
+        float p3 = (sS.w == NEG_INF || (sS.w - lse) < -80.0f) ? 0.0f : __expf(sS.w - lse);
 
-        float sh0 = s0 - lse0;
-        float sh1 = s1 - lse1;
-
-        float p0_orig = (s0 == NEG_INF || sh0 < -80.0f) ? 0.0f : __expf(sh0);
-        float p1_orig = (s1 == NEG_INF || sh1 < -80.0f) ? 0.0f : __expf(sh1);
-
-        float p0_drop = p0_orig;
-        float p1_drop = p1_orig;
+        float pd0 = p0, pd1 = p1, pd2 = p2, pd3 = p3;
 
         if constexpr (IS_DROPOUT) {
-            if (in0) {
-                uint64_t flat_idx0 = static_cast<uint64_t>(GLOBAL_ROW_OFFSET + row0) * GLOBAL_N + (GLOBAL_COL_OFFSET + col0);
-                PhiloxState philox0 = init_philox(DROPOUT_SEED, DROPOUT_OFFSET + (flat_idx0 >> 2));
-                uint4 rng0 = philox0.next();
-                uint32_t r0 = (flat_idx0 & 3) == 0 ? rng0.x : (flat_idx0 & 3) == 1 ? rng0.y : (flat_idx0 & 3) == 2 ? rng0.z : rng0.w;
-                p0_drop = (r0 <= drop_thr) ? (p0_orig * rp_dropout) : 0.0f;
-            }
-            if (in1) {
-                uint64_t flat_idx1 = static_cast<uint64_t>(GLOBAL_ROW_OFFSET + row1) * GLOBAL_N + (GLOBAL_COL_OFFSET + col1);
-                PhiloxState philox1 = init_philox(DROPOUT_SEED, DROPOUT_OFFSET + (flat_idx1 >> 2));
-                uint4 rng1 = philox1.next();
-                uint32_t r1 = (flat_idx1 & 3) == 0 ? rng1.x : (flat_idx1 & 3) == 1 ? rng1.y : (flat_idx1 & 3) == 2 ? rng1.z : rng1.w;
-                p1_drop = (r1 <= drop_thr) ? (p1_orig * rp_dropout) : 0.0f;
-            }
+            const uint64_t addr_plx = static_cast<uint64_t>(GLOBAL_ROW_OFFSET + row) * GLOBAL_N + (GLOBAL_COL_OFFSET + col);
+            const uint4         rng = init_philox(DROPOUT_SEED, DROPOUT_OFFSET + (addr_plx >> 2)).next();
+
+            if (in0) pd0 = (rng.x <= drop_thr) ? (p0 * rp_dropout) : 0.0f;
+            if (in1) pd1 = (rng.y <= drop_thr) ? (p1 * rp_dropout) : 0.0f;
+            if (in2) pd2 = (rng.z <= drop_thr) ? (p2 * rp_dropout) : 0.0f;
+            if (in3) pd3 = (rng.w <= drop_thr) ? (p3 * rp_dropout) : 0.0f;
         }
 
-        float ds0 = __fmaf_rn(p0_drop, dov0, -p0_orig * dot0) * SOFTMAX_SCALE;
-        float ds1 = __fmaf_rn(p1_drop, dov1, -p1_orig * dot1) * SOFTMAX_SCALE;
+        float ds0 = __fmaf_rn(pd0, sdOV.x, -p0 * dot) * SOFTMAX_SCALE;
+        float ds1 = __fmaf_rn(pd1, sdOV.y, -p1 * dot) * SOFTMAX_SCALE;
+        float ds2 = __fmaf_rn(pd2, sdOV.z, -p2 * dot) * SOFTMAX_SCALE;
+        float ds3 = __fmaf_rn(pd3, sdOV.w, -p3 * dot) * SOFTMAX_SCALE;
 
         if constexpr (IS_SOFTCAP) {
-            if (s0 > NEG_INF) { float s0_norm = __fmul_rn(s0, softcap_inv); ds0 = __fmul_rn(ds0, __fmaf_rn(-s0_norm, s0_norm, 1.0f)); }
-            if (s1 > NEG_INF) { float s1_norm = __fmul_rn(s1, softcap_inv); ds1 = __fmul_rn(ds1, __fmaf_rn(-s1_norm, s1_norm, 1.0f)); }
+            if (sS.x > NEG_INF) { const float n = __fmul_rn(sS.x, softcap_inv); ds0 = __fmul_rn(ds0, __fmaf_rn(-n, n, 1.0f)); }
+            if (sS.y > NEG_INF) { const float n = __fmul_rn(sS.y, softcap_inv); ds1 = __fmul_rn(ds1, __fmaf_rn(-n, n, 1.0f)); }
+            if (sS.z > NEG_INF) { const float n = __fmul_rn(sS.z, softcap_inv); ds2 = __fmul_rn(ds2, __fmaf_rn(-n, n, 1.0f)); }
+            if (sS.w > NEG_INF) { const float n = __fmul_rn(sS.w, softcap_inv); ds3 = __fmul_rn(ds3, __fmaf_rn(-n, n, 1.0f)); }
         }
 
-        const int ldo0 = row0 * SMEM_LDO_STRIDE + col0;
-        const int ldo1 = has_pair ? (row1 * SMEM_LDO_STRIDE + col1) : 0;
-
         if constexpr (!PHASE) {
-            if (prev_ldo0 >= 0) {
-                const int  p_ldo1 = prev_aux & 0xFFFF;
-                const bool p_has  = (prev_aux >> 16) & 1;
-                const bool vec    = p_has && ((prev_ldo0 & 1) == 0);
-
-                uint32_t addr_ds0 = __cvta_generic_to_shared(SMEM_DS + prev_ldo0);
-                uint32_t addr_ds1 = p_has ? __cvta_generic_to_shared(SMEM_DS + p_ldo1) : 0;
-
-                if (vec) {
-                    if ((addr_ds0 & 0x3) == 0) {
-                        st_half2(addr_ds0, prev_ds, prev_row0);
-                    } else {
-                        st_half(addr_ds0, prev_ds.x, prev_row0);
-                        if (p_has) {
-                            st_half(addr_ds1, prev_ds.y, prev_row1);
-                        }
-                    }
-                } else {
-                    st_half(addr_ds0, prev_ds.x, prev_row0);
-                    if (p_has) {
-                        st_half(addr_ds1, prev_ds.y, prev_row1);
-                    }
-                }
+            if (prev_has) {
+                const uint32_t sDS_base = __cvta_generic_to_shared(SMEM_DS + prev_row * SMEM_LDO_STRIDE);
+                const uint32_t addr  = sDS_base + prev_col * 2;
+                st_half4(addr, __float22half2_rn(make_float2(prev_ds.x, prev_ds.y)), __float22half2_rn(make_float2(prev_ds.z, prev_ds.w)), prev_row);
             }
-
-            prev_ds   = __float22half2_rn(make_float2(ds0, ds1));
-            prev_ldo0 = ldo0;
-            prev_aux  = (static_cast<uint32_t>(ldo1) & 0xFFFF) | (static_cast<uint32_t>(has_pair) << 16);
-            prev_row0 = row0;
-            prev_row1 = row1;
-
+            prev_ds  = make_float4(ds0, ds1, ds2, ds3);
+            prev_row = row;
+            prev_col = col;
+            prev_has = true;
         } else {
-            const __half2 h2_ds = __float22half2_rn(make_float2(ds0, ds1));
-            const __half2 h2_p  = __float22half2_rn(make_float2(p0_drop, p1_drop));
+            const uint32_t sDS_base = __cvta_generic_to_shared(SMEM_DS + row * SMEM_LDO_STRIDE);
+            const uint32_t sP_base  = __cvta_generic_to_shared(SMEM_P  + row * SMEM_LDO_STRIDE);
+            const uint32_t addr_ds  = sDS_base + col * 2;
+            const uint32_t addr_p   = sP_base  + col * 2;
 
-            uint32_t addr_ds0 = __cvta_generic_to_shared(SMEM_DS + ldo0);
-            uint32_t addr_p0  = __cvta_generic_to_shared(SMEM_P  + ldo0);
-
-            const bool vec = has_pair && (row1 == row0) && ((ldo0 & 1) == 0);
-
-            if (vec) {
-                if (((addr_ds0 & 0x3) == 0) && ((addr_p0 & 0x3) == 0)) {
-                    st_half2(addr_ds0, h2_ds, row0);
-                    st_half2(addr_p0,  h2_p,  row0);
-                    continue;
-                }
-            }
-
-            st_half(addr_ds0, h2_ds.x, row0);
-            st_half(addr_p0,  h2_p.x,  row0);
-
-            if (has_pair) {
-                uint32_t addr_ds1 = __cvta_generic_to_shared(SMEM_DS + ldo1);
-                uint32_t addr_p1  = __cvta_generic_to_shared(SMEM_P  + ldo1);
-                st_half(addr_ds1, h2_ds.y, row1);
-                st_half(addr_p1,  h2_p.y,  row1);
-            }
+            st_half4(addr_ds, __float22half2_rn(make_float2(ds0, ds1)), __float22half2_rn(make_float2(ds2, ds3)), row);
+            st_half4(addr_p,  __float22half2_rn(make_float2(pd0, pd1)), __float22half2_rn(make_float2(pd2, pd3)), row);
         }
     }
 
     if constexpr (!PHASE) {
-        if (prev_ldo0 >= 0) {
-            const int  p_ldo1 = prev_aux & 0xFFFF;
-            const bool p_has  = (prev_aux >> 16) & 1;
-            const bool vec    = p_has && ((prev_ldo0 & 1) == 0);
-
-            uint32_t addr_ds0 = __cvta_generic_to_shared(SMEM_DS + prev_ldo0);
-            uint32_t addr_ds1 = p_has ? __cvta_generic_to_shared(SMEM_DS + p_ldo1) : 0;
-
-            if (vec) {
-                if ((addr_ds0 & 0x3) == 0) {
-                    st_half2(addr_ds0, prev_ds, prev_row0);
-                } else {
-                    st_half(addr_ds0, prev_ds.x, prev_row0);
-                    if (p_has) {
-                        st_half(addr_ds1, prev_ds.y, prev_row1);
-                    }
-                }
-            } else {
-                st_half(addr_ds0, prev_ds.x, prev_row0);
-                if (p_has) {
-                    st_half(addr_ds1, prev_ds.y, prev_row1);
-                }
-            }
+        if (prev_has) {
+            const uint32_t sDS_base = __cvta_generic_to_shared(SMEM_DS + prev_row * SMEM_LDO_STRIDE);
+            const uint32_t addr  = sDS_base + prev_col * 2;
+            st_half4(addr, __float22half2_rn(make_float2(prev_ds.x, prev_ds.y)), __float22half2_rn(make_float2(prev_ds.z, prev_ds.w)), prev_row);
         }
     }
 }

@@ -156,11 +156,8 @@ flash_attention_kvcache_kernel(
     // ==================================================================================
     extern __shared__ char smem_raw[];
 
-    WMMA_GEMM_INIT_SMEM<Config>(smem_raw);
-
-    __syncthreads();
-
     auto& smem = *reinterpret_cast<typename Config::SmemLayout*>(smem_raw);
+
     __half* __restrict__ sQ      = smem.phase.fdo.q;
     __half* __restrict__ sK      = smem.phase.fdo.reuse_kv.k;
     __half* __restrict__ sV      = smem.phase.fdo.reuse_kv.v;
@@ -170,9 +167,10 @@ flash_attention_kvcache_kernel(
     float*  __restrict__ sRowSum = smem.row_sum;
     float*  __restrict__ sO      = smem.phase.fdo.o;
 
-    if (tid < BLOCK_M) {
-        sRowMax[tid] = NEG_INF;
-    }
+    WMMA_GEMM_INIT_SMEM<Config>(smem_raw);
+    __syncthreads();
+    WMMA_GEMM_INIT_SMEM<Config>(smem.row_max, NEG_INF);
+    __syncthreads();
 
     // ==================================================================================
     // Load Q tile + Rotary
@@ -269,7 +267,7 @@ flash_attention_kvcache_kernel(
         // Layout:   sP[valid_q_rows, N_STRIDE] @ sV[valid_kv_rows, D_STRIDE] += sO
         // Template: BLOCK_M/BLOCK_N static, valid_q/valid_kv dynamic (varlen ragged tiles)
         // ==============================================================================
-        WMMA_GEMM_GRADIENTS<Config, GemmType::dO_PV, D, BLOCK_M, BLOCK_N, N_STRIDE, D_STRIDE>(
+        WMMA_GEMM_GRADIENTS<Config, GemmType::dO_PV, D, BLOCK_M, BLOCK_N, N_STRIDE * 2, D_STRIDE>(
           sP, sV, sO,
           block.valid_q_rows, valid_kv_rows,
           warp_id, lane_id);

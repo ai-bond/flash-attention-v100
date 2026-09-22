@@ -1,10 +1,15 @@
+// ======================================================================================
+// * Copyright (c) 2026, D.Skryabin / tg @ai_bond007 SPDX-License: BSD-3-Clause
+// ======================================================================================
 // Accumulator store row_major dump
+// ======================================================================================
 #include <cuda_fp16.h>
 #include <cstdint>
 #include <cstdio>
 
 #ifdef USE_VOLTA_MMA
     #include "mma_m16n16k16.h"
+    #include "swizzle.h"
     using namespace volta;
 #else
     #include <mma.h>
@@ -25,8 +30,15 @@ __global__ void dump_acc_store_regs(
 
     __shared__ float smem_C[256];
 
+    // ---- load input matrix into smem_C[0..255] (row_major) via swizzle ----
     for (int i = threadIdx.x; i < 256; i += 32) {
+#ifdef USE_VOLTA_MMA
+        int row = i / 16;
+        unsigned b = __cvta_generic_to_shared(smem_C) + i * 4;
+        st_float(b, C_in[i], row);
+#else
         smem_C[i] = C_in[i];
+#endif
     }
     __syncthreads();
 
@@ -48,11 +60,20 @@ __global__ void dump_acc_store_regs(
         reg_dump_before[threadIdx.x * 8 + i] = smem_dump[threadIdx.x * 8 + i];
     }
 
+    // ---- store acc_frag back into the same swizzled smem_C[0..255] ----
+    //      (library's store_matrix_sync is assumed to apply the same swizzle)
     wmma::store_matrix_sync(smem_C + 0, acc_frag, 16, wmma::mem_row_major);
     __syncthreads();
 
+    // ---- readout smem_C[0..255] via ld_float (inverse of st_float swizzle) ----
     for (int i = threadIdx.x; i < 256; i += 32) {
+#ifdef USE_VOLTA_MMA
+        int row = i / 16;
+        unsigned b = __cvta_generic_to_shared(smem_C) + i * 4;
+        C_out[i] = ld_float(b, row);
+#else
         C_out[i] = smem_C[i];
+#endif
     }
 }
 

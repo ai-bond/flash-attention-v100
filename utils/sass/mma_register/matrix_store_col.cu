@@ -1,10 +1,15 @@
+// ======================================================================================
+// * Copyright (c) 2026, D.Skryabin / tg @ai_bond007 SPDX-License: BSD-3-Clause
+// ======================================================================================
 // Accumulator store col_major dump
+// ======================================================================================
 #include <cuda_fp16.h>
 #include <cstdint>
 #include <cstdio>
 
 #ifdef USE_VOLTA_MMA
     #include "mma_m16n16k16.h"
+    #include "swizzle.h"
     using namespace volta;
 #else
     #include <mma.h>
@@ -24,8 +29,15 @@ __global__ void dump_acc_store_col_regs(
 
     __shared__ float smem_C[512];
 
+    // ---- load input matrix into smem_C[0..255] (col_major) ----
     for (int i = threadIdx.x; i < 256; i += 32) {
+#ifdef USE_VOLTA_MMA
+        int row = i / 16;
+        unsigned b = __cvta_generic_to_shared(smem_C) + i * 4;
+        st_float(b, C_in[i], row);
+#else
         smem_C[i] = C_in[i];
+#endif
     }
     __syncthreads();
 
@@ -47,16 +59,31 @@ __global__ void dump_acc_store_col_regs(
         reg_dump_before[threadIdx.x * 8 + i] = smem_dump[threadIdx.x * 8 + i];
     }
 
+    // ---- prefill store target smem_C[256..511] with -1.0f via swizzle ----
     for (int i = threadIdx.x; i < 256; i += 32) {
+#ifdef USE_VOLTA_MMA
+        int row = (256 + i) / 16;   // = 16 + i/16 -> same swizzle mask as row i/16
+        unsigned b = __cvta_generic_to_shared(smem_C) + (256 + i) * 4;
+        st_float(b, -1.0f, row);
+#else
         smem_C[256 + i] = -1.0f;
+#endif
     }
     __syncthreads();
 
+    // ---- store acc_frag into swizzled smem_C[256..511] ----
     wmma::store_matrix_sync(smem_C + 256, acc_frag, 16, wmma::mem_col_major);
     __syncthreads();
 
+    // ---- readout smem_C[256..511] via ld_float (inverse of st_float swizzle) ----
     for (int i = threadIdx.x; i < 256; i += 32) {
+#ifdef USE_VOLTA_MMA
+        int row = (256 + i) / 16;
+        unsigned b = __cvta_generic_to_shared(smem_C) + (256 + i) * 4;
+        C_out[i] = ld_float(b, row);
+#else
         C_out[i] = smem_C[256 + i];
+#endif
     }
 }
 
