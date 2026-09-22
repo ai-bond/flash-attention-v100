@@ -185,13 +185,15 @@ __device__ __forceinline__ void WMMA_GEMM_SOFTMAX(
 
 // ======================================================================================
 // WMMA_GEMM_SOFTMAX_GRADIENT: Recompute P & dS for backward pass
+// ======================================================================================
 // FA2 MATH: P_orig = exp(S - lse)
 //           P_drop = P_orig * mask / (1-p)
 //           dS     = (P_drop * dOV - P_orig * D) * softmax_scale
-//           if softcap: dS *= (1 - (S/c)^2)  [S is already softcapped]
-// SWIZZLE:  S/dOV read via ld_float(addr, row). P/dS stored via st_half/st_half2(row).
-//           Phase 1 (dQ):  load_matrix_sync(row_major) -> swizzle by r_base=row
-//           Phase 2 (dKV): load_matrix_sync(col_major) -> swizzle by c_base=row
+//           if softcap: dS *= (1 - (S/c)^2)   [FMA form]
+//
+// LAYOUT:   S [float], dOV[float] row-major, stride SMEM_LDS_STRIDE (floats)
+//           P [half ], dS [half ] row-major, stride SMEM_LDO_STRIDE (halves)
+//           sS[row,k]             sP[row,2k],sP[row,2k+1]
 // ======================================================================================
 template<typename Config, GemmType TYPE, bool IS_SOFTCAP, bool IS_DROPOUT, int SMEM_LDS_STRIDE, int SMEM_LDO_STRIDE, int TILE_X, int TILE_Y>
 __device__ __forceinline__ void WMMA_GEMM_SOFTMAX_GRADIENT(
@@ -208,180 +210,110 @@ __device__ __forceinline__ void WMMA_GEMM_SOFTMAX_GRADIENT(
     float    P_DROPOUT,
     uint64_t DROPOUT_SEED,
     uint64_t DROPOUT_OFFSET,
-    int GLOBAL_ROW_OFFSET,
-    int GLOBAL_COL_OFFSET,
-    int GLOBAL_N,
-    int THREAD_ID
+    int      GLOBAL_ROW_OFFSET,
+    int      GLOBAL_COL_OFFSET,
+    int      GLOBAL_N,
+    int      THREAD_ID
 ) {
-    constexpr int  TOTAL_ELEMENTS    = TILE_X * TILE_Y;
-    constexpr int  TOTAL_PAIRS       = (TOTAL_ELEMENTS + 1) >> 1;
     constexpr bool PHASE             = static_cast<uint8_t>(TYPE) & 0x1;
     constexpr int  THREADS_PER_BLOCK = Config::THREADS_PER_BLOCK;
 
-    const float softcap_inv = IS_SOFTCAP ? (1.0f / SOFTCAP) : 0.0f;
-    const float rp_dropout  = IS_DROPOUT ? (1.0f / (1.0f - P_DROPOUT)) : 1.0f;
-    const uint32_t drop_thr = IS_DROPOUT ? static_cast<uint32_t>((1.0f - P_DROPOUT) * 4294967295.0f) : 0;
+    const float    softcap_inv = IS_SOFTCAP ? (1.0f / SOFTCAP) : 0.0f;
+    const float    rp_dropout  = IS_DROPOUT ? (1.0f / (1.0f - P_DROPOUT)) : 1.0f;
+    const uint32_t drop_thr    = IS_DROPOUT ? static_cast<uint32_t>((1.0f - P_DROPOUT) * 4294967295.0f) : 0u;
 
-    __half2  prev_ds = __float22half2_rn(make_float2(0.0f, 0.0f));
-    int      prev_ldo0 = -1;
-    uint32_t prev_aux  =  0;
-    int      prev_row0 = -1;
-    int      prev_row1 = -1;
+    float4  prev_ds  = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    int     prev_row  = -1;
+    int     prev_col  =  0;
+    bool    prev_has  = false;
 
     #pragma unroll 1
-    for (int i = THREAD_ID; i < TOTAL_PAIRS; i += THREADS_PER_BLOCK) {
-        const int idx0 = i << 1;
-        const int idx1 = idx0 + 1;
-        const int row0 = idx0 / TILE_Y;
-        const int col0 = idx0 % TILE_Y;
-        const bool has_pair = (idx1 < TOTAL_ELEMENTS);
-        const int row1 = has_pair ? (idx1 / TILE_Y) : row0;
-        const int col1 = has_pair ? (idx1 % TILE_Y) : (col0 + 1);
+    for (int i = THREAD_ID; i < (TILE_X * TILE_Y >> 2); i += THREADS_PER_BLOCK) {
+        const int idx = i << 2;
+        const int row = idx / TILE_Y;
+        const int col = idx % TILE_Y;
 
-        const bool in0 = (row0 < VALID_Q_ROWS) && (col0 < VALID_KV_ROWS);
-        const bool in1 = has_pair && (row1 < VALID_Q_ROWS) && (col1 < VALID_KV_ROWS);
+        const bool is_valid = (row < VALID_Q_ROWS);
+        const bool in0      = is_valid && (col       < VALID_KV_ROWS);
+        const bool in1      = is_valid && ((col + 1) < VALID_KV_ROWS);
+        const bool in2      = is_valid && ((col + 2) < VALID_KV_ROWS);
+        const bool in3      = is_valid && ((col + 3) < VALID_KV_ROWS);
 
-        const float lse0 = (row0 < VALID_Q_ROWS) ? SMEM_LSE[row0] : 0.0f;
-        const float lse1 = (row1 < VALID_Q_ROWS) ? SMEM_LSE[row1] : lse0;
-        const float dot0 = (row0 < VALID_Q_ROWS) ? SMEM_DOT[row0] : 0.0f;
-        const float dot1 = (row1 < VALID_Q_ROWS) ? SMEM_DOT[row1] : dot0;
+        const float lse = is_valid ? SMEM_LSE[row] : 0.0f;
+        const float dot = is_valid ? SMEM_DOT[row] : 0.0f;
 
-        const int lds0 = row0 * SMEM_LDS_STRIDE + col0;
-        const int lds1 = has_pair ? (row1 * SMEM_LDS_STRIDE + col1) : 0;
+        float4 sS, sdOV;
 
-        uint32_t addr_s0   = __cvta_generic_to_shared(SMEM_S + lds0);
-        uint32_t addr_s1   = __cvta_generic_to_shared(SMEM_S + lds1);
-        uint32_t addr_dov0 = __cvta_generic_to_shared(SMEM_DOV + lds0);
-        uint32_t addr_dov1 = __cvta_generic_to_shared(SMEM_DOV + lds1);
+        if (is_valid) {
+            const uint32_t sS_base   = __cvta_generic_to_shared(SMEM_S   + row * SMEM_LDS_STRIDE);
+            const uint32_t sDOV_base = __cvta_generic_to_shared(SMEM_DOV + row * SMEM_LDS_STRIDE);
+            sS   = ld_float4(sS_base   + col * 4, row);
+            sdOV = ld_float4(sDOV_base + col * 4, row);
+        } else {
+            sS   = make_float4(NEG_INF, NEG_INF, NEG_INF, NEG_INF);
+            sdOV = make_float4(0.0f,    0.0f,    0.0f,    0.0f);
+        }
 
-        float s0 = in0 ? ld_float(addr_s0, row0) : NEG_INF;
-        float s1 = in1 ? ld_float(addr_s1, row1) : NEG_INF;
+        if (!in0) { sS.x = NEG_INF; sdOV.x = 0.0f; }
+        if (!in1) { sS.y = NEG_INF; sdOV.y = 0.0f; }
+        if (!in2) { sS.z = NEG_INF; sdOV.z = 0.0f; }
+        if (!in3) { sS.w = NEG_INF; sdOV.w = 0.0f; }
 
-        float dov0 = (s0 != NEG_INF) ? ld_float(addr_dov0, row0) : 0.0f;
-        float dov1 = (s1 != NEG_INF) ? ld_float(addr_dov1, row1) : 0.0f;
+        float p0 = (sS.x == NEG_INF || (sS.x - lse) < -80.0f) ? 0.0f : __expf(sS.x - lse);
+        float p1 = (sS.y == NEG_INF || (sS.y - lse) < -80.0f) ? 0.0f : __expf(sS.y - lse);
+        float p2 = (sS.z == NEG_INF || (sS.z - lse) < -80.0f) ? 0.0f : __expf(sS.z - lse);
+        float p3 = (sS.w == NEG_INF || (sS.w - lse) < -80.0f) ? 0.0f : __expf(sS.w - lse);
 
-        float sh0 = s0 - lse0;
-        float sh1 = s1 - lse1;
-
-        float p0_orig = (s0 == NEG_INF || sh0 < -80.0f) ? 0.0f : __expf(sh0);
-        float p1_orig = (s1 == NEG_INF || sh1 < -80.0f) ? 0.0f : __expf(sh1);
-
-        float p0_drop = p0_orig;
-        float p1_drop = p1_orig;
+        float pd0 = p0, pd1 = p1, pd2 = p2, pd3 = p3;
 
         if constexpr (IS_DROPOUT) {
-            if (in0) {
-                uint64_t flat_idx0 = static_cast<uint64_t>(GLOBAL_ROW_OFFSET + row0) * GLOBAL_N + (GLOBAL_COL_OFFSET + col0);
-                PhiloxState philox0 = init_philox(DROPOUT_SEED, DROPOUT_OFFSET + (flat_idx0 >> 2));
-                uint4 rng0 = philox0.next();
-                uint32_t r0 = (flat_idx0 & 3) == 0 ? rng0.x : (flat_idx0 & 3) == 1 ? rng0.y : (flat_idx0 & 3) == 2 ? rng0.z : rng0.w;
-                p0_drop = (r0 <= drop_thr) ? (p0_orig * rp_dropout) : 0.0f;
-            }
-            if (in1) {
-                uint64_t flat_idx1 = static_cast<uint64_t>(GLOBAL_ROW_OFFSET + row1) * GLOBAL_N + (GLOBAL_COL_OFFSET + col1);
-                PhiloxState philox1 = init_philox(DROPOUT_SEED, DROPOUT_OFFSET + (flat_idx1 >> 2));
-                uint4 rng1 = philox1.next();
-                uint32_t r1 = (flat_idx1 & 3) == 0 ? rng1.x : (flat_idx1 & 3) == 1 ? rng1.y : (flat_idx1 & 3) == 2 ? rng1.z : rng1.w;
-                p1_drop = (r1 <= drop_thr) ? (p1_orig * rp_dropout) : 0.0f;
-            }
+            const uint64_t addr_plx = static_cast<uint64_t>(GLOBAL_ROW_OFFSET + row) * GLOBAL_N + (GLOBAL_COL_OFFSET + col);
+            const uint4         rng = init_philox(DROPOUT_SEED, DROPOUT_OFFSET + (addr_plx >> 2)).next();
+
+            if (in0) pd0 = (rng.x <= drop_thr) ? (p0 * rp_dropout) : 0.0f;
+            if (in1) pd1 = (rng.y <= drop_thr) ? (p1 * rp_dropout) : 0.0f;
+            if (in2) pd2 = (rng.z <= drop_thr) ? (p2 * rp_dropout) : 0.0f;
+            if (in3) pd3 = (rng.w <= drop_thr) ? (p3 * rp_dropout) : 0.0f;
         }
 
-        float ds0 = __fmaf_rn(p0_drop, dov0, -p0_orig * dot0) * SOFTMAX_SCALE;
-        float ds1 = __fmaf_rn(p1_drop, dov1, -p1_orig * dot1) * SOFTMAX_SCALE;
+        float ds0 = __fmaf_rn(pd0, sdOV.x, -p0 * dot) * SOFTMAX_SCALE;
+        float ds1 = __fmaf_rn(pd1, sdOV.y, -p1 * dot) * SOFTMAX_SCALE;
+        float ds2 = __fmaf_rn(pd2, sdOV.z, -p2 * dot) * SOFTMAX_SCALE;
+        float ds3 = __fmaf_rn(pd3, sdOV.w, -p3 * dot) * SOFTMAX_SCALE;
 
         if constexpr (IS_SOFTCAP) {
-            if (s0 > NEG_INF) { float s0_norm = __fmul_rn(s0, softcap_inv); ds0 = __fmul_rn(ds0, __fmaf_rn(-s0_norm, s0_norm, 1.0f)); }
-            if (s1 > NEG_INF) { float s1_norm = __fmul_rn(s1, softcap_inv); ds1 = __fmul_rn(ds1, __fmaf_rn(-s1_norm, s1_norm, 1.0f)); }
+            if (sS.x > NEG_INF) { const float n = __fmul_rn(sS.x, softcap_inv); ds0 = __fmul_rn(ds0, __fmaf_rn(-n, n, 1.0f)); }
+            if (sS.y > NEG_INF) { const float n = __fmul_rn(sS.y, softcap_inv); ds1 = __fmul_rn(ds1, __fmaf_rn(-n, n, 1.0f)); }
+            if (sS.z > NEG_INF) { const float n = __fmul_rn(sS.z, softcap_inv); ds2 = __fmul_rn(ds2, __fmaf_rn(-n, n, 1.0f)); }
+            if (sS.w > NEG_INF) { const float n = __fmul_rn(sS.w, softcap_inv); ds3 = __fmul_rn(ds3, __fmaf_rn(-n, n, 1.0f)); }
         }
 
-        const int ldo0 = row0 * SMEM_LDO_STRIDE + col0;
-        const int ldo1 = has_pair ? (row1 * SMEM_LDO_STRIDE + col1) : 0;
-
         if constexpr (!PHASE) {
-            if (prev_ldo0 >= 0) {
-                const int  p_ldo1 = prev_aux & 0xFFFF;
-                const bool p_has  = (prev_aux >> 16) & 1;
-                const bool vec    = p_has && ((prev_ldo0 & 1) == 0);
-
-                uint32_t addr_ds0 = __cvta_generic_to_shared(SMEM_DS + prev_ldo0);
-                uint32_t addr_ds1 = p_has ? __cvta_generic_to_shared(SMEM_DS + p_ldo1) : 0;
-
-                if (vec) {
-                    if ((addr_ds0 & 0x3) == 0) {
-                        st_half2(addr_ds0, prev_ds, prev_row0);
-                    } else {
-                        st_half(addr_ds0, prev_ds.x, prev_row0);
-                        if (p_has) {
-                            st_half(addr_ds1, prev_ds.y, prev_row1);
-                        }
-                    }
-                } else {
-                    st_half(addr_ds0, prev_ds.x, prev_row0);
-                    if (p_has) {
-                        st_half(addr_ds1, prev_ds.y, prev_row1);
-                    }
-                }
+            if (prev_has) {
+                const uint32_t sDS_base = __cvta_generic_to_shared(SMEM_DS + prev_row * SMEM_LDO_STRIDE);
+                const uint32_t addr  = sDS_base + prev_col * 2;
+                st_half4(addr, __float22half2_rn(make_float2(prev_ds.x, prev_ds.y)), __float22half2_rn(make_float2(prev_ds.z, prev_ds.w)), prev_row);
             }
-
-            prev_ds   = __float22half2_rn(make_float2(ds0, ds1));
-            prev_ldo0 = ldo0;
-            prev_aux  = (static_cast<uint32_t>(ldo1) & 0xFFFF) | (static_cast<uint32_t>(has_pair) << 16);
-            prev_row0 = row0;
-            prev_row1 = row1;
-
+            prev_ds  = make_float4(ds0, ds1, ds2, ds3);
+            prev_row = row;
+            prev_col = col;
+            prev_has = true;
         } else {
-            const __half2 h2_ds = __float22half2_rn(make_float2(ds0, ds1));
-            const __half2 h2_p  = __float22half2_rn(make_float2(p0_drop, p1_drop));
+            const uint32_t sDS_base = __cvta_generic_to_shared(SMEM_DS + row * SMEM_LDO_STRIDE);
+            const uint32_t sP_base  = __cvta_generic_to_shared(SMEM_P  + row * SMEM_LDO_STRIDE);
+            const uint32_t addr_ds  = sDS_base + col * 2;
+            const uint32_t addr_p   = sP_base  + col * 2;
 
-            uint32_t addr_ds0 = __cvta_generic_to_shared(SMEM_DS + ldo0);
-            uint32_t addr_p0  = __cvta_generic_to_shared(SMEM_P  + ldo0);
-
-            const bool vec = has_pair && (row1 == row0) && ((ldo0 & 1) == 0);
-
-            if (vec) {
-                if (((addr_ds0 & 0x3) == 0) && ((addr_p0 & 0x3) == 0)) {
-                    st_half2(addr_ds0, h2_ds, row0);
-                    st_half2(addr_p0,  h2_p,  row0);
-                    continue;
-                }
-            }
-
-            st_half(addr_ds0, h2_ds.x, row0);
-            st_half(addr_p0,  h2_p.x,  row0);
-
-            if (has_pair) {
-                uint32_t addr_ds1 = __cvta_generic_to_shared(SMEM_DS + ldo1);
-                uint32_t addr_p1  = __cvta_generic_to_shared(SMEM_P  + ldo1);
-                st_half(addr_ds1, h2_ds.y, row1);
-                st_half(addr_p1,  h2_p.y,  row1);
-            }
+            st_half4(addr_ds, __float22half2_rn(make_float2(ds0, ds1)), __float22half2_rn(make_float2(ds2, ds3)), row);
+            st_half4(addr_p,  __float22half2_rn(make_float2(pd0, pd1)), __float22half2_rn(make_float2(pd2, pd3)), row);
         }
     }
 
     if constexpr (!PHASE) {
-        if (prev_ldo0 >= 0) {
-            const int  p_ldo1 = prev_aux & 0xFFFF;
-            const bool p_has  = (prev_aux >> 16) & 1;
-            const bool vec    = p_has && ((prev_ldo0 & 1) == 0);
-
-            uint32_t addr_ds0 = __cvta_generic_to_shared(SMEM_DS + prev_ldo0);
-            uint32_t addr_ds1 = p_has ? __cvta_generic_to_shared(SMEM_DS + p_ldo1) : 0;
-
-            if (vec) {
-                if ((addr_ds0 & 0x3) == 0) {
-                    st_half2(addr_ds0, prev_ds, prev_row0);
-                } else {
-                    st_half(addr_ds0, prev_ds.x, prev_row0);
-                    if (p_has) {
-                        st_half(addr_ds1, prev_ds.y, prev_row1);
-                    }
-                }
-            } else {
-                st_half(addr_ds0, prev_ds.x, prev_row0);
-                if (p_has) {
-                    st_half(addr_ds1, prev_ds.y, prev_row1);
-                }
-            }
+        if (prev_has) {
+            const uint32_t sDS_base = __cvta_generic_to_shared(SMEM_DS + prev_row * SMEM_LDO_STRIDE);
+            const uint32_t addr  = sDS_base + prev_col * 2;
+            st_half4(addr, __float22half2_rn(make_float2(prev_ds.x, prev_ds.y)), __float22half2_rn(make_float2(prev_ds.z, prev_ds.w)), prev_row);
         }
     }
 }

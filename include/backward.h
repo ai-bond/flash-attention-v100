@@ -73,7 +73,7 @@ struct KernelConfig {
                     alignas(16) float  s  [ DQ::BLOCK_M * DQ::N_STRIDE ];
                 union {
                     alignas(16) float  dOV[ DQ::BLOCK_M * DQ::N_STRIDE ];
-                    alignas(16) __half dS [ DQ::BLOCK_M * DQ::N_STRIDE ];
+                    alignas(16) __half dS [ DQ::BLOCK_M * DQ::N_STRIDE * 2];
                 } reuse_sdOVS;
                     alignas(16) float  dQ [ DQ::BLOCK_M * DQ::D_STRIDE ];
             } bdq;
@@ -87,11 +87,11 @@ struct KernelConfig {
                 } reuse_qdO;
                 union {
                     alignas(16) float  s [ DKV::BLOCK_N * DKV::M_STRIDE ];
-                    alignas(16) __half p [ DKV::BLOCK_N * DKV::BLOCK_M ];
+                    alignas(16) __half p [ DKV::BLOCK_N * DKV::M_STRIDE * 2];
                 } reuse_sp;
                 union {
                     alignas(16) float  dOV[ DKV::BLOCK_N * DKV::M_STRIDE ];
-                    alignas(16) __half dS [ DKV::BLOCK_N * DKV::BLOCK_M ];
+                    alignas(16) __half dS [ DKV::BLOCK_N * DKV::M_STRIDE * 2];
                 } reuse_dOVS;
                     alignas(16) float dK[ DKV::BLOCK_M * DKV::D_STRIDE ];
                     alignas(16) float dV[ DKV::BLOCK_M * DKV::D_STRIDE ];

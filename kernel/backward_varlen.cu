@@ -251,7 +251,7 @@ flash_attention_backward_varlen_kernel(
             // Varlen:   GLOBAL_N=block.seqlen_k (actual KV length) for correct dropout RNG stride
             // Template: IS_DROPOUT guards compile-time; runtime p_dropout > 0 enables execution
             // ======================================================================================
-            WMMA_GEMM_SOFTMAX_GRADIENT<Config, GemmType::compute_dS, IS_SOFTCAP, IS_DROPOUT, N_STRIDE, N_STRIDE, BLOCK_M, BLOCK_N>(
+            WMMA_GEMM_SOFTMAX_GRADIENT<Config, GemmType::compute_dS, IS_SOFTCAP, IS_DROPOUT, N_STRIDE, N_STRIDE * 2, BLOCK_M, BLOCK_N>(
               sS, sdOV, sLse, sRowDot, nullptr, sdS,
               block.valid_q_rows, valid_kv_rows,
               softmax_scale, softcap,
@@ -265,7 +265,7 @@ flash_attention_backward_varlen_kernel(
             // Layout:   sdS[valid_q_rows, N_STRIDE] @ sK[valid_kv_rows, D_STRIDE] += sdQ
             // Template: BLOCK_M/BLOCK_N static, valid_q/valid_kv dynamic (varlen ragged tiles)
             // ======================================================================================
-            WMMA_GEMM_GRADIENTS<Config, GemmType::dQ_dSK, D, BLOCK_M, BLOCK_N, N_STRIDE, D_STRIDE>(
+            WMMA_GEMM_GRADIENTS<Config, GemmType::dQ_dSK, D, BLOCK_M, BLOCK_N, N_STRIDE * 2, D_STRIDE>(
               sdS, sK, sdQ,
               block.valid_q_rows, valid_kv_rows,
               warp_id, lane_id);
@@ -375,10 +375,6 @@ flash_attention_backward_varlen_kernel(
         // ======================================================================================
         extern __shared__ char smem_raw[];
 
-        WMMA_GEMM_INIT_SMEM<Config>(smem_raw);
-
-        __syncthreads();
-
         auto& smem = *reinterpret_cast<typename Config::SmemLayout*>(smem_raw);
 
         __half* __restrict__ sQ      = smem.phase.bdkv.reuse_qdO.q;
@@ -393,6 +389,9 @@ flash_attention_backward_varlen_kernel(
         float*  __restrict__ sLse    = smem.lse;
         float*  __restrict__ sdK     = smem.phase.bdkv.dK;
         float*  __restrict__ sdV     = smem.phase.bdkv.dV;
+
+        WMMA_GEMM_INIT_SMEM<Config>(smem_raw);
+        __syncthreads();
 
         // ======================================================================================
         // Load:     K & V tiles from global to sK/sV shared memory
@@ -483,7 +482,7 @@ flash_attention_backward_varlen_kernel(
             // Varlen:   GLOBAL_N=block.seqlen_k for correct dropout RNG stride
             // Template: IS_DROPOUT guards compile-time; runtime p_dropout > 0 enables execution
             // ======================================================================================
-            WMMA_GEMM_SOFTMAX_GRADIENT<Config, GemmType::compute_P_dS, IS_SOFTCAP, IS_DROPOUT, M_STRIDE, BLOCK_M, BLOCK_N, BLOCK_M>(
+            WMMA_GEMM_SOFTMAX_GRADIENT<Config, GemmType::compute_P_dS, IS_SOFTCAP, IS_DROPOUT, M_STRIDE, M_STRIDE * 2, BLOCK_N, BLOCK_M>(
               sS, sdOV, sLse, sRowDot, sP, sdS,
               valid_q_rows, block.valid_kv_rows,
               softmax_scale, softcap,
@@ -497,7 +496,7 @@ flash_attention_backward_varlen_kernel(
             // Layout:   sP^T[valid_kv_rows, M_STRIDE] @ sdO[valid_q_rows, D_STRIDE] += sdV
             // Template: BLOCK_M/BLOCK_N static, valid_kv/valid_q dynamic (varlen ragged tiles)
             // ======================================================================================
-            WMMA_GEMM_GRADIENTS<Config, GemmType::dV_PTdO, D, BLOCK_M, BLOCK_N, BLOCK_M, D_STRIDE>(
+            WMMA_GEMM_GRADIENTS<Config, GemmType::dV_PTdO, D, BLOCK_M, BLOCK_N, M_STRIDE * 2, D_STRIDE>(
               sP, sdO, sdV,
               block.valid_kv_rows, valid_q_rows,
               warp_id, lane_id);
@@ -519,7 +518,7 @@ flash_attention_backward_varlen_kernel(
             // Layout:   sdS^T[valid_kv_rows, M_STRIDE] @ sQ[valid_q_rows, D_STRIDE] += sdK
             // Template: BLOCK_M/BLOCK_N static, valid_kv/valid_q dynamic (varlen ragged tiles)
             // ======================================================================================
-            WMMA_GEMM_GRADIENTS<Config, GemmType::dK_dSTQ, D, BLOCK_M, BLOCK_N, BLOCK_M, D_STRIDE>(
+            WMMA_GEMM_GRADIENTS<Config, GemmType::dK_dSTQ, D, BLOCK_M, BLOCK_N, M_STRIDE * 2, D_STRIDE>(
               sdS, sQ, sdK,
               block.valid_kv_rows, valid_q_rows,
               warp_id, lane_id);

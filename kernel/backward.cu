@@ -220,7 +220,7 @@ flash_attention_backward_kernel(
             //           LSE[row: BLOCK_M], row_dot[row: BLOCK_M] -> dS[row: BLOCK_M, BLOCK_N]
             // Template: LDS_STRIDE=N_STRIDE, LDO_STRIDE=N_STRIDE, TILE_X=BLOCK_M, TILE_Y=BLOCK_N
             // ==================================================================================
-            WMMA_GEMM_SOFTMAX_GRADIENT<Config, GemmType::compute_dS, IS_SOFTCAP, IS_DROPOUT, N_STRIDE, N_STRIDE, BLOCK_M, BLOCK_N>(
+            WMMA_GEMM_SOFTMAX_GRADIENT<Config, GemmType::compute_dS, IS_SOFTCAP, IS_DROPOUT, N_STRIDE, N_STRIDE * 2, BLOCK_M, BLOCK_N>(
               sS, sdOV, sLse, sRowDot,
               nullptr, sdS,
               block.valid_q_rows, valid_kv_rows,
@@ -234,7 +234,7 @@ flash_attention_backward_kernel(
             // Layout:   dS[row: BLOCK_M, BLOCK_N], K[row: BLOCK_N, D] -> dQ[row: BLOCK_M, D]
             // Template: BLOCK_X=BLOCK_M, BLOCK_Y=BLOCK_N
             // ==================================================================================
-            WMMA_GEMM_GRADIENTS<Config, GemmType::dQ_dSK, D, BLOCK_M, BLOCK_N, N_STRIDE, D_STRIDE>(
+            WMMA_GEMM_GRADIENTS<Config, GemmType::dQ_dSK, D, BLOCK_M, BLOCK_N, N_STRIDE * 2, D_STRIDE>(
               sdS, sK, sdQ,
               block.valid_q_rows, valid_kv_rows, warp_id, lane_id);
             __syncthreads();
@@ -431,7 +431,7 @@ flash_attention_backward_kernel(
                 //           LSE[row: BLOCK_N], row_dot[row: BLOCK_N] -> P[row: BLOCK_N, BLOCK_M], dS[row: BLOCK_N, BLOCK_M]
                 // Template: LDS_STRIDE=M_STRIDE, LDO_STRIDE=BLOCK_M, TILE_X=BLOCK_N, TILE_Y=BLOCK_M
                 // ==================================================================================
-                WMMA_GEMM_SOFTMAX_GRADIENT<Config, GemmType::compute_P_dS, IS_SOFTCAP, IS_DROPOUT, M_STRIDE, BLOCK_M, BLOCK_N, BLOCK_M>(
+                WMMA_GEMM_SOFTMAX_GRADIENT<Config, GemmType::compute_P_dS, IS_SOFTCAP, IS_DROPOUT, M_STRIDE, M_STRIDE * 2, BLOCK_N, BLOCK_M>(
                   sS, sdOV, sLse, sRowDot, sP, sdS,
                   valid_q_rows,  block.valid_kv_rows,
                   softmax_scale, softcap,
@@ -443,7 +443,7 @@ flash_attention_backward_kernel(
                 // Layout:   P^T[col: BLOCK_M, BLOCK_N], dO[row: BLOCK_N, D] -> dV[row: BLOCK_M, D]
                 // Template: BLOCK_X=BLOCK_M, BLOCK_Y=BLOCK_N
                 // ==================================================================================
-                WMMA_GEMM_GRADIENTS<Config, GemmType::dV_PTdO, D, BLOCK_M, BLOCK_N, BLOCK_M, D_STRIDE>(
+                WMMA_GEMM_GRADIENTS<Config, GemmType::dV_PTdO, D, BLOCK_M, BLOCK_N, M_STRIDE * 2, D_STRIDE>(
                   sP, sdO, sdV,
                   block.valid_kv_rows, valid_q_rows,
                   warp_id, lane_id);
@@ -465,7 +465,7 @@ flash_attention_backward_kernel(
                 // Layout:   dS^T[col: BLOCK_M, BLOCK_N], Q[row: BLOCK_N, D] -> dK[row: BLOCK_M, D]
                 // Template: BLOCK_X=BLOCK_M, BLOCK_Y=BLOCK_N
                 // ==================================================================================
-                WMMA_GEMM_GRADIENTS<Config, GemmType::dK_dSTQ, D, BLOCK_M, BLOCK_N, BLOCK_M, D_STRIDE>(
+                WMMA_GEMM_GRADIENTS<Config, GemmType::dK_dSTQ, D, BLOCK_M, BLOCK_N, M_STRIDE * 2, D_STRIDE>(
                   sdS, sQ, sdK,
                   block.valid_kv_rows, valid_q_rows,
                   warp_id, lane_id);
