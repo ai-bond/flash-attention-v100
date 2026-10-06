@@ -26,8 +26,8 @@ __device__ __forceinline__ void WMMA_GEMM_DOT_PRODUCT(
     int THREAD_ID
 ) {
     using PTraits = PhaseTraits<PHASE>;
-    
-    constexpr int THREADS_PER_ROW = PTraits::IS_SWAPPED ? Config::DKV::THREADS_PER_ROW : Config::DQ::THREADS_PER_ROW;    
+
+    constexpr int THREADS_PER_ROW = PTraits::IS_SWAPPED ? Config::DKV::THREADS_PER_ROW : Config::DQ::THREADS_PER_ROW;
 
     const int total_iters = (Config::DIM + 7) >> 3;
 

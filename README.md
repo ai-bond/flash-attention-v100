@@ -6,12 +6,12 @@ This repository implementation of [FlashAttention-2](https://github.com/ai-bond/
 
 If this code saved you time, treat me to a coffee ☕: 
 - 🪙 BTC:          `bc1q5dydywjqmlewmenkyymzrmy482f9jdh7mr42aw`
-- 💵 USDT (TRC20): `TAuNnyYigkcUvA2aPoEZnN48JaJ21HoWkb`
+- 💵 USDT (SOL):   `3EsSLBQ8PW3tiaNArndghbzBvJAvhuoKjJGDQqR4r8t4`
 
 Installation Guide for Volta
 -------------
 
-The installation instructions for Volta GPUs are available here at [`install.md`](https://github.com/ai-bond/flash-attention-v100/blob/main/utils/docs/install.md).
+The installation instructions are available at this [`install.`](https://github.com/ai-bond/flash-attention-v100/blob/main/utils/docs/install.md).
 
 How to use FlashAttention
 -------------
