@@ -68,12 +68,11 @@ __device__ __forceinline__ void WMMA_GEMM_INIT_SMEM(T (&arr)[N], T VALUE) {
 }
 
 // ======================================================================================
-// TILE LOADER: Global-shared load with decoupled stride/width for varlen/dense layouts
+// TILE LOADER: Global-shared load for unified dense/varlen/kvcache layouts
 //   DUAL_LOAD:     Loads two independent buffers (GMEM0->SMEM0, GMEM1->SMEM1)
-//   SMEM_STRIDE:   Shared memory pitch (uint4-aligned), decoupled from global stride
-//   GLOBAL_WIDTH:  Sub-tile column width for varlen; -1 falls back to GLOBAL_STRIDE
+//   GLOBAL_STRIDE: Runtime source row pitch
 // ======================================================================================
-template<typename Config, bool DUAL_LOAD, int SMEM_STRIDE, int GLOBAL_WIDTH = -1>
+template<typename Config, GemmPhase Phase, Stage Option>
 __device__ __forceinline__ void WMMA_GEMM_LOAD_TILE(
     const __half* __restrict__ GMEM0,
           __half* __restrict__ SMEM0,
@@ -83,12 +82,12 @@ __device__ __forceinline__ void WMMA_GEMM_LOAD_TILE(
     int VALID_ROWS,
     int THREAD_ID
 ) {
-    constexpr int THREADS_PER_BLOCK = Config::THREADS_PER_BLOCK;
-    constexpr int dst_stride_uint4  = (SMEM_STRIDE + 7) >> 3;
-    const     int wth_stride_uint4  = (((GLOBAL_WIDTH > 0) ? GLOBAL_WIDTH : GLOBAL_STRIDE) + 7) >> 3;
-    const     int src_stride_uint4  = (GLOBAL_STRIDE + 7) >> 3;
+    using LTraits = LoadTraits<Phase, Option>;
 
-    const     int total_iters       = VALID_ROWS * wth_stride_uint4;
+    constexpr int THREADS_PER_BLOCK = Config::THREADS_PER_BLOCK;
+    constexpr int dst_stride_uint4  = (Config::DIM + 7) >> 3;
+    const     int src_stride_uint4  = (GLOBAL_STRIDE + 7) >> 3;
+    const     int total_iters       = VALID_ROWS * dst_stride_uint4;
 
     if (total_iters == 0) return;
 
@@ -97,15 +96,15 @@ __device__ __forceinline__ void WMMA_GEMM_LOAD_TILE(
 
     uint64_t src_base1 = 0;
     uint32_t dst_base1 = 0;
-    if constexpr (DUAL_LOAD) {
+    if constexpr (LTraits::DUAL_LOAD) {
         src_base1 = static_cast<uint64_t>(__cvta_generic_to_global(GMEM1));
         dst_base1 = static_cast<uint32_t>(__cvta_generic_to_shared(SMEM1));
     }
 
     #pragma unroll 2
     for (int idx = THREAD_ID; idx < total_iters; idx += THREADS_PER_BLOCK) {
-        const int row = idx / wth_stride_uint4;
-        const int col = idx % wth_stride_uint4;
+        const int row = idx / dst_stride_uint4;
+        const int col = idx % dst_stride_uint4;
 
         const int src_offset = row * src_stride_uint4 + col;
         const int dst_offset = row * dst_stride_uint4 + col;
@@ -116,7 +115,7 @@ __device__ __forceinline__ void WMMA_GEMM_LOAD_TILE(
         uint32_t dst_addr0 = swizzle(dst_base0 + (static_cast<uint32_t>(dst_offset) << 4), row);
 
         uint32_t r0, r1, r2, r3;
-        if constexpr (DUAL_LOAD) {
+        if constexpr (LTraits::DUAL_LOAD) {
             uint64_t src_addr1 = src_base1 + (static_cast<uint64_t>(src_offset) << 4);
             uint32_t dst_addr1 = swizzle(dst_base1 + (static_cast<uint32_t>(dst_offset) << 4), row);
 
@@ -162,13 +161,12 @@ __device__ __forceinline__ void WMMA_GEMM_LOAD_TILE(
     }
 }
 
-// ============================================================================
+// ======================================================================================
 // KERNEL EPILOGUE:   Shared-global fp32->fp16 store with optional norm & dual output
-//   TYPE (GemmType): NORMLZE (bit 0) rescales by 1/SMEM_DOT[row]; DUAL_STORE (bit 1) writes SMEM1->GMEM1
-//   SMEM_STRIDE:     Shared memory pitch (float4-aligned), decoupled from global stride
-//   GLOBAL_WIDTH:    Sub-tile column width for varlen; -1 falls back to GLOBAL_STRIDE
-// ============================================================================
-template<typename Config, GemmType TYPE, int SMEM_STRIDE, int GLOBAL_WIDTH = -1 >
+//   TYPE (GemmType): NORMALIZE rescales by 1/SMEM_DOT[row]; DUAL_STORE writes SMEM1->GMEM1
+//   GLOBAL_STRIDE:   Runtime destination row pitch
+// ======================================================================================
+template<typename Config, Result Type>
 __device__ __forceinline__ void WMMA_GEMM_EPILOGUE(
     const float* __restrict__ SMEM0,
          __half* __restrict__ GMEM0,
@@ -179,21 +177,23 @@ __device__ __forceinline__ void WMMA_GEMM_EPILOGUE(
     int VALID_ROWS,
     int THREAD_ID
 ) {
-    const int global_chunks = ((GLOBAL_WIDTH > 0) ? GLOBAL_WIDTH : GLOBAL_STRIDE) >> 2;
+    using ETraits = EpilogueTraits<Type>;
+
+    const int global_chunks = Config::DIM >> 2;
     const int total_iters   = VALID_ROWS * global_chunks;
 
     if (total_iters == 0) return;
 
+    constexpr bool NORMALIZE         = ETraits::NORMALIZE;
+    constexpr bool DUAL_STORE        = ETraits::DUAL_STORE;
     constexpr int  THREADS_PER_BLOCK = Config::THREADS_PER_BLOCK;
-    constexpr bool NORMLZE    = static_cast<uint8_t>(TYPE) & 0x1;
-    constexpr bool DUAL_STORE = static_cast<uint8_t>(TYPE) & 0x2;
 
     for (int i = THREAD_ID; i < total_iters; i += THREADS_PER_BLOCK) {
         const int row =  i / global_chunks;
         const int col = (i % global_chunks) << 2;
 
         float norm = 1.0f;
-        if constexpr (NORMLZE) {
+        if constexpr (NORMALIZE) {
             norm = __frcp_rn(fmaxf(SMEM_DOT[row], 1e-24f));
         }
 
@@ -201,7 +201,7 @@ __device__ __forceinline__ void WMMA_GEMM_EPILOGUE(
         const int pred = in_bounds ? 1 : 0;
 
         if (in_bounds) {
-            uint32_t smem00_addr = __cvta_generic_to_shared(SMEM0 + row * SMEM_STRIDE) + col * 4;
+            uint32_t smem00_addr = __cvta_generic_to_shared(SMEM0 + row * Config::DIM) + col * 4;
             float4   smem00      = ld_float4(smem00_addr, row);
             const __half2 h0 = __float22half2_rn(make_float2(smem00.x * norm, smem00.y * norm));
             const __half2 h1 = __float22half2_rn(make_float2(smem00.z * norm, smem00.w * norm));
@@ -227,7 +227,7 @@ __device__ __forceinline__ void WMMA_GEMM_EPILOGUE(
             );
 
             if constexpr (DUAL_STORE) {
-                uint32_t smem01_addr = __cvta_generic_to_shared(SMEM1 + row * SMEM_STRIDE) + col * 4;
+                uint32_t smem01_addr = __cvta_generic_to_shared(SMEM1 + row * Config::DIM) + col * 4;
                 float4   smem01      = ld_float4(smem01_addr, row);
                 const __half2 h2 = __float22half2_rn(make_float2(smem01.x * norm, smem01.y * norm));
                 const __half2 h3 = __float22half2_rn(make_float2(smem01.z * norm, smem01.w * norm));

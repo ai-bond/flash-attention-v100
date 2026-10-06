@@ -20,7 +20,7 @@
 //           P [half ]            row-major, swizzled via st_half4/st_half(addr, row)
 //           sS[row,k]            sP[row,2k], sP[row,2k+1]
 // ======================================================================================
-template <typename Config, int BLOCK_M, int BLOCK_N, int SCORE_STRIDE, int HEAD_STRIDE, bool IS_DROPOUT>
+template <typename Config, bool IS_DROPOUT>
 __device__ __forceinline__ void WMMA_GEMM_SOFTMAX(
     float*   __restrict__ SMEM_S,
     __half*  __restrict__ SMEM_P,
@@ -42,14 +42,18 @@ __device__ __forceinline__ void WMMA_GEMM_SOFTMAX(
 ) {
     if (VALID_Q == 0 || VALID_KV == 0) return;
 
+    constexpr int BLOCK_N         = Config::DO::BLOCK_N;
+    constexpr int SCORE_STRIDE    = Config::DO::BLOCK_N;
+    constexpr int HEAD_STRIDE     = Config::DIM;
     constexpr int THREADS_PER_ROW = Config::DO::THREADS_PER_ROW;
+
     constexpr int MAX_ITERS       = ((BLOCK_N >> 2) + THREADS_PER_ROW - 1) / THREADS_PER_ROW;
     constexpr int MAX_TAILS       = (4 + THREADS_PER_ROW - 1) / THREADS_PER_ROW;
 
-    const int row     = THREAD_ID / THREADS_PER_ROW;
-    const int thread  = THREAD_ID % THREADS_PER_ROW;
-    const int cols    = VALID_KV >> 2;
-    const int tail    = (VALID_KV >> 2) << 2;
+    const int row    = THREAD_ID / THREADS_PER_ROW;
+    const int thread = THREAD_ID % THREADS_PER_ROW;
+    const int cols   = VALID_KV >> 2;
+    const int tail   = (VALID_KV >> 2) << 2;
 
     float thread_max = NEG_INF, new_max  = NEG_INF;
     float thread_sum = 0.0f,    exp_diff = 1.0f;
@@ -215,7 +219,7 @@ __device__ __forceinline__ void WMMA_GEMM_SOFTMAX(
 //           P [half ], dS [half ] row-major, stride SMEM_LDO_STRIDE (halves)
 //           sS[row,k]             sP[row,2k],sP[row,2k+1]
 // ======================================================================================
-template<typename Config, GemmType TYPE, bool IS_SOFTCAP, bool IS_DROPOUT, int SMEM_LDS_STRIDE, int SMEM_LDO_STRIDE, int TILE_X, int TILE_Y>
+template<typename Config, GemmPhase TYPE, bool IS_SOFTCAP, bool IS_DROPOUT>
 __device__ __forceinline__ void WMMA_GEMM_SOFTMAX_GRADIENT(
     const float* __restrict__ SMEM_S,
     const float* __restrict__ SMEM_DOV,
@@ -235,7 +239,13 @@ __device__ __forceinline__ void WMMA_GEMM_SOFTMAX_GRADIENT(
     int      GLOBAL_N,
     int      THREAD_ID
 ) {
-    constexpr bool PHASE             = static_cast<uint8_t>(TYPE) & 0x1;
+    using Traits = PhaseTraits<TYPE>;
+
+    constexpr int  TILE_X            = Traits::template BLOCK_X<Config>();
+    constexpr int  TILE_Y            = Traits::template BLOCK_Y<Config>();
+    constexpr int  LDS_STRIDE        = Traits::template LDS_STRIDE<Config>();
+    constexpr int  LDO_STRIDE        = Traits::template LDO_STRIDE<Config>();
+    constexpr bool PHASE             = Traits::IS_SDS_SP;
     constexpr int  THREADS_PER_BLOCK = Config::THREADS_PER_BLOCK;
 
     const float    softcap_inv = IS_SOFTCAP ? (1.0f / SOFTCAP) : 0.0f;
@@ -265,8 +275,8 @@ __device__ __forceinline__ void WMMA_GEMM_SOFTMAX_GRADIENT(
         float4 sS, sdOV;
 
         if (is_valid) {
-            const uint32_t sS_base   = __cvta_generic_to_shared(SMEM_S   + row * SMEM_LDS_STRIDE);
-            const uint32_t sDOV_base = __cvta_generic_to_shared(SMEM_DOV + row * SMEM_LDS_STRIDE);
+            const uint32_t sS_base   = __cvta_generic_to_shared(SMEM_S   + row * LDS_STRIDE);
+            const uint32_t sDOV_base = __cvta_generic_to_shared(SMEM_DOV + row * LDS_STRIDE);
             sS   = ld_float4(sS_base   + col * 4, row);
             sdOV = ld_float4(sDOV_base + col * 4, row);
         } else {
@@ -310,7 +320,7 @@ __device__ __forceinline__ void WMMA_GEMM_SOFTMAX_GRADIENT(
 
         if constexpr (!PHASE) {
             if (prev_has) {
-                const uint32_t sDS_base = __cvta_generic_to_shared(SMEM_DS + prev_row * SMEM_LDO_STRIDE);
+                const uint32_t sDS_base = __cvta_generic_to_shared(SMEM_DS + prev_row * LDO_STRIDE);
                 const uint32_t addr  = sDS_base + prev_col * 2;
                 st_half4(addr, __float22half2_rn(make_float2(prev_ds.x, prev_ds.y)), __float22half2_rn(make_float2(prev_ds.z, prev_ds.w)), prev_row);
             }
@@ -319,8 +329,8 @@ __device__ __forceinline__ void WMMA_GEMM_SOFTMAX_GRADIENT(
             prev_col = col;
             prev_has = true;
         } else {
-            const uint32_t sDS_base = __cvta_generic_to_shared(SMEM_DS + row * SMEM_LDO_STRIDE);
-            const uint32_t sP_base  = __cvta_generic_to_shared(SMEM_P  + row * SMEM_LDO_STRIDE);
+            const uint32_t sDS_base = __cvta_generic_to_shared(SMEM_DS + row * LDO_STRIDE);
+            const uint32_t sP_base  = __cvta_generic_to_shared(SMEM_P  + row * LDO_STRIDE);
             const uint32_t addr_ds  = sDS_base + col * 2;
             const uint32_t addr_p   = sP_base  + col * 2;
 
@@ -331,7 +341,7 @@ __device__ __forceinline__ void WMMA_GEMM_SOFTMAX_GRADIENT(
 
     if constexpr (!PHASE) {
         if (prev_has) {
-            const uint32_t sDS_base = __cvta_generic_to_shared(SMEM_DS + prev_row * SMEM_LDO_STRIDE);
+            const uint32_t sDS_base = __cvta_generic_to_shared(SMEM_DS + prev_row * LDO_STRIDE);
             const uint32_t addr  = sDS_base + prev_col * 2;
             st_half4(addr, __float22half2_rn(make_float2(prev_ds.x, prev_ds.y)), __float22half2_rn(make_float2(prev_ds.z, prev_ds.w)), prev_row);
         }

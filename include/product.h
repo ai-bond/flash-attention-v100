@@ -9,9 +9,11 @@
 #include "swizzle.h"
 
 // ======================================================================================
-// COMPUTE_ROW_DOT
+// WMMA_GEMM_DOT_PRODUCT: Row-wise sum(O ⊙ dO) with optional LSE staging to SMEM
+//   TYPE (GemmType): PHASE (bit 0) selects THREADS_PER_ROW source (DQ vs DKV)
+//   GLOBAL_STRIDE:   Runtime source row pitch
 // ======================================================================================
-template <typename Config, GemmType TYPE, int SMEM_STRIDE, int GLOBAL_WIDTH = -1>
+template <typename Config, GemmPhase PHASE>
 __device__ __forceinline__ void WMMA_GEMM_DOT_PRODUCT(
     const __half* __restrict__ GMEM_O,
     const __half* __restrict__ SMEM_DO,
@@ -23,10 +25,11 @@ __device__ __forceinline__ void WMMA_GEMM_DOT_PRODUCT(
     int OFFSET,
     int THREAD_ID
 ) {
-    constexpr bool PHASE            = static_cast<uint8_t>(TYPE) & 0x1;
-    constexpr int THREADS_PER_ROW   = PHASE ? Config::DKV::THREADS_PER_ROW : Config::DQ::THREADS_PER_ROW;
+    using PTraits = PhaseTraits<PHASE>;
+    
+    constexpr int THREADS_PER_ROW = PTraits::IS_SWAPPED ? Config::DKV::THREADS_PER_ROW : Config::DQ::THREADS_PER_ROW;    
 
-    const int total_iters = (GLOBAL_WIDTH > 0 ? GLOBAL_WIDTH : GLOBAL_STRIDE) + 7 >> 3;
+    const int total_iters = (Config::DIM + 7) >> 3;
 
     if (total_iters == 0 || VALID_ROWS == 0) return;
 
@@ -39,7 +42,7 @@ __device__ __forceinline__ void WMMA_GEMM_DOT_PRODUCT(
     if (row < VALID_ROWS) {
 
         const uint64_t gmem_base = static_cast<uint64_t>(__cvta_generic_to_global(GMEM_O))  + static_cast<uint64_t>(row) * GLOBAL_STRIDE * 2;
-        const uint32_t smem_base = static_cast<uint32_t>(__cvta_generic_to_shared(SMEM_DO)) + static_cast<uint32_t>(row) * SMEM_STRIDE   * 2;
+        const uint32_t smem_base = static_cast<uint32_t>(__cvta_generic_to_shared(SMEM_DO)) + static_cast<uint32_t>(row) * Config::DIM   * 2;
 
         #pragma unroll
         for (int j = 0; j < work; ++j) {
@@ -47,7 +50,7 @@ __device__ __forceinline__ void WMMA_GEMM_DOT_PRODUCT(
             if (chunk >= total_iters) break;
 
             const int col  = chunk << 3;
-            const int pred = (col < (GLOBAL_WIDTH > 0 ? GLOBAL_WIDTH : GLOBAL_STRIDE)) ? 1 : 0;
+            const int pred = (col < Config::DIM) ? 1 : 0;
 
             uint32_t o_pack[4], d_pack[4];
             const uint64_t gmem_addr = gmem_base + static_cast<uint64_t>(col) * 2;

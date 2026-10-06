@@ -3,9 +3,6 @@
 // ======================================================================================
 #pragma once
 
-// ======================================================================================
-// CONFIGURATIONS
-// ======================================================================================
 #define BLOCK_M_16  16
 #define BLOCK_N_16  512
 
@@ -32,26 +29,25 @@ struct KernelConfig {
         static constexpr int BLOCK_M = (D == 16) ? BLOCK_M_16 : (D == 32) ? BLOCK_M_32 : (D == 64) ? BLOCK_M_64 : (D == 128) ? BLOCK_M_128 : BLOCK_M_256;
         static constexpr int BLOCK_N = (D == 16) ? BLOCK_N_16 : (D == 32) ? BLOCK_N_32 : (D == 64) ? BLOCK_N_64 : (D == 128) ? BLOCK_N_128 : BLOCK_N_256;
         static constexpr int THREADS_PER_ROW = (WARPS * MAX_THREADS_PER_WARP) / BLOCK_M;
-        static constexpr int D_STRIDE        = D;
-        static constexpr int N_STRIDE        = BLOCK_N;
     };
 
+    static constexpr int DIM = D;
     static constexpr int WARPS_PER_BLOCK     = WARPS;
     static constexpr int THREADS_PER_BLOCK   = WARPS * MAX_THREADS_PER_WARP;
 
     struct alignas(128) SmemLayout {
         union PhaseMem {
             struct DO_Phase {
-                    alignas(16) __half q      [DO::BLOCK_M * DO::D_STRIDE];
+                    alignas(16) __half q      [DO::BLOCK_M * D];
                 union {
-                    alignas(16) __half k      [DO::BLOCK_N * DO::D_STRIDE];
-                    alignas(16) __half v      [DO::BLOCK_N * DO::D_STRIDE];
+                    alignas(16) __half k      [DO::BLOCK_N * D];
+                    alignas(16) __half v      [DO::BLOCK_N * D];
                 } reuse_kv;
                 union {
-                    alignas(16) float  s      [DO::BLOCK_M * DO::N_STRIDE];
-                    alignas(16) __half p      [DO::BLOCK_M * DO::N_STRIDE * 2];
+                    alignas(16) float  s      [DO::BLOCK_M * DO::BLOCK_N];
+                    alignas(16) __half p      [DO::BLOCK_M * DO::BLOCK_N * 2];
                 } reuse_sp;
-                    alignas(16) float  o      [DO::BLOCK_M * DO::D_STRIDE];
+                    alignas(16) float  o      [DO::BLOCK_M * D];
             } fdo;
         } phase;
                     alignas(16) float  row_max[DO::BLOCK_M];

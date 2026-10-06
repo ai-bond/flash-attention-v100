@@ -9,9 +9,12 @@
 #include "swizzle.h"
 
 // ======================================================================================
-// KV-CACHE UPDATER: Global(K_NEW/V_NEW) -> Registers -> (RoPE on K) -> Global(K_CACHE/V_CACHE)
+// WMMA_GEMM_UPDATE_KVCACHE: Global(K_NEW/V_NEW) -> Registers -> (RoPE on K) -> Global(K_CACHE/V_CACHE)
+//   IS_PAGED:       Paged KV cache via block_table indirection
+//   IS_ROPE:        Apply RoPE on K rows in-flight
+//   IS_INTERLEAVED: Interleaved RoPE layout vs split-halves
 // ======================================================================================
-template<typename Config, int GLOBAL_STRIDE, bool IS_PAGED, bool IS_ROPE, bool IS_INTERLEAVED>
+template<typename Config, bool IS_PAGED, bool IS_ROPE, bool IS_INTERLEAVED>
 __device__ __forceinline__ void WMMA_GEMM_UPDATE_KVCACHE(
     const __half* __restrict__ K_NEW,
     const __half* __restrict__ V_NEW,
@@ -36,13 +39,13 @@ __device__ __forceinline__ void WMMA_GEMM_UPDATE_KVCACHE(
 ) {
     if (K_NEW == nullptr || V_NEW == nullptr || T_NEW <= 0 || KV_HEAD_IDX >= H_K) return;
 
-    constexpr int THREADS      = Config::THREADS_PER_BLOCK;
-    constexpr int CHUNKS       = GLOBAL_STRIDE / 8;
-    const     int total_iters  = T_NEW * CHUNKS;
+    constexpr int THREADS     = Config::THREADS_PER_BLOCK;
+    constexpr int CHUNKS      = Config::DIM / 8;
+    const     int total_iters = T_NEW * CHUNKS;
 
     if (total_iters == 0) return;
 
-    const int half_rot      = IS_ROPE ? (ROTARY_DIM / 2) : 0;
+    const int half_rot    = IS_ROPE ? (ROTARY_DIM / 2) : 0;
 
     uint64_t base_k_new   = reinterpret_cast<uint64_t>(K_NEW);
     uint64_t base_v_new   = reinterpret_cast<uint64_t>(V_NEW);
@@ -149,9 +152,12 @@ __device__ __forceinline__ void WMMA_GEMM_UPDATE_KVCACHE(
 }
 
 // ======================================================================================
-// TILE LOADER + ROTARY
+// WMMA_GEMM_TILE_ROTARY: Global->SMEM tile load with optional RoPE applied in-flight
+//   IS_CAUSAL / IS_WINDOW:  Governs per-row position stride for RoPE
+//   IS_ROPE:                Apply RoPE to the tile rows
+//   IS_INTERLEAVED:         Interleaved RoPE layout vs split-halves
 // ======================================================================================
-template<typename Config, int SMEM_STRIDE, bool IS_CAUSAL, bool IS_WINDOW, bool IS_ROPE, bool IS_INTERLEAVED, int GLOBAL_WIDTH = -1>
+template<typename Config, bool IS_CAUSAL, bool IS_WINDOW, bool IS_ROPE, bool IS_INTERLEAVED>
 __device__ __forceinline__ void WMMA_GEMM_TILE_ROTARY(
     const __half* __restrict__ GMEM,
           __half* __restrict__ SMEM,
@@ -166,10 +172,9 @@ __device__ __forceinline__ void WMMA_GEMM_TILE_ROTARY(
     int THREAD_ID
 ) {
     constexpr int THREADS_PER_BLOCK = Config::THREADS_PER_BLOCK;
-    constexpr int dst_stride_uint4  = (SMEM_STRIDE + 7) >> 3;
-    const     int wth_stride_uint4  = (((GLOBAL_WIDTH > 0) ? GLOBAL_WIDTH : GLOBAL_STRIDE) + 7) >> 3;
+    constexpr int dst_stride_uint4  = (Config::DIM + 7) >> 3;
     const     int src_stride_uint4  = (GLOBAL_STRIDE + 7) >> 3;
-    const     int total_iters       = VALID_ROWS * wth_stride_uint4;
+    const     int total_iters       = VALID_ROWS * dst_stride_uint4;
 
     if (total_iters == 0) return;
 
@@ -181,8 +186,8 @@ __device__ __forceinline__ void WMMA_GEMM_TILE_ROTARY(
 
     #pragma unroll 2
     for (int idx = THREAD_ID; idx < total_iters; idx += THREADS_PER_BLOCK) {
-        const int row = idx / wth_stride_uint4;
-        const int col = idx % wth_stride_uint4;
+        const int row = idx / dst_stride_uint4;
+        const int col = idx % dst_stride_uint4;
 
         const int src_off = row * src_stride_uint4 + col;
         const int dst_off = row * dst_stride_uint4 + col;
