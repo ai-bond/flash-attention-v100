@@ -82,7 +82,7 @@ if [ $DO_COMPILE -eq 1 ]; then
         # Executable
         if [ ! -f "$out" ]; then
             echo "Compile object $cu -> $out"
-            nvcc -arch=sm_70 -O3 -lineinfo -Wno-deprecated-gpu-targets $INC $DEFINE_FLAG "$cu" -o "$out"
+            nvcc -arch=sm_70 -O3 -lineinfo -Wno-deprecated-gpu-targets --expt-relaxed-constexpr $INC $DEFINE_FLAG "$cu" -o "$out"
         else
             echo "Already compiled $cu -> $out ... skip"
         fi
@@ -90,7 +90,7 @@ if [ $DO_COMPILE -eq 1 ]; then
         # Full PTX
         if [ ! -f "$ptx" ]; then
             echo "Compile ptx $cu -> $ptx"
-            nvcc -arch=sm_70 -lineinfo -ptx -Wno-deprecated-gpu-targets $INC $DEFINE_FLAG "$cu" -o "$ptx"
+            nvcc -arch=sm_70 -lineinfo -ptx -Wno-deprecated-gpu-targets --expt-relaxed-constexpr $INC $DEFINE_FLAG "$cu" -o "$ptx"
         else
             echo "Already compiled $cu -> $ptx ... skip"
         fi
@@ -98,7 +98,7 @@ if [ $DO_COMPILE -eq 1 ]; then
         # Full SASS via cubin + cuobjdump
         if [ ! -f "$sass" ]; then
             echo "Compile cubin $cu -> $cubin"
-            nvcc -arch=sm_70 -cubin -lineinfo -Wno-deprecated-gpu-targets $INC $DEFINE_FLAG "$cu" -o "$cubin"
+            nvcc -arch=sm_70 -cubin -lineinfo -Wno-deprecated-gpu-targets --expt-relaxed-constexpr $INC $DEFINE_FLAG "$cu" -o "$cubin"
             echo "Dump sass $cubin -> $sass"
             cuobjdump -sass "$cubin" > "$sass"
         else
