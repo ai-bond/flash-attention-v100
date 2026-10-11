@@ -1,4 +1,4 @@
-[<- Main](../../README.md)
+[<- Main](https://github.com/ai-bond/flash-attention-v100/)
 
 ---
 
@@ -73,4 +73,4 @@ When built with `--debug`, `run.sh` generates `./build/asm_extract.sh`. This scr
 - **PTX Mode**: The script invokes `cat` on the input `.ptx` file. It uses `awk` to search for case-insensitive substrings matching `dbg_ptx_<block_name_lower>_begin` and `dbg_ptx_<block_name_lower>_end`. These strings correspond to the inline assembly comments injected by `__ASM_DEBUG_BEGIN` and `__ASM_DEBUG_END` macros in `debug.h`.
 - **SASS Mode**: The script invokes `cuobjdump --dump-sass` on the input `.cubin` file. It searches for the hexadecimal magic numbers `beef0001` (begin) and `cafe0002` (end) embedded in the SASS instruction stream via the `mov.u32` instructions defined in the `ASM_MARK` macro.
 
-[<- Main](../../README.md)
+[<- Main](https://github.com/ai-bond/flash-attention-v100/)

@@ -1,4 +1,4 @@
-[<- В начало](../../README.md)
+[<- В начало](https://github.com/ai-bond/flash-attention-v100/)
 
 - [Русский язык](#введение) / [English Language](#introduction)
 
@@ -18,7 +18,7 @@ FlashAttention-2 (FA2) — это оптимизированная реализ�
 - $K \in \mathbb{R}^{N \times d_k}$ — матрица ключей (keys)
 - $V \in \mathbb{R}^{N \times d_v}$ — матрица значений (values)
 - $P = Q K^\top / \sqrt{d_k} \in \mathbb{R}^{N \times N}$ — логиты внимания
-- $A = \operatorname{softmax}(P) \in \mathbb{R}^{N \times N}$ — матрица внимания
+- $A = \mathrm{softmax}(P) \in \mathbb{R}^{N \times N}$ — матрица внимания
 - $O = A V \in \mathbb{R}^{N \times d_v}$ — выход внимания
 
 #### Forward-Проход
@@ -41,7 +41,7 @@ FlashAttention-2 (FA2) — это оптимизированная реализ�
 
 ---
 
-Для каждого блока столбцов $j$ (по $K_j, V_j\,$):
+Для каждого блока столбцов $j$ (по $K_j$, $V_j$):
 
 1. **Вычисление логитов**:
 
@@ -77,7 +77,7 @@ $$
 
 ---
 
-- **Fused kernel**: все операции (матричные умножения, softmax, умножение на $V\,$) выполняются в одном CUDA-ядре.
+- **Fused kernel**: все операции (матричные умножения, softmax, умножение на $V$) выполняются в одном CUDA-ядре.
 - **Recomputation**: матрица $A$ не сохраняется для backward — она будет пересчитана из $Q, K$.
 - **Tensor Cores**: используются для ускорения $QK^\top$ и $AV$ (через `mma.sync`).
 - **Shared memory tiling**: данные загружаются блоками в shared memory для минимизации обращений к глобальной памяти.
@@ -116,7 +116,7 @@ $$
 3. **Градиент через softmax**:
 
 $$
-dP = A \odot \left(dA - \operatorname{rowsum}(dA \odot A) \cdot \mathbf{1}\right)
+dP = A \odot \left(dA - \mathrm{rowsum}(dA \odot A) \cdot \mathbf{1}\right)
 $$
 
 где $\odot$ — поэлементное умножение, $\mathbf{1}$ — вектор из единиц.
@@ -124,11 +124,11 @@ $$
 Эквивалентно:
 
 $$
-\text{sum\_dA\_A} = \sum_{j=1}^{N} (dA_{ij} \cdot A_{ij}) \quad \text{(по строкам)}
+\mathrm{sum\_dA\_A} = \sum_{j=1}^{N} (dA_{ij} \cdot A_{ij}) \quad \text{(по строкам)}
 $$
 
 $$
-dP_{ij} = A_{ij} \cdot \left(dA_{ij} - \text{sum\_dA\_A}_i\right)
+dP_{ij} = A_{ij} \cdot \left(dA_{ij} - \mathrm{sum\_dA\_A}_i\right)
 $$
 
 4. **Градиенты по Q и K**:
@@ -147,7 +147,7 @@ $$
 
 - $A$ не материализуется на forward → пересчитывается по блокам на backward из $Q, K$.
 - **Численная стабильность**: при вычислении softmax вычитается $\max(P_i)$ по строке.
-- **Блочная обработка**: все операции (включая $dV, dQ, dK\,$) выполняются по тайлам (обычно $128 \times 128\,$), чтобы уместиться в shared memory.
+- **Блочная обработка**: все операции (включая $dV, dQ, dK$) выполняются по тайлам (обычно $128 \times 128$), чтобы уместиться в shared memory.
 - **Fused kernel**: все вычисления делаются в одном CUDA-ядре без промежуточных записей в глобальную память.
 
 #### Реализация Forward/Backward Ядер
@@ -193,7 +193,7 @@ $$
 
 ---
 
-[<- Main](../../README.md)
+[<- Main](https://github.com/ai-bond/flash-attention-v100/)
 
 - [Russian Language](#введение) / [English Language](#introduction)
 
@@ -213,7 +213,7 @@ FlashAttention-2 (FA2) is an optimized implementation of the attention mechanism
 - $K \in \mathbb{R}^{N \times d_k}$ — key matrix
 - $V \in \mathbb{R}^{N \times d_v}$ — value matrix
 - $P = Q K^\top / \sqrt{d_k} \in \mathbb{R}^{N \times N}$ — attention logits
-- $A = \operatorname{softmax}(P) \in \mathbb{R}^{N \times N}$ — attention matrix
+- $A = \mathrm{softmax}(P) \in \mathbb{R}^{N \times N}$ — attention matrix
 - $O = A V \in \mathbb{R}^{N \times d_v}$ — attention output
 
 #### Forward Pass
@@ -236,7 +236,7 @@ For each row $i$:
 
 ---
 
-For each column block $j$ (over $K_j, V_j\,$):
+For each column block $j$ (over $K_j$, $V_j$):
 
 1. **Logits computation**:
 
@@ -272,7 +272,7 @@ $$
 
 ---
 
-- **Fused kernel**: all operations (matrix multiplications, softmax, multiplication by $V\,$) are performed in a single CUDA kernel.
+- **Fused kernel**: all operations (matrix multiplications, softmax, multiplication by $V$) are performed in a single CUDA kernel.
 - **Recomputation**: matrix $A$ is not saved for backward — it will be recomputed from $Q, K$.
 - **Tensor Cores**: used to accelerate $QK^\top$ and $AV$ (via `mma.sync`).
 - **Shared memory tiling**: data is loaded in blocks to shared memory to minimize global memory accesses.
@@ -311,7 +311,7 @@ $$
 3. **Gradient through softmax**:
 
 $$
-dP = A \odot \left(dA - \operatorname{rowsum}(dA \odot A) \cdot \mathbf{1}\right)
+dP = A \odot \left(dA - \mathrm{rowsum}(dA \odot A) \cdot \mathbf{1}\right)
 $$
 
 where $\odot$ is element-wise multiplication, $\mathbf{1}$ is a vector of ones.
@@ -319,11 +319,11 @@ where $\odot$ is element-wise multiplication, $\mathbf{1}$ is a vector of ones.
 Equivalently:
 
 $$
-\text{sum\_dA\_A} = \sum_{j=1}^{N} (dA_{ij} \cdot A_{ij}) \quad \text{(row-wise)}
+\mathrm{sum\_dA\_A} = \sum_{j=1}^{N} (dA_{ij} \cdot A_{ij}) \quad \text{(row-wise)}
 $$
 
 $$
-dP_{ij} = A_{ij} \cdot \left(dA_{ij} - \text{sum\_dA\_A}_i\right)
+dP_{ij} = A_{ij} \cdot \left(dA_{ij} - \mathrm{sum\_dA\_A}_i\right)
 $$
 
 4. **Gradients w.r.t. Q and K**:
@@ -342,7 +342,7 @@ $$
 
 - $A$ is not materialized during forward → recomputed in blocks during backward from $Q, K$.
 - **Numerical stability**: $\max(P_i)$ is subtracted row-wise during softmax computation.
-- **Block processing**: all operations (including $dV, dQ, dK\,$) are performed in tiles (usually $128 \times 128\,$) to fit in shared memory.
+- **Block processing**: all operations (including $dV, dQ, dK$) are performed in tiles (usually $128 \times 128$) to fit in shared memory.
 - **Fused kernel**: all computations are done in a single CUDA kernel without intermediate writes to global memory.
 
 #### Forward/Backward Kernel Implementation
@@ -385,3 +385,5 @@ $$
 | Tile Recycling | Reusing previously computed tiles to reduce computations and improve performance. |
 | Warps and Blocks Optimization | Optimizing warp and block usage for better hardware resource utilization. |
 | Memory Hierarchy Optimization | Optimizing the use of different memory levels to reduce data access latency. |
+
+[<- Main](https://github.com/ai-bond/flash-attention-v100/)
