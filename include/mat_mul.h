@@ -36,9 +36,9 @@ __device__ __forceinline__ void WMMA_GEMM_SCORES(
 #else
     using namespace volta::wmma;
 #endif
-    using GTraits = GemmTraits<TYPE>;
+    using GTraits = GemmTraits<TYPE, PHASE>;
     using PTraits = PhaseTraits<PHASE>;
-    
+
     constexpr bool APPLY_MASK      = GTraits::APPLY_MASK;
     constexpr bool HAS_FEATURES    =  IS_ALIBI  || IS_SOFTCAP || IS_WINDOW;
     const     int  SEQLEN_OFFSET   = (IS_CAUSAL || IS_WINDOW) ? SEQLEN : 0;
@@ -47,8 +47,9 @@ __device__ __forceinline__ void WMMA_GEMM_SCORES(
     constexpr int D                = Config::DIM;
     constexpr int TILE_M           = PTraits::template BLOCK_X<Config>();
     constexpr int TILE_N           = PTraits::template BLOCK_Y<Config>();
-    constexpr int OUT_STRIDE       = PTraits::template BLOCK_Y<Config>();
-    constexpr int IN_STRIDE        = Config::DIM;
+    constexpr int A_STRIDE         = GTraits::A_IS_COL ? PTraits::template BLOCK_X<Config>() : Config::DIM;
+    constexpr int B_STRIDE         = GTraits::B_IS_COL ? Config::DIM : PTraits::template BLOCK_Y<Config>();
+    constexpr int C_STRIDE         = PTraits::template BLOCK_Y<Config>();
 
     constexpr int num_tiles_m      = (TILE_M + WMMA_M - 1) / WMMA_M;
     constexpr int num_tiles_n      = (TILE_N + WMMA_N - 1) / WMMA_N;
@@ -82,8 +83,17 @@ __device__ __forceinline__ void WMMA_GEMM_SCORES(
         for (int k_tile = 0; k_tile < num_tiles_k; ++k_tile) {
             const int k_offset = k_tile * WMMA_K;
             if (k_offset >= D) break;
-            load_matrix_sync(a_frag, SMEM_A + tile_m * IN_STRIDE + k_offset, IN_STRIDE);
-            load_matrix_sync(b_frag, SMEM_B + tile_n * IN_STRIDE + k_offset, IN_STRIDE);
+
+            const __half* a_ptr = GTraits::A_IS_COL
+                ? SMEM_A + k_offset * A_STRIDE + tile_m
+                : SMEM_A + tile_m   * A_STRIDE + k_offset;
+
+            const __half* b_ptr = GTraits::B_IS_COL
+                ? SMEM_B + tile_n   * B_STRIDE + k_offset
+                : SMEM_B + k_offset * B_STRIDE + tile_n;
+
+            load_matrix_sync(a_frag, a_ptr, A_STRIDE);
+            load_matrix_sync(b_frag, b_ptr, B_STRIDE);
             mma_sync(acc_frag, a_frag, b_frag, acc_frag);
         }
 
@@ -163,7 +173,7 @@ __device__ __forceinline__ void WMMA_GEMM_SCORES(
                 acc_frag.x[i] *= SOFTMAX_SCALE;
             }
         }
-        store_matrix_sync(SMEM_C + tile_m * OUT_STRIDE + tile_n, acc_frag, OUT_STRIDE, mem_row_major);
+        store_matrix_sync(SMEM_C + tile_m * C_STRIDE + tile_n, acc_frag, C_STRIDE, mem_row_major);
     }
 }
 
@@ -186,14 +196,15 @@ __device__ __forceinline__ void WMMA_GEMM_GRADIENTS(
 #else
     using namespace volta::wmma;
 #endif
-    using GTraits = GemmTraits<TYPE>;
+    using GTraits = GemmTraits<TYPE, PHASE>;
     using PTraits = PhaseTraits<PHASE>;
 
     constexpr int D               = Config::DIM;
     constexpr int TILE_M          = PTraits::IS_SWAPPED ? PTraits::template BLOCK_Y<Config>() : PTraits::template BLOCK_X<Config>();
     constexpr int TILE_K          = PTraits::IS_SWAPPED ? PTraits::template BLOCK_X<Config>() : PTraits::template BLOCK_Y<Config>();
-    constexpr int IN_STRIDE       = PTraits::IS_SWAPPED ? (TILE_M * 2) : (TILE_K * 2);
-    constexpr int OUT_STRIDE      = Config::DIM;
+    constexpr int A_STRIDE        = GTraits::A_IS_COL ? (TILE_M * 2) : (TILE_K * 2);
+    constexpr int B_STRIDE        = GTraits::B_IS_COL ? PTraits::template BLOCK_Y<Config>() : Config::DIM;
+    constexpr int C_STRIDE        = Config::DIM;
     constexpr int WARPS_PER_BLOCK = Config::WARPS_PER_BLOCK;
 
     constexpr int num_tiles_m     = (TILE_M + WMMA_M - 1) / WMMA_M;
@@ -221,7 +232,7 @@ __device__ __forceinline__ void WMMA_GEMM_GRADIENTS(
         fragment<matrix_b, WMMA_M, WMMA_N, WMMA_K, half, b_layout> b_frag;
         fragment<accumulator, WMMA_M, WMMA_N, WMMA_K, float> acc_frag;
 
-        load_matrix_sync(acc_frag, SMEM_C + tile_m * OUT_STRIDE + tile_n, OUT_STRIDE, mem_row_major);
+        load_matrix_sync(acc_frag, SMEM_C + tile_m * C_STRIDE + tile_n, C_STRIDE, mem_row_major);
 
         #pragma unroll
         for (int k_tile = 0; k_tile < num_tiles_k; ++k_tile) {
@@ -229,18 +240,18 @@ __device__ __forceinline__ void WMMA_GEMM_GRADIENTS(
             if (k_offset >= VALID_K) break;
 
             const __half* a_ptr = GTraits::A_IS_COL 
-                ? SMEM_A + k_offset * IN_STRIDE + tile_m
-                : SMEM_A + tile_m   * IN_STRIDE + k_offset;
+                ? SMEM_A + k_offset * A_STRIDE + tile_m
+                : SMEM_A + tile_m   * A_STRIDE + k_offset;
 
             const __half* b_ptr = GTraits::B_IS_COL
-                ? SMEM_B + tile_n   * OUT_STRIDE + k_offset
-                : SMEM_B + k_offset * OUT_STRIDE + tile_n;
+                ? SMEM_B + tile_n   * B_STRIDE + k_offset
+                : SMEM_B + k_offset * B_STRIDE + tile_n;
 
-            load_matrix_sync(a_frag, a_ptr, IN_STRIDE);
-            load_matrix_sync(b_frag, b_ptr, OUT_STRIDE);
+            load_matrix_sync(a_frag, a_ptr, A_STRIDE);
+            load_matrix_sync(b_frag, b_ptr, B_STRIDE);
 
             mma_sync(acc_frag, a_frag, b_frag, acc_frag);
         }
-        store_matrix_sync(SMEM_C + tile_m * OUT_STRIDE + tile_n, acc_frag, OUT_STRIDE, mem_row_major);
+        store_matrix_sync(SMEM_C + tile_m * C_STRIDE + tile_n, acc_frag, C_STRIDE, mem_row_major);
     }
 }

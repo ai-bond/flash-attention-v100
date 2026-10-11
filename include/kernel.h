@@ -75,7 +75,7 @@ enum class Stage : uint8_t {
 // ======================================================================================
 // GEMM OPERATION TRAITS
 // ======================================================================================
-template<GemmType Option>
+template<GemmType Option, GemmPhase Phase>
 struct GemmTraits {
     static constexpr bool A_IS_COL   = (Option == GemmType::PT_dO || Option == GemmType::dST_Q);
     static constexpr bool B_IS_COL   = (Option == GemmType::Q_KT  || Option == GemmType::dO_VT);
