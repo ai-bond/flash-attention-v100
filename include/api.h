@@ -243,3 +243,68 @@ std::vector<at::Tensor> flash_attention_kvcache(
     bool         is_rotary_interleaved,
     int          num_splits = 0
 );
+
+/**
+ * Linear + Cross-Entropy Forward Pass
+ *
+ * Computes cross-entropy loss directly from hidden states and head weights, without materializing the (M, V) logits tensor.
+ * Internally fuses logits = input @ weight^T with the * log-softmax / NLL / label-smoothing / z-loss computation.
+ *
+ * @param input               Hidden states                            [*, D]   (fp16, input)
+ * @param weight              Classification head weight               [V, D]   (fp16, input)
+ * @param target              Target class indices                     [*] (int32/int64, input)
+ * @param reduction           Loss reduction mode:                     0=none, 1=mean, 2=sum
+ * @param label_smoothing     Label smoothing in [0, 1)                (float, input)
+ * @param logit_scale         Scale applied to logits before softmax
+ * @param lse_square_scale    Coefficient of the z-loss (lse^2) term
+ * @param ignore_index        Target value to ignore (loss = 0.0)
+ * @return                    Tuple of tensors {loss, lse, z_loss}
+ *                            loss   : reduced loss (scalar for mean/sum, same shape as target for reduction=none)
+ *                            lse    : per-row log-sum-exp             [M] (fp32)
+ *                            z_loss : per-row z-loss component        [M] (fp32)
+ */
+std::tuple<at::Tensor, at::Tensor, at::Tensor> linear_cross_entropy_forward(
+    const at::Tensor& input,
+    const at::Tensor& weight,
+    const at::Tensor& target,
+    int64_t reduction,
+    double  label_smoothing,
+    double  logit_scale,
+    double  lse_sscale,
+    int64_t ignore_index
+);
+
+/**
+ * Linear + Cross-Entropy Backward Pass
+ *
+ * Computes gradients w.r.t. the hidden states and the classification head weights.
+ * Reuses the per-row log-sum-exp saved by the forward pass so that the (M, V) logits tensor never has to be materialized.
+ *
+ * @param grad_output         Upstream gradient of the loss                 (input)
+ *                            - scalar for reduction = mean/sum
+ *                            - same shape as target for reduction = none
+ * @param saved_lse           Per-row log-sum-exp saved by forward          [M] (fp32, input)
+ * @param input               Hidden states from forward                    [*, D] (fp16, input)
+ * @param weight              Classification head weight from fwd           [V, D] (fp16, input)
+ * @param target              Target class indices from forward             [*] (int32/int64, input)
+ * @param reduction           Loss reduction mode (must match forward)
+ * @param label_smoothing     Label smoothing (must match forward)
+ * @param logit_scale         Logit scale (must match forward)
+ * @param lse_sscale          Z-loss coefficient (must match forward)
+ * @param ignore_index        Ignore index (must match forward)
+ * @return                    Tuple of gradient tensors {grad_input, grad_weight}
+ *                            grad_input  : gradient w.r.t. input  (shape as input,  fp16)
+ *                            grad_weight : gradient w.r.t. weight (shape as weight, fp16)
+ */
+std::tuple<at::Tensor, at::Tensor> linear_cross_entropy_backward(
+    const at::Tensor& grad_output,
+    const at::Tensor& saved_lse,
+    const at::Tensor& input,
+    const at::Tensor& weight,
+    const at::Tensor& target,
+    int64_t reduction,
+    double  label_smoothing,
+    double  logit_scale,
+    double  lse_sscale,
+    int64_t ignore_index
+);

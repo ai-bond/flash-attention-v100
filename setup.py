@@ -83,6 +83,7 @@ def get_ext_modules():
             name="flash_attn_v100_cuda",
             sources=[
                 "kernel/api.cpp",
+                "kernel/entropy.cu",
                 "kernel/forward.cu",
                 "kernel/forward_varlen.cu",
                 "kernel/backward.cu",

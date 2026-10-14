@@ -16,7 +16,7 @@ The installation instructions are available at this [`install.`](https://github.
 How to use FlashAttention
 -------------
 
-The main functions implement scaled dot product attention (softmax(Q @ K^T * softmax_scale) @ V):
+The main functions implement scaled dot product attention `(softmax(Q @ K^T * softmax_scale) @ V)`:
 ```
 from flash_attn      import flash_attn_func, flash_attn_varlen_func, flash_attn_with_kvcache
 from flash_attn_v100 import flash_attn_func, flash_attn_varlen_func, flash_attn_with_kvcache
@@ -96,5 +96,33 @@ Arguments:
 
 Return:
     out: (batch_size, seqlen_q, nheads, headdim) or (out, softmax_lse)
+"""
+```
+
+How to use Linear Cross-Entropy Loss
+-------------
+
+The main functions implement linear projection + cross-entropy `logits = input @ weight.T` without materializing logits tensor:
+```
+from flash_attn_v100.cross_entropy import cross_entropy_loss
+from flash_attn.losses.cross_entropy import CrossEntropyLoss
+```
+```
+cross_entropy_loss(input, weight, labels, reduction="none", label_smoothing=0.0, logit_scale=1.0, lse_square_scale=0.0, ignore_index=-100):
+"""
+Linear + Cross-Entropy
+
+Arguments:
+    input                 : (..., D). Hidden states, CUDA, native FP16
+    weight                : (V, D). Classification head weight, CUDA, native FP16
+    labels                : (...) . Target indices, int32/int64, CUDA
+    reduction             : "none" | "mean" | "sum"
+    label_smoothing       : float in [0, 1)
+    logit_scale           : float > 0. Scale for logits before softmax
+    lse_square_scale      : float. If > 0, adds z-loss = lse_square_scale * LSE^2
+    ignore_index          : int. Rows with this target contribute 0 to the loss
+
+Return:
+    losses: float32 tensor, or (losses, z_loss)
 """
 ```

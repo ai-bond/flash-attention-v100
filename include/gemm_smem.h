@@ -85,7 +85,7 @@ __device__ __forceinline__ void WMMA_GEMM_LOAD_TILE(
     using LTraits = LoadTraits<Phase, Option>;
 
     constexpr int THREADS_PER_BLOCK = Config::THREADS_PER_BLOCK;
-    constexpr int dst_stride_uint4  = (Config::DIM + 7) >> 3;
+    constexpr int dst_stride_uint4  = (LTraits::template TRANSPOSE<Config>() + 7) >> 3;
     const     int src_stride_uint4  = (GLOBAL_STRIDE + 7) >> 3;
     const     int total_iters       = VALID_ROWS * dst_stride_uint4;
 

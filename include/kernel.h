@@ -38,21 +38,24 @@
 // GEMM OPERATION TYPE
 // ======================================================================================
 enum class GemmType : uint8_t {
-    Q_KT,        // Q    @ K^T  (Query @ Key transpose)
-    dO_VT,       // dO   @ V^T  (dOutput @ Value transpose)
-    P_V,         // P    @ V    (Probability @ Value)
-    dS_K,        // dS   @ K    (dScore @ Key)
-    PT_dO,       // P^T  @ dO   (Probability transpose @ dOutput)
-    dST_Q,       // dS^T @ Q    (dScore transpose @ Query)
+    Q_KT,        // Q         @ K^T    (Query @ Key transpose)
+    dO_VT,       // dO        @ V^T    (dOutput @ Value transpose)
+    P_V,         // P         @ V      (Probability @ Value)
+    dS_K,        // dS        @ K      (dScore @ Key)
+    PT_dO,       // P^T       @ dO     (Probability transpose @ dOutput)
+    dST_Q,       // dS^T      @ Q      (dScore transpose @ Query)
+    dL_W,        // dLogits   @ Weight
+    dLT_I,       // dLogits^T @ Input
 };
 
 // ======================================================================================
 // GEMM PHASE
 // ======================================================================================
 enum class GemmPhase : uint8_t {
-    FWD,         // Forward pass       (Q-centric: BLOCK_M × BLOCK_N)
-    BWQ,         // Backward dQ phase  (Q-centric: BLOCK_M × BLOCK_N)
-    BWKV         // Backward dKV phase (KV-centric: BLOCK_N × BLOCK_M)
+    FWD,         // Forward pass       (Q-centric:  BLOCK_M × BLOCK_N)
+    BWQ,         // Backward dQ phase  (Q-centric:  BLOCK_M × BLOCK_N)
+    BWKV,        // Backward dKV phase (KV-centric: BLOCK_N × BLOCK_M)
+    LCDX         // LCE dX / dW        (A @ B, B = [K, BLOCK_N], smem row stride = BLOCK_N)
 };
 
 // ======================================================================================
@@ -69,7 +72,8 @@ enum class Result : uint8_t {
 // ======================================================================================
 enum class Stage : uint8_t {
     DUAL,        // Dual   tile load (Q+dO or K+V initial load)
-    SNGL         // Single tile load (K/V or Q/dO loop loads)
+    SNGL,        // Single tile load (K/V or Q/dO loop loads)
+    TRNSP        // Narrow single load
 };
 
 // ======================================================================================
@@ -77,7 +81,7 @@ enum class Stage : uint8_t {
 // ======================================================================================
 template<GemmType Option, GemmPhase Phase>
 struct GemmTraits {
-    static constexpr bool A_IS_COL   = (Option == GemmType::PT_dO || Option == GemmType::dST_Q);
+    static constexpr bool A_IS_COL   = (Option == GemmType::PT_dO || Option == GemmType::dST_Q || Option == GemmType::dLT_I);
     static constexpr bool B_IS_COL   = (Option == GemmType::Q_KT  || Option == GemmType::dO_VT);
     static constexpr bool APPLY_MASK = (Option == GemmType::Q_KT);
 };
@@ -126,6 +130,9 @@ struct PhaseTraits {
 template<GemmPhase Phase, Stage Option>
 struct LoadTraits {
     static constexpr bool DUAL_LOAD = ((Phase == GemmPhase::BWQ || Phase == GemmPhase::BWKV) && Option == Stage::DUAL);
+
+    template<typename Config>
+    static constexpr int TRANSPOSE() { if constexpr (Option == Stage::TRNSP) return Config::BLOCK_N; else return Config::DIM; }
 };
 
 // ======================================================================================
