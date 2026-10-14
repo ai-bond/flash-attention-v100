@@ -170,7 +170,7 @@ except FileNotFoundError:
 
 setup(
     name="flash_attn_v100",
-    version="26.06",
+    version="26.10",
     packages=["flash_attn_v100"],
     ext_modules=get_ext_modules(),
     cmdclass=get_cmdclass(),
