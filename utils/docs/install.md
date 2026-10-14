@@ -1,4 +1,4 @@
-[<- Main](../../README.md)
+[<- Main](https://github.com/ai-bond/flash-attention-v100/)
 
 Last one available CUDA for Volta:
 -------------
@@ -84,4 +84,4 @@ Debugging errors
 
 For detailed instructions on enabling debug mode, extracting PTX/SASS assembly, and using kernel validation macros, refer to the dedicated [guide](https://github.com/ai-bond/flash-attention-v100/blob/main/utils/docs/debug.md).
 
-[<- Main](../../README.md)
+[<- Main](https://github.com/ai-bond/flash-attention-v100/)

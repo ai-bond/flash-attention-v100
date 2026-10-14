@@ -17,46 +17,46 @@ except ImportError:
 
 def ref_mha_forward(q, k, v, scale=1.0, causal=False, upcast=True):
     """
-    Queries [B,H,M,D] → Scores [B,H,M,N] → Weights [B,H,M,N] → Output [B,H,M,D]
-      Keys [B,H,N,D] ↗              ↓              ↓
-                               Causal Mask    Values [B,H,N,D] ↗
+    Queries [B,M,H,D] → Scores [B,H,M,N]  →  Weights [B,H,M,N] → Output [B,M,H,D]
+       Keys [B,N,H,D] ↗             ↓               ↓            ↗
+                               Causal Mask    Values [B,N,H,D] ↗
     """
     dtype_og = q.dtype
     if upcast:
         q, k, v = q.float(), k.float(), v.float()
 
-    s = torch.einsum('bhmd,bhnd->bhmn', q, k) * scale
+    s = torch.einsum('bmhd,bnhd->bhmn', q, k) * scale
     if causal:
         mask = torch.triu(torch.ones(s.shape[-2], s.shape[-1], device=s.device, dtype=torch.bool), diagonal=1)
         s = s.masked_fill(mask, float('-inf'))
     p = torch.softmax(s, dim=-1)
-    o = torch.einsum('bhmn,bhnd->bhmd', p, v)
+    o = torch.einsum('bhmn,bnhd->bmhd', p, v)
     return o.to(dtype=dtype_og)
 
 def ref_mha_backward(q, k, v, do, scale=1.0, causal=False, upcast=True):
     """
-    Q [B,H,M,D] ────┐
-    K [B,H,N,D] ────┼─→ QK^T * scale → Scores [B,H,M,N] → Softmax → Weights [B,H,M,N]
-    V [B,H,N,D] ────┘                                                           │
+    Q [B,M,H,D] ────┐
+    K [B,N,H,D] ────┼ → QK^T * scale → Scores [B,H,M,N] → Softmax → Weights [B,H,M,N]
+    V [B,N,H,D] ────┘                                                           │
     ↓                                                                           │
-    dO [B,H,M,D] ←─ Gradient Flow ── Output [B,H,M,D] ←─── Weights @ V ←────────┘
-    ↓              ↓              ↓
-    dQ            dK             dV
+    dO [B,M,H,D] ←─ Gradient Flow ── Output [B,M,H,D] ←─── Weights @ V ←────────┘
+    ↓                ↓      ↓
+    dQ              dK      dV
     """
     q = q.detach().clone().requires_grad_(True)
     k = k.detach().clone().requires_grad_(True)
     v = v.detach().clone().requires_grad_(True)
-    
+
     dtype_og = q.dtype
     if upcast:
         q, k, v = q.float(), k.float(), v.float()
 
-    s = torch.einsum('bhmd,bhnd->bhmn', q, k) * scale
+    s = torch.einsum('bmhd,bnhd->bhmn', q, k) * scale
     if causal:
         mask = torch.triu(torch.ones(s.shape[-2], s.shape[-1], device=s.device, dtype=torch.bool), diagonal=1)
         s = s.masked_fill(mask, float('-inf'))
     p = torch.softmax(s, dim=-1)
-    o_ref = torch.einsum('bhmn,bhnd->bhmd', p, v)
+    o_ref = torch.einsum('bhmn,bnhd->bmhd', p, v)
 
     grads = torch.autograd.grad(o_ref.to(dtype=dtype_og), (q, k, v), do)
     return tuple(g.to(dtype=dtype_og) for g in grads)
@@ -151,10 +151,10 @@ def test_combined():
             torch.manual_seed(421)
 
             # Generate reference input data forward+backward
-            q = torch.randn(B, H, M, D, device='cuda', dtype=torch.float16)
-            k = torch.randn(B, H, N, D, device='cuda', dtype=torch.float16)
-            v = torch.randn(B, H, N, D, device='cuda', dtype=torch.float16)
-            dO = torch.randn(B, H, M, D, device='cuda', dtype=torch.float16)
+            q  = torch.randn(B, M, H, D, device='cuda', dtype=torch.float16)
+            k  = torch.randn(B, N, H, D, device='cuda', dtype=torch.float16)
+            v  = torch.randn(B, N, H, D, device='cuda', dtype=torch.float16)
+            dO = torch.randn(B, M, H, D, device='cuda', dtype=torch.float16)
 
             softmax_scale = 1.0 / math.sqrt(D)
 
@@ -162,19 +162,19 @@ def test_combined():
             q, k, v, dO = map(ensure_contiguous, (q, k, v, dO))
 
             # Unique buffers for ref/cuda forward+backward
-            o_ref = torch.empty(B, H, M, D, device='cuda', dtype=torch.float16)
-            o_custom = torch.empty(B, H, M, D, device='cuda', dtype=torch.float16)
+            o_ref    = torch.empty(B, M, H, D, device='cuda', dtype=torch.float16)
+            o_custom = torch.empty(B, M, H, D, device='cuda', dtype=torch.float16)
 
-            softmax_lse_ref = torch.empty(B, H, M, device='cuda', dtype=torch.float32)
+            softmax_lse_ref    = torch.empty(B, H, M, device='cuda', dtype=torch.float32)
             softmax_lse_custom = torch.empty(B, H, M, device='cuda', dtype=torch.float32)
 
-            dQ_ref = torch.empty(B, H, M, D, device='cuda', dtype=torch.float16)
-            dK_ref = torch.empty(B, H, N, D, device='cuda', dtype=torch.float16)
-            dV_ref = torch.empty(B, H, N, D, device='cuda', dtype=torch.float16)
+            dQ_ref    = torch.empty(B, M, H, D, device='cuda', dtype=torch.float16)
+            dK_ref    = torch.empty(B, N, H, D, device='cuda', dtype=torch.float16)
+            dV_ref    = torch.empty(B, N, H, D, device='cuda', dtype=torch.float16)
 
-            dQ_custom = torch.empty(B, H, M, D, device='cuda', dtype=torch.float16)
-            dK_custom = torch.empty(B, H, N, D, device='cuda', dtype=torch.float16)
-            dV_custom = torch.empty(B, H, N, D, device='cuda', dtype=torch.float16)
+            dQ_custom = torch.empty(B, M, H, D, device='cuda', dtype=torch.float16)
+            dK_custom = torch.empty(B, N, H, D, device='cuda', dtype=torch.float16)
+            dV_custom = torch.empty(B, N, H, D, device='cuda', dtype=torch.float16)
 
             # Check for contiguous
             buffers = [o_ref, o_custom, softmax_lse_ref, softmax_lse_custom, dQ_ref, dK_ref, dV_ref, dQ_custom, dK_custom, dV_custom]

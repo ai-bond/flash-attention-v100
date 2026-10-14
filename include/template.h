@@ -200,8 +200,7 @@ struct BlockInfo {
         if constexpr (IS_VARLEN) {
             return static_cast<size_t>(q_base + start_q) * H_Q * D + static_cast<size_t>(head_idx) * D;
         } else {
-            int batch_head_id = batch_idx * H_Q + head_idx;
-            return static_cast<size_t>(batch_head_id) * M_or_TQ * D + static_cast<size_t>(start_q) * D;
+            return static_cast<size_t>(batch_idx) * M_or_TQ * H_Q * D + static_cast<size_t>(head_idx) * D + static_cast<size_t>(start_q)   * H_Q * D;
         }
     }
 
@@ -212,8 +211,7 @@ struct BlockInfo {
         if constexpr (IS_VARLEN) {
             return static_cast<size_t>(k_base) * H_K * D + static_cast<size_t>(kv_head_idx) * D;
         } else {
-            int batch_head_id = batch_idx * H_K + kv_head_idx;
-            return static_cast<size_t>(batch_head_id) * N_or_TK * D;
+            return static_cast<size_t>(batch_idx) * N_or_TK * H_K * D + static_cast<size_t>(kv_head_idx) * D;
         }
     }
 

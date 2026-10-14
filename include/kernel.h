@@ -35,25 +35,111 @@
 #define MAX_REG_BUFFER          65536
 
 // ======================================================================================
-// GEMM OPERATION
-// Bit 0 (0x1): CONTEXT-DEPENDENT FLAG
-//  * In WMMA_GEMM_SCORES:    APPLY_MASK (1=apply causal mask to output, 0=no mask)
-//  * In WMMA_GEMM_GRADIENTS: ACCUMULATE (1=C += A@B, 0=C = A@B / overwrite)
-// Bit 1 (0x2): A_IS_COL   (1=load A as col_major / interpret as A^T, 0=row_major)
-// Bit 2 (0x4): B_IS_COL   (1=load B as col_major / interpret as B^T, 0=row_major)
+// GEMM OPERATION TYPE
 // ======================================================================================
 enum class GemmType : uint8_t {
-    sQ_KT        = (1<<0) | (0<<1) | (1<<2),  // 0b101 = 5:    Q(row) @  K(col)^T, APPLY_MASK=1, A=row, B=col
-    dOV_dOVT     = (0<<0) | (0<<1) | (1<<2),  // 0b100 = 4:   dO(row) @  V(col)^T, APPLY_MASK=0, A=row, B=col
-    dO_PV        = (1<<0) | (0<<1) | (0<<2),  // 0b001 = 1:    P(row) @  V(col)^T, ACCUMULATE=1, A=row, B=col
-    dQ_dSK       = (1<<0) | (0<<1) | (0<<2),  // 0b001 = 1:   dS(row) @  K(row),   ACCUMULATE=1, A=row, B=row
-    dV_PTdO      = (1<<0) | (1<<1) | (0<<2),  // 0b011 = 3:  P^T(col) @ dO(row),   ACCUMULATE=1, A=col, B=row
-    dK_dSTQ      = (1<<0) | (1<<1) | (0<<2),  // 0b011 = 3: dS^T(col) @  Q(row),   ACCUMULATE=1, A=col, B=row
-    rowdot_dQ    = (0<<0) | (0<<1) | (0<<2),  // 0b000 = 0: LSE_OFFSET=0
-    rowdot_dKV   = (1<<0) | (0<<1) | (0<<2),  // 0b011 = 3: LSE_OFFSET=1
-    compute_dS   = (0<<0) | (0<<1) | (0<<2),  // 0b000 = 0: IS_SDS_SP=0  dQ
-    compute_P_dS = (1<<0) | (0<<1) | (0<<2),  // 0b001 = 1: IS_SDS_SP=1  dKV
-    write_dO     = (1<<0) | (0<<1) | (0<<2),  // 0b001 = 1: NORMALIZE=1, DUAL_OUTPUT=0 (forward  O)
-    write_dQ     = (0<<0) | (0<<1) | (0<<2),  // 0b000 = 0: NORMALIZE=0, DUAL_OUTPUT=0 (backward dQ)
-    write_dKV    = (0<<0) | (1<<1) | (0<<2),  // 0b010 = 2: NORMALIZE=0, DUAL_OUTPUT=1 (backward dK+dV)
+    Q_KT,        // Q         @ K^T    (Query @ Key transpose)
+    dO_VT,       // dO        @ V^T    (dOutput @ Value transpose)
+    P_V,         // P         @ V      (Probability @ Value)
+    dS_K,        // dS        @ K      (dScore @ Key)
+    PT_dO,       // P^T       @ dO     (Probability transpose @ dOutput)
+    dST_Q,       // dS^T      @ Q      (dScore transpose @ Query)
+    dL_W,        // dLogits   @ Weight
+    dLT_I,       // dLogits^T @ Input
+};
+
+// ======================================================================================
+// GEMM PHASE
+// ======================================================================================
+enum class GemmPhase : uint8_t {
+    FWD,         // Forward pass       (Q-centric:  BLOCK_M × BLOCK_N)
+    BWQ,         // Backward dQ phase  (Q-centric:  BLOCK_M × BLOCK_N)
+    BWKV,        // Backward dKV phase (KV-centric: BLOCK_N × BLOCK_M)
+    LCDX         // LCE dX / dW        (A @ B, B = [K, BLOCK_N], smem row stride = BLOCK_N)
+};
+
+// ======================================================================================
+// EPILOGUE RESULT TYPE
+// ======================================================================================
+enum class Result : uint8_t {
+    WRITE_O,     // Forward:  normalize + store O (divide by row_sum)
+    WRITE_DQ,    // Backward: store dQ (no normalization)
+    WRITE_DKV    // Backward: dual store dK+dV (no normalization)
+};
+
+// ======================================================================================
+// TILE LOAD STAGE
+// ======================================================================================
+enum class Stage : uint8_t {
+    DUAL,        // Dual   tile load (Q+dO or K+V initial load)
+    SNGL,        // Single tile load (K/V or Q/dO loop loads)
+    TRNSP        // Narrow single load
+};
+
+// ======================================================================================
+// GEMM OPERATION TRAITS
+// ======================================================================================
+template<GemmType Option, GemmPhase Phase>
+struct GemmTraits {
+    static constexpr bool A_IS_COL   = (Option == GemmType::PT_dO || Option == GemmType::dST_Q || Option == GemmType::dLT_I);
+    static constexpr bool B_IS_COL   = (Option == GemmType::Q_KT  || Option == GemmType::dO_VT);
+    static constexpr bool APPLY_MASK = (Option == GemmType::Q_KT);
+};
+
+// ======================================================================================
+// PHASE TRAITS
+// ======================================================================================
+template<GemmPhase Phase>
+struct PhaseTraits {
+    static constexpr bool IS_SWAPPED = (Phase == GemmPhase::BWKV);
+    static constexpr int  LSE_OFFSET = IS_SWAPPED ? 1 : 0;
+    static constexpr bool IS_SDS_SP  = IS_SWAPPED;
+
+    template<typename Config>
+    static constexpr int BLOCK_X() {
+        if constexpr (Phase == GemmPhase::FWD) {
+            return IS_SWAPPED ? Config::DO::BLOCK_N :  Config::DO::BLOCK_M;
+        } else if constexpr (Phase == GemmPhase::BWQ) {
+            return IS_SWAPPED ? Config::DQ::BLOCK_N :  Config::DQ::BLOCK_M;
+        } else {
+            return IS_SWAPPED ? Config::DKV::BLOCK_N : Config::DKV::BLOCK_M;
+        }
+    }
+
+    template<typename Config>
+    static constexpr int BLOCK_Y() {
+        if constexpr (Phase == GemmPhase::FWD) {
+            return IS_SWAPPED ? Config::DO::BLOCK_M :  Config::DO::BLOCK_N;
+        } else if constexpr (Phase == GemmPhase::BWQ) {
+            return IS_SWAPPED ? Config::DQ::BLOCK_M :  Config::DQ::BLOCK_N;
+        } else {
+            return IS_SWAPPED ? Config::DKV::BLOCK_M : Config::DKV::BLOCK_N;
+        }
+    }
+
+    template<typename Config>
+    static constexpr int LDS_STRIDE() { return BLOCK_Y<Config>(); }
+
+    template<typename Config>
+    static constexpr int LDO_STRIDE() { return BLOCK_Y<Config>() * 2; }
+};
+
+// ======================================================================================
+// LOAD TRAITS
+// ======================================================================================
+template<GemmPhase Phase, Stage Option>
+struct LoadTraits {
+    static constexpr bool DUAL_LOAD = ((Phase == GemmPhase::BWQ || Phase == GemmPhase::BWKV) && Option == Stage::DUAL);
+
+    template<typename Config>
+    static constexpr int TRANSPOSE() { if constexpr (Option == Stage::TRNSP) return Config::BLOCK_N; else return Config::DIM; }
+};
+
+// ======================================================================================
+// EPILOGUE TRAITS
+// ======================================================================================
+template<Result Type>
+struct EpilogueTraits {
+    static constexpr bool NORMALIZE  = (Type == Result::WRITE_O);
+    static constexpr bool DUAL_STORE = (Type == Result::WRITE_DKV);
 };

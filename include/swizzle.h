@@ -11,7 +11,12 @@
 // SWIZZLE HELPERS
 // ======================================================================================
 __device__ __forceinline__ uint32_t swizzle(uint32_t addr, int row) {
-    return addr ^ ((row & 3) | ((row >> 1) & 4)) << 4;
+#if defined(MMA_NATIVE) || defined(MMA_884)
+    (void)row;
+    return addr;
+#else
+    return addr ^ (((row & 3) | ((row >> 1) & 4)) << 4);
+#endif
 }
 
 // ======================================================================================

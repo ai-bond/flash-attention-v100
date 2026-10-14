@@ -1,3 +1,5 @@
+[<- В начало](https://github.com/ai-bond/flash-attention-v100)
+
 - [Русский язык](#сведения-о-nvidia-volta-gv100-inline-ptx-assembly-tensor-core-и-mma) / [English Language](#nvidia-volta-gv100-inline-ptx-assembly-tensor-core-and-mma)
 
 
@@ -142,7 +144,11 @@ auto result = mma_op(A, B, C);
 ---
 Ошибка компиляции "Feature 'ldmatrix' requires .target sm_75 or higher" возникает потому, что инструкция ldmatrix, которая используется nvcuda::wmma для загрузки данных в фрагменты для операций с Tensor Cores, требует целевой архитектуры sm_75 или выше . Хотя архитектура Volta (sm_70) впервые представила Tensor Cores и поддерживает инструкцию mma.sync.m8n8k4, инструкция ldmatrix была введена позже, с архитектурой Turing (sm_75) . Поэтому код, использующий ldmatrix, не может быть скомпилирован для целевой архитектуры sm_70
 
+[<- В начало](https://github.com/ai-bond/flash-attention-v100)
+
 - [Русский язык](#сведения-о-nvidia-volta-gv100-inline-ptx-assembly-tensor-core-и-mma) / [English Language](#nvidia-volta-gv100-inline-ptx-assembly-tensor-core-and-mma)
+
+[<- Main](https://github.com/ai-bond/flash-attention-v100)
 
 ---
 
@@ -279,3 +285,5 @@ Although `nvcuda::wmma` is a high-level C++ API introduced in CUDA 9+ and design
 ### Using ldmatrix
 ---
 The compilation error "Feature 'ldmatrix' requires .target sm_75 or higher" occurs because the `ldmatrix` instruction, which is used by `nvcuda::wmma` to load data into fragments for Tensor Core operations, requires target architecture sm_75 or higher. Although Volta architecture (sm_70) first introduced Tensor Cores and supports the `mma.sync.m8n8k4` instruction, the `ldmatrix` instruction was introduced later with Turing architecture (sm_75). Therefore, code using `ldmatrix` cannot be compiled for target architecture sm_70.
+
+[<- Main](https://github.com/ai-bond/flash-attention-v100)

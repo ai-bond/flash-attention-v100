@@ -19,37 +19,46 @@
 // WMMA_GEMM_SCORES: Compute C = (A @ B) * scale [+(causal/window/alibi/softcap)]
 // Use for: Q@K^T (forward), dO@V^T (backward pre-softmax)
 // ======================================================================================
-template<typename Config, GemmType TYPE, int D, bool IS_CAUSAL, bool IS_ALIBI, bool IS_SOFTCAP, bool IS_WINDOW,
-                                                       int BLOCK_X, int BLOCK_Y, int IN_STRIDE, int OUT_STRIDE>
+template<typename Config, GemmType TYPE, GemmPhase PHASE, bool IS_CAUSAL, bool IS_ALIBI, bool IS_SOFTCAP, bool IS_WINDOW>
 __device__ __forceinline__ void WMMA_GEMM_SCORES(
     const __half* __restrict__ SMEM_A,
     const __half* __restrict__ SMEM_B,
            float* __restrict__ SMEM_C,
-    int VALID_M,   int VALID_N,
-    int GLOBAL_M,  int GLOBAL_N,
-    int SEQLEN,    float SOFTMAX_SCALE,
-    float SOFTCAP, float ALIBI_SLOPE,
-    int WIN_L,     int WIN_R,
-    int WARP_ID,   int LANE_ID
+    int   VALID_M,   int   VALID_N,
+    int   GLOBAL_M,  int   GLOBAL_N,
+    int   SEQLEN,    float SOFTMAX_SCALE,
+    float SOFTCAP,   float ALIBI_SLOPE,
+    int   WIN_L,     int   WIN_R,
+    int   WARP_ID,   int   LANE_ID
 ) {
 #ifdef MMA_NATIVE
     using namespace nvcuda::wmma;
 #else
     using namespace volta::wmma;
 #endif
-    constexpr bool APPLY_MASK    = static_cast<uint8_t>(TYPE) & 0x1;
-    constexpr bool HAS_FEATURES  = IS_ALIBI || IS_SOFTCAP || IS_WINDOW;
-    const     int  SEQLEN_OFFSET = (IS_CAUSAL || IS_WINDOW) ? SEQLEN : 0;
+    using GTraits = GemmTraits<TYPE, PHASE>;
+    using PTraits = PhaseTraits<PHASE>;
 
-    constexpr int WARPS_PER_BLOCK = Config::WARPS_PER_BLOCK;
-    constexpr int num_tiles_m     = (BLOCK_X + WMMA_M - 1) / WMMA_M;
-    constexpr int num_tiles_n     = (BLOCK_Y + WMMA_N - 1) / WMMA_N;
-    constexpr int num_tiles_k     = (D + WMMA_K - 1) / WMMA_K;
-    constexpr int total_tiles     = num_tiles_m * num_tiles_n;
-    constexpr int tiles_per_warp  = (total_tiles + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
+    constexpr bool APPLY_MASK      = GTraits::APPLY_MASK;
+    constexpr bool HAS_FEATURES    =  IS_ALIBI  || IS_SOFTCAP || IS_WINDOW;
+    const     int  SEQLEN_OFFSET   = (IS_CAUSAL || IS_WINDOW) ? SEQLEN : 0;
+    constexpr int  WARPS_PER_BLOCK = Config::WARPS_PER_BLOCK;
 
-    using a_layout = std::conditional_t<static_cast<uint8_t>(TYPE) & 0x2, col_major, row_major>;
-    using b_layout = std::conditional_t<static_cast<uint8_t>(TYPE) & 0x4, col_major, row_major>;
+    constexpr int D                = Config::DIM;
+    constexpr int TILE_M           = PTraits::template BLOCK_X<Config>();
+    constexpr int TILE_N           = PTraits::template BLOCK_Y<Config>();
+    constexpr int A_STRIDE         = GTraits::A_IS_COL ? PTraits::template BLOCK_X<Config>() : Config::DIM;
+    constexpr int B_STRIDE         = GTraits::B_IS_COL ? Config::DIM : PTraits::template BLOCK_Y<Config>();
+    constexpr int C_STRIDE         = PTraits::template BLOCK_Y<Config>();
+
+    constexpr int num_tiles_m      = (TILE_M + WMMA_M - 1) / WMMA_M;
+    constexpr int num_tiles_n      = (TILE_N + WMMA_N - 1) / WMMA_N;
+    constexpr int num_tiles_k      = (D + WMMA_K - 1) / WMMA_K;
+    constexpr int total_tiles      = num_tiles_m * num_tiles_n;
+    constexpr int tiles_per_warp   = (total_tiles + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
+
+    using a_layout = std::conditional_t<GTraits::A_IS_COL, col_major, row_major>;
+    using b_layout = std::conditional_t<GTraits::B_IS_COL, col_major, row_major>;
 
     const unsigned row_causal =  (LANE_ID & 0b1) + ((LANE_ID >> 2) & 0b1) * 8 + ((LANE_ID >> 4) & 0b1) * 4;
     const unsigned col_causal = ((LANE_ID >> 1) & 0b1) * 2 + ((LANE_ID >> 3) & 0b1) * 8;
@@ -74,8 +83,17 @@ __device__ __forceinline__ void WMMA_GEMM_SCORES(
         for (int k_tile = 0; k_tile < num_tiles_k; ++k_tile) {
             const int k_offset = k_tile * WMMA_K;
             if (k_offset >= D) break;
-            load_matrix_sync(a_frag, SMEM_A + tile_m * IN_STRIDE + k_offset, IN_STRIDE);
-            load_matrix_sync(b_frag, SMEM_B + tile_n * IN_STRIDE + k_offset, IN_STRIDE);
+
+            const __half* a_ptr = GTraits::A_IS_COL
+                ? SMEM_A + k_offset * A_STRIDE + tile_m
+                : SMEM_A + tile_m   * A_STRIDE + k_offset;
+
+            const __half* b_ptr = GTraits::B_IS_COL
+                ? SMEM_B + tile_n   * B_STRIDE + k_offset
+                : SMEM_B + k_offset * B_STRIDE + tile_n;
+
+            load_matrix_sync(a_frag, a_ptr, A_STRIDE);
+            load_matrix_sync(b_frag, b_ptr, B_STRIDE);
             mma_sync(acc_frag, a_frag, b_frag, acc_frag);
         }
 
@@ -155,15 +173,15 @@ __device__ __forceinline__ void WMMA_GEMM_SCORES(
                 acc_frag.x[i] *= SOFTMAX_SCALE;
             }
         }
-        store_matrix_sync(SMEM_C + tile_m * OUT_STRIDE + tile_n, acc_frag, OUT_STRIDE, mem_row_major);
+        store_matrix_sync(SMEM_C + tile_m * C_STRIDE + tile_n, acc_frag, C_STRIDE, mem_row_major);
     }
 }
 
 // ======================================================================================
 // WMMA_GEMM_GRADIENTS: Compute C += A @ B  (Read-Modify-Write accumulation)
-// Use for: P@V, dS@K, P^T@dO, dS^T@Q in backward pass
+// Use for: P@V (forward), dS@K, P^T@dO, dS^T@Q (backward)
 // ======================================================================================
-template<typename Config, GemmType TYPE, int D, int BLOCK_X, int BLOCK_Y, int IN_STRIDE, int OUT_STRIDE>
+template<typename Config, GemmType TYPE, GemmPhase PHASE>
 __device__ __forceinline__ void WMMA_GEMM_GRADIENTS(
     const __half* __restrict__ SMEM_A,
     const __half* __restrict__ SMEM_B,
@@ -178,20 +196,25 @@ __device__ __forceinline__ void WMMA_GEMM_GRADIENTS(
 #else
     using namespace volta::wmma;
 #endif
-    constexpr bool A_IS_COL    = static_cast<uint8_t>(TYPE) & 0x2;
-    constexpr bool B_IS_COL    = static_cast<uint8_t>(TYPE) & 0x4;
+    using GTraits = GemmTraits<TYPE, PHASE>;
+    using PTraits = PhaseTraits<PHASE>;
 
+    constexpr int D               = Config::DIM;
+    constexpr int TILE_M          = PTraits::IS_SWAPPED ? PTraits::template BLOCK_Y<Config>() : PTraits::template BLOCK_X<Config>();
+    constexpr int TILE_K          = PTraits::IS_SWAPPED ? PTraits::template BLOCK_X<Config>() : PTraits::template BLOCK_Y<Config>();
+    constexpr int A_STRIDE        = GTraits::A_IS_COL ? (TILE_M * 2) : (TILE_K * 2);
+    constexpr int B_STRIDE        = GTraits::B_IS_COL ? PTraits::template BLOCK_Y<Config>() : Config::DIM;
+    constexpr int C_STRIDE        = Config::DIM;
     constexpr int WARPS_PER_BLOCK = Config::WARPS_PER_BLOCK;
 
-    constexpr int num_tiles_m = (BLOCK_X + WMMA_M - 1) / WMMA_M;
-    constexpr int num_tiles_n = (D + WMMA_N - 1) / WMMA_N;
-    constexpr int num_tiles_k = (BLOCK_Y + WMMA_K - 1) / WMMA_K;
+    constexpr int num_tiles_m     = (TILE_M + WMMA_M - 1) / WMMA_M;
+    constexpr int num_tiles_n     = (D + WMMA_N - 1) / WMMA_N;
+    constexpr int num_tiles_k     = (TILE_K + WMMA_K - 1) / WMMA_K;
+    constexpr int total_tiles     = num_tiles_m * num_tiles_n;
+    constexpr int tiles_per_warp  = (total_tiles + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
 
-    constexpr int total_tiles = num_tiles_m * num_tiles_n;
-    constexpr int tiles_per_warp = (total_tiles + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
-
-    using a_layout = std::conditional_t<A_IS_COL, col_major, row_major>;
-    using b_layout = std::conditional_t<B_IS_COL, col_major, row_major>;
+    using a_layout = std::conditional_t<GTraits::A_IS_COL, col_major, row_major>;
+    using b_layout = std::conditional_t<GTraits::B_IS_COL, col_major, row_major>;
 
     for (int tile_idx = 0; tile_idx < tiles_per_warp; ++tile_idx) {
         const int global_tile_idx = WARP_ID * tiles_per_warp + tile_idx;
@@ -209,26 +232,26 @@ __device__ __forceinline__ void WMMA_GEMM_GRADIENTS(
         fragment<matrix_b, WMMA_M, WMMA_N, WMMA_K, half, b_layout> b_frag;
         fragment<accumulator, WMMA_M, WMMA_N, WMMA_K, float> acc_frag;
 
-        load_matrix_sync(acc_frag, SMEM_C + tile_m * OUT_STRIDE + tile_n, OUT_STRIDE, mem_row_major);
+        load_matrix_sync(acc_frag, SMEM_C + tile_m * C_STRIDE + tile_n, C_STRIDE, mem_row_major);
 
         #pragma unroll
         for (int k_tile = 0; k_tile < num_tiles_k; ++k_tile) {
             const int k_offset = k_tile * WMMA_K;
             if (k_offset >= VALID_K) break;
 
-            const __half* a_ptr = A_IS_COL
-                ? SMEM_A + k_offset * IN_STRIDE + tile_m
-                : SMEM_A + tile_m * IN_STRIDE + k_offset;
+            const __half* a_ptr = GTraits::A_IS_COL 
+                ? SMEM_A + k_offset * A_STRIDE + tile_m
+                : SMEM_A + tile_m   * A_STRIDE + k_offset;
 
-            const __half* b_ptr = B_IS_COL
-                ? SMEM_B + tile_n * OUT_STRIDE + k_offset
-                : SMEM_B + k_offset * OUT_STRIDE + tile_n;
+            const __half* b_ptr = GTraits::B_IS_COL
+                ? SMEM_B + tile_n   * B_STRIDE + k_offset
+                : SMEM_B + k_offset * B_STRIDE + tile_n;
 
-            load_matrix_sync(a_frag, a_ptr, IN_STRIDE);
-            load_matrix_sync(b_frag, b_ptr, OUT_STRIDE);
+            load_matrix_sync(a_frag, a_ptr, A_STRIDE);
+            load_matrix_sync(b_frag, b_ptr, B_STRIDE);
 
             mma_sync(acc_frag, a_frag, b_frag, acc_frag);
         }
-        store_matrix_sync(SMEM_C + tile_m * OUT_STRIDE + tile_n, acc_frag, OUT_STRIDE, mem_row_major);
+        store_matrix_sync(SMEM_C + tile_m * C_STRIDE + tile_n, acc_frag, C_STRIDE, mem_row_major);
     }
 }
