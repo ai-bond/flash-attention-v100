@@ -21,7 +21,7 @@
 // ======================================================================================
 // KV-CACHE FORWARD KERNEL
 // ======================================================================================
-template<int D, bool IS_CAUSAL, bool IS_ALIBI, bool IS_SOFTCAP, bool IS_WINDOW, bool IS_PAGED, bool IS_ROPE, bool IS_INTERLEAVED>
+template<int D, bool IS_EVEN, bool IS_CAUSAL, bool IS_ALIBI, bool IS_SOFTCAP, bool IS_WINDOW, bool IS_PAGED, bool IS_ROPE, bool IS_INTERLEAVED>
 __global__ void __launch_bounds__(KernelConfig<D>::THREADS_PER_BLOCK, 1)
 flash_attention_kvcache_kernel(
     const __half* __restrict__ Q,
@@ -385,8 +385,9 @@ void launcher_flash_attention_kvcache(
     bool is_window  = (window_left >= 0 || window_right >= 0);
     bool is_dropout = false;
 
-    dispatch_attention_features(is_causal, is_alibi, is_softcap, is_window, is_dropout, is_paged, is_rope, is_interleaved,
-    [&](auto CAUSAL, auto ALIBI, auto SOFTCAP, auto WINDOW, auto /*DROPOUT*/, auto PAGED, auto ROPE, auto INTERLEAVED) {
+    dispatch_attention_features(is_even, is_causal, is_alibi, is_softcap, is_window, is_dropout, is_paged, is_rope, is_interleaved,
+    [&](auto EVEN, auto CAUSAL, auto ALIBI, auto SOFTCAP, auto WINDOW, auto /*DROPOUT*/, auto PAGED, auto ROPE, auto INTERLEAVED) {
+        constexpr bool IS_EVEN        = decltype(EVEN)::value;
         constexpr bool IS_CAUSAL      = decltype(CAUSAL)::value;
         constexpr bool IS_ALIBI       = decltype(ALIBI)::value;
         constexpr bool IS_SOFTCAP     = decltype(SOFTCAP)::value;
@@ -395,7 +396,7 @@ void launcher_flash_attention_kvcache(
         constexpr bool IS_ROPE        = decltype(ROPE)::value;
         constexpr bool IS_INTERLEAVED = decltype(INTERLEAVED)::value;
 
-        auto kernel = flash_attention_kvcache_kernel<D, IS_CAUSAL, IS_ALIBI, IS_SOFTCAP, IS_WINDOW, IS_PAGED, IS_ROPE, IS_INTERLEAVED>;
+        auto kernel = flash_attention_kvcache_kernel<D, IS_EVEN, IS_CAUSAL, IS_ALIBI, IS_SOFTCAP, IS_WINDOW, IS_PAGED, IS_ROPE, IS_INTERLEAVED>;
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
         kernel<<<grid, block, smem, stream>>>(
             q_ptr, k_new_ptr, v_new_ptr, k_cache_ptr, v_cache_ptr, out_ptr, lse_ptr,

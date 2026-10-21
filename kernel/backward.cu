@@ -23,7 +23,7 @@
 // ======================================================================================
 // BACKWARD KERNEL
 // ======================================================================================
-template<int D, bool IS_CAUSAL, bool IS_ALIBI, bool IS_SOFTCAP, bool IS_WINDOW, bool IS_DROPOUT>
+template<int D, bool IS_EVEN, bool IS_CAUSAL, bool IS_ALIBI, bool IS_SOFTCAP, bool IS_WINDOW, bool IS_DROPOUT>
 __global__ void __launch_bounds__(KernelConfig<D>::THREADS_PER_BLOCK, 1)
 flash_attention_backward_kernel(
     const __half* __restrict__ Q,
@@ -533,6 +533,7 @@ void launcher_flash_attention_backward(
     const dim3 grid(grid_max, 2, B * H_Q);
     const dim3 block(Config::THREADS_PER_BLOCK);
 
+    bool is_even        = (N % Config::DQ::BLOCK_N  == 0) && (M % Config::DKV::BLOCK_N == 0);
     bool is_alibi       = (alibi_slopes != nullptr);
     bool is_softcap     = (softcap > 0.0f);
     bool is_window      = (window_left >= 0 || window_right >= 0);
@@ -551,15 +552,16 @@ void launcher_flash_attention_backward(
     __half*       dK_ptr  = reinterpret_cast<__half*>(dK.data_ptr());
     __half*       dV_ptr  = reinterpret_cast<__half*>(dV.data_ptr());
 
-    dispatch_attention_features(is_causal, is_alibi, is_softcap, is_window, is_dropout, is_paged, is_rope, is_interleaved,
-    [&](auto CAUSAL, auto ALIBI, auto SOFTCAP, auto WINDOW, auto DROPOUT, auto /*PAGED*/, auto /*ROPE*/, auto /*INTERLEAVED*/) {
+    dispatch_attention_features(is_even, is_causal, is_alibi, is_softcap, is_window, is_dropout, is_paged, is_rope, is_interleaved,
+    [&](auto EVEN, auto CAUSAL, auto ALIBI, auto SOFTCAP, auto WINDOW, auto DROPOUT, auto /*PAGED*/, auto /*ROPE*/, auto /*INTERLEAVED*/) {
+        constexpr bool IS_EVEN    = decltype(EVEN)::value;
         constexpr bool IS_CAUSAL  = decltype(CAUSAL)::value;
         constexpr bool IS_ALIBI   = decltype(ALIBI)::value;
         constexpr bool IS_SOFTCAP = decltype(SOFTCAP)::value;
         constexpr bool IS_WINDOW  = decltype(WINDOW)::value;
         constexpr bool IS_DROPOUT = decltype(DROPOUT)::value;
 
-        auto kernel = flash_attention_backward_kernel<D, IS_CAUSAL, IS_ALIBI, IS_SOFTCAP, IS_WINDOW, IS_DROPOUT>;
+        auto kernel = flash_attention_backward_kernel<D, IS_EVEN, IS_CAUSAL, IS_ALIBI, IS_SOFTCAP, IS_WINDOW, IS_DROPOUT>;
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
 
         kernel<<<grid, block, smem, stream>>>(

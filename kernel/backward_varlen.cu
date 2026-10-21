@@ -23,7 +23,7 @@
 // ======================================================================================
 // BACKWARD VARLEN KERNEL
 // ======================================================================================
-template<int D, bool IS_CAUSAL, bool IS_ALIBI, bool IS_SOFTCAP, bool IS_WINDOW, bool IS_DROPOUT>
+template<int D, bool IS_EVEN, bool IS_CAUSAL, bool IS_ALIBI, bool IS_SOFTCAP, bool IS_WINDOW, bool IS_DROPOUT>
 __global__ void __launch_bounds__(KernelConfig<D>::THREADS_PER_BLOCK, 1)
 flash_attention_backward_varlen_kernel(
     const __half* __restrict__ Q,
@@ -566,6 +566,7 @@ void launcher_flash_attention_backward_varlen(
     const dim3 grid(grid_x, 2, B * H_Q);
     const dim3 block(Config::THREADS_PER_BLOCK);
 
+    bool is_even        = false;
     bool is_alibi       = (alibi_slopes != nullptr);
     bool is_softcap     = (softcap > 0.0f);
     bool is_window      = (window_left >= 0 || window_right >= 0);
@@ -587,15 +588,16 @@ void launcher_flash_attention_backward_varlen(
     const int*    cu_seqlens_q_ptr = cu_seqlens_q.data_ptr<int>();
     const int*    cu_seqlens_k_ptr = cu_seqlens_k.data_ptr<int>();
 
-    dispatch_attention_features(is_causal, is_alibi, is_softcap, is_window, is_dropout, is_paged, is_rope, is_interleaved,
-    [&](auto CAUSAL, auto ALIBI, auto SOFTCAP, auto WINDOW, auto DROPOUT, auto /*PAGED*/, auto /*ROPE*/, auto /*INTERLEAVED*/) {
+    dispatch_attention_features(is_even, is_causal, is_alibi, is_softcap, is_window, is_dropout, is_paged, is_rope, is_interleaved,
+    [&](auto EVEN, auto CAUSAL, auto ALIBI, auto SOFTCAP, auto WINDOW, auto DROPOUT, auto /*PAGED*/, auto /*ROPE*/, auto /*INTERLEAVED*/) {
+        constexpr bool IS_EVEN    = decltype(EVEN)::value;
         constexpr bool IS_CAUSAL  = decltype(CAUSAL)::value;
         constexpr bool IS_ALIBI   = decltype(ALIBI)::value;
         constexpr bool IS_SOFTCAP = decltype(SOFTCAP)::value;
         constexpr bool IS_WINDOW  = decltype(WINDOW)::value;
         constexpr bool IS_DROPOUT = decltype(DROPOUT)::value;
 
-        auto kernel = flash_attention_backward_varlen_kernel<D, IS_CAUSAL, IS_ALIBI, IS_SOFTCAP, IS_WINDOW, IS_DROPOUT>;
+        auto kernel = flash_attention_backward_varlen_kernel<D, IS_EVEN, IS_CAUSAL, IS_ALIBI, IS_SOFTCAP, IS_WINDOW, IS_DROPOUT>;
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
 
         kernel<<<grid, block, smem, stream>>>(

@@ -22,7 +22,7 @@
 // ======================================================================================
 // FORWARD KERNEL
 // ======================================================================================
-template<int D, bool IS_CAUSAL, bool IS_ALIBI, bool IS_SOFTCAP, bool IS_WINDOW, bool IS_DROPOUT>
+template<int D, bool IS_EVEN, bool IS_CAUSAL, bool IS_ALIBI, bool IS_SOFTCAP, bool IS_WINDOW, bool IS_DROPOUT>
 __global__ void __launch_bounds__(KernelConfig<D>::THREADS_PER_BLOCK, 1)
 flash_attention_forward_kernel(
     const __half* __restrict__ Q,
@@ -255,6 +255,7 @@ void launcher_flash_attention_forward(
     const dim3 grid((M + Config::DO::BLOCK_M - 1) / Config::DO::BLOCK_M, 1, B * H_Q);
     const dim3 block(Config::THREADS_PER_BLOCK);
 
+    bool is_even        = (N % Config::DO::BLOCK_N == 0);
     bool is_alibi       = (alibi_slopes != nullptr);
     bool is_softcap     = (softcap > 0.0f);
     bool is_window      = (window_left >= 0 || window_right >= 0);
@@ -270,15 +271,16 @@ void launcher_flash_attention_forward(
            float* lse_ptr   = softmax_lse.data_ptr<float>();
           __half* dmask_ptr = dmask.numel() > 0 ? reinterpret_cast<__half*>(dmask.data_ptr()) : nullptr;
 
-    dispatch_attention_features(is_causal, is_alibi, is_softcap, is_window, is_dropout, is_paged, is_rope, is_interleaved,
-    [&](auto CAUSAL, auto ALIBI, auto SOFTCAP, auto WINDOW, auto DROPOUT, auto /*PAGED*/, auto /*ROPE*/, auto /*INTERLEAVED*/) {
+    dispatch_attention_features(is_even, is_causal, is_alibi, is_softcap, is_window, is_dropout, is_paged, is_rope, is_interleaved,
+    [&](auto EVEN, auto CAUSAL, auto ALIBI, auto SOFTCAP, auto WINDOW, auto DROPOUT, auto /*PAGED*/, auto /*ROPE*/, auto /*INTERLEAVED*/) {
+        constexpr bool IS_EVEN    = decltype(EVEN)::value;
         constexpr bool IS_CAUSAL  = decltype(CAUSAL)::value;
         constexpr bool IS_ALIBI   = decltype(ALIBI)::value;
         constexpr bool IS_SOFTCAP = decltype(SOFTCAP)::value;
         constexpr bool IS_WINDOW  = decltype(WINDOW)::value;
         constexpr bool IS_DROPOUT = decltype(DROPOUT)::value;
 
-        auto kernel = flash_attention_forward_kernel<D, IS_CAUSAL, IS_ALIBI, IS_SOFTCAP, IS_WINDOW, IS_DROPOUT>;
+        auto kernel = flash_attention_forward_kernel<D, IS_EVEN, IS_CAUSAL, IS_ALIBI, IS_SOFTCAP, IS_WINDOW, IS_DROPOUT>;
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
 
         kernel<<<grid, block, smem, stream>>>(
