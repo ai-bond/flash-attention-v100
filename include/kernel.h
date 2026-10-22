@@ -18,6 +18,7 @@
 #endif
 
 #define NEG_INF                 (-1e30f)
+#define LOG2E                   1.4426950408889634f
 
 #define MAX_THREADS_PER_WARP    32
 #define MAX_THREADS_PER_SM      2048
@@ -92,15 +93,14 @@ struct GemmTraits {
 template<GemmPhase Phase>
 struct PhaseTraits {
     static constexpr bool IS_SWAPPED = (Phase == GemmPhase::BWKV);
-    static constexpr int  LSE_OFFSET = IS_SWAPPED ? 1 : 0;
-    static constexpr bool IS_SDS_SP  = IS_SWAPPED;
+    static constexpr bool WRITE_P    = IS_SWAPPED;
 
     template<typename Config>
     static constexpr int BLOCK_X() {
         if constexpr (Phase == GemmPhase::FWD) {
-            return IS_SWAPPED ? Config::DO::BLOCK_N :  Config::DO::BLOCK_M;
+            return IS_SWAPPED ? Config::DO::BLOCK_N  : Config::DO::BLOCK_M;
         } else if constexpr (Phase == GemmPhase::BWQ) {
-            return IS_SWAPPED ? Config::DQ::BLOCK_N :  Config::DQ::BLOCK_M;
+            return IS_SWAPPED ? Config::DQ::BLOCK_N  : Config::DQ::BLOCK_M;
         } else {
             return IS_SWAPPED ? Config::DKV::BLOCK_N : Config::DKV::BLOCK_M;
         }
@@ -109,19 +109,16 @@ struct PhaseTraits {
     template<typename Config>
     static constexpr int BLOCK_Y() {
         if constexpr (Phase == GemmPhase::FWD) {
-            return IS_SWAPPED ? Config::DO::BLOCK_M :  Config::DO::BLOCK_N;
+            return IS_SWAPPED ? Config::DO::BLOCK_M  : Config::DO::BLOCK_N;
         } else if constexpr (Phase == GemmPhase::BWQ) {
-            return IS_SWAPPED ? Config::DQ::BLOCK_M :  Config::DQ::BLOCK_N;
+            return IS_SWAPPED ? Config::DQ::BLOCK_M  : Config::DQ::BLOCK_N;
         } else {
             return IS_SWAPPED ? Config::DKV::BLOCK_M : Config::DKV::BLOCK_N;
         }
     }
 
     template<typename Config>
-    static constexpr int LDS_STRIDE() { return BLOCK_Y<Config>(); }
-
-    template<typename Config>
-    static constexpr int LDO_STRIDE() { return BLOCK_Y<Config>() * 2; }
+    static constexpr int STRIDE() { return BLOCK_Y<Config>(); }
 };
 
 // ======================================================================================
@@ -140,6 +137,7 @@ struct LoadTraits {
 // ======================================================================================
 template<Result Type>
 struct EpilogueTraits {
+    static constexpr bool WRITE_LSE  = (Type == Result::WRITE_O);
     static constexpr bool NORMALIZE  = (Type == Result::WRITE_O);
     static constexpr bool DUAL_STORE = (Type == Result::WRITE_DKV);
 };

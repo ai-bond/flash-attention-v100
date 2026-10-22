@@ -7,6 +7,15 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include "swizzle.h"
+#include "template.h"
+
+#ifdef MMA_NATIVE
+    #include <mma.h>
+#elif defined(MMA_884)
+    #include "mma_m8n8k4.h"
+#else
+    #include "mma_m16n16k16.h"
+#endif
 
 // ======================================================================================
 // SMEM CORE HELPER
@@ -66,6 +75,47 @@ __device__ __forceinline__ void WMMA_GEMM_INIT_SMEM(T (&arr)[N], T VALUE) {
     constexpr size_t TOTAL_BYTES = N * sizeof(T);
     INIT_SMEM_CORE<Config, T, TOTAL_BYTES>(reinterpret_cast<char*>(arr), VALUE);
 }
+
+// ======================================================================================
+// WMMA_GEMM_INIT_REGS: Register fragment array
+// ======================================================================================
+template<typename Config, GemmType TYPE, GemmPhase PHASE, bool SCALARS = false>
+struct WMMA_GEMM_INIT_REGS {
+
+    using GTraits = GemmTraits<TYPE, PHASE>;
+    using PTraits = PhaseTraits<PHASE>;
+
+    static constexpr bool IS_SCORES  = GTraits::B_IS_COL; 
+    static constexpr int TILE_M      = IS_SCORES ? PTraits::template BLOCK_X<Config>() : (PTraits::IS_SWAPPED ? PTraits::template BLOCK_Y<Config>() : PTraits::template BLOCK_X<Config>());
+    static constexpr int TILE_N      = IS_SCORES ? PTraits::template BLOCK_Y<Config>() : Config::DIM;
+    static constexpr int num_tiles_m = (TILE_M + WMMA_M - 1) / WMMA_M;
+    static constexpr int num_tiles_n = (TILE_N + WMMA_N - 1) / WMMA_N;
+    static constexpr int total_mn    = num_tiles_m * num_tiles_n;
+    static constexpr int tiles       = SCALARS ? (num_tiles_m / Config::WARPS_PER_BLOCK) * 2 : (total_mn + Config::WARPS_PER_BLOCK - 1) / Config::WARPS_PER_BLOCK;
+
+#ifdef MMA_NATIVE
+    using frag_t = nvcuda::wmma::fragment<nvcuda::wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float>;
+#else
+    using frag_t = volta::wmma::fragment<volta::wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float>;
+#endif
+
+    std::conditional_t<SCALARS, float, frag_t> frags[tiles];
+
+    __device__ __forceinline__ WMMA_GEMM_INIT_REGS(float fill = 0.0f) {
+        if constexpr (SCALARS) {
+            #pragma unroll
+            for (int i = 0; i < tiles; ++i) frags[i] = fill;
+        } else if constexpr (!IS_SCORES) {
+#ifdef MMA_NATIVE
+            using namespace nvcuda::wmma;
+#else
+            using namespace volta::wmma;
+#endif
+            #pragma unroll
+            for (int i = 0; i < tiles; ++i) fill_fragment(frags[i], fill);
+        }
+    }
+};
 
 // ======================================================================================
 // TILE LOADER: Global-shared load for unified dense/varlen/kvcache layouts
@@ -162,95 +212,116 @@ __device__ __forceinline__ void WMMA_GEMM_LOAD_TILE(
 }
 
 // ======================================================================================
-// KERNEL EPILOGUE:   Shared-global fp32->fp16 store with optional norm & dual output
-//   TYPE (GemmType): NORMALIZE rescales by 1/SMEM_DOT[row]; DUAL_STORE writes SMEM1->GMEM1
-//   GLOBAL_STRIDE:   Runtime destination row pitch
+// WMMA_GEMM_EPILOGUE: Register-based flush to gmem
 // ======================================================================================
-template<typename Config, Result Type>
+//   WRITE_O:   single store, normalize by ROW_SUM + lse
+//   WRITE_DQ:  single store, no normalization
+//   WRITE_DKV: dual   store, no normalization
+// ======================================================================================
+template<typename Config, Result TYPE, typename Fragment>
 __device__ __forceinline__ void WMMA_GEMM_EPILOGUE(
-    const float* __restrict__ SMEM0,
+       Fragment* __restrict__ REGS0,
          __half* __restrict__ GMEM0,
-    const float* __restrict__ SMEM1,
+     const void* __restrict__ REGS1,
          __half* __restrict__ GMEM1,
-    const float* __restrict__ SMEM_DOT,
-    int GLOBAL_STRIDE,
-    int VALID_ROWS,
-    int THREAD_ID
+          float* __restrict__ GMEM_LSE,
+    const float*              ROW_SUM,
+    const float*              ROW_MAX,
+    int STRIDE,  int VALID_M,
+    int WARP_ID, int LANE_ID
 ) {
-    using ETraits = EpilogueTraits<Type>;
+    using ETraits = EpilogueTraits<TYPE>;
+    using PTraits = PhaseTraits<TYPE == Result::WRITE_O ? GemmPhase::FWD : TYPE == Result::WRITE_DQ ? GemmPhase::BWQ : GemmPhase::BWKV>;
 
-    const int global_chunks = Config::DIM >> 2;
-    const int total_iters   = VALID_ROWS * global_chunks;
+    constexpr bool NORMALIZE  = ETraits::NORMALIZE;
+    constexpr bool DUAL_STORE = ETraits::DUAL_STORE;
+    constexpr bool WRITE_LSE  = ETraits::WRITE_LSE;
 
-    if (total_iters == 0) return;
+    constexpr int D            = Config::DIM;
+    constexpr int TILE_M       = PTraits::IS_SWAPPED ? PTraits::template BLOCK_Y<Config>() : PTraits::template BLOCK_X<Config>();
+    constexpr int num_tiles_m  = (TILE_M + WMMA_M - 1) / WMMA_M;
+    constexpr int num_tiles_n  = (D      + WMMA_N - 1) / WMMA_N;
+    constexpr int total_tiles  = num_tiles_m * num_tiles_n;
+    constexpr int TILES        = (total_tiles + Config::WARPS_PER_BLOCK - 1) / Config::WARPS_PER_BLOCK;
 
-    constexpr bool NORMALIZE         = ETraits::NORMALIZE;
-    constexpr bool DUAL_STORE        = ETraits::DUAL_STORE;
-    constexpr int  THREADS_PER_BLOCK = Config::THREADS_PER_BLOCK;
+    const uint2 lines     = LINE_CHORDS(static_cast<unsigned>(LANE_ID));
 
-    for (int i = THREAD_ID; i < total_iters; i += THREADS_PER_BLOCK) {
-        const int row =  i / global_chunks;
-        const int col = (i % global_chunks) << 2;
+    #pragma unroll
+    for (int tile_idx = 0; tile_idx < TILES; ++tile_idx) {
 
-        float norm = 1.0f;
-        if constexpr (NORMALIZE) {
-            norm = __frcp_rn(fmaxf(SMEM_DOT[row], 1e-24f));
-        }
+        if ((WARP_ID * TILES + tile_idx) >= total_tiles) break;
 
-        const bool in_bounds = (row < VALID_ROWS);
-        const int pred = in_bounds ? 1 : 0;
+        const int tile_m = ((WARP_ID * TILES + tile_idx) / num_tiles_n) * WMMA_M;
+        const int tile_n = ((WARP_ID * TILES + tile_idx) % num_tiles_n) * WMMA_N;
 
-        if (in_bounds) {
-            uint32_t smem00_addr = __cvta_generic_to_shared(SMEM0 + row * Config::DIM) + col * 4;
-            float4   smem00      = ld_float4(smem00_addr, row);
-            const __half2 h0 = __float22half2_rn(make_float2(smem00.x * norm, smem00.y * norm));
-            const __half2 h1 = __float22half2_rn(make_float2(smem00.z * norm, smem00.w * norm));
+        if (tile_m >= VALID_M) continue;
 
-            ushort v0 = __half_as_ushort(h0.x); ushort v1 = __half_as_ushort(h0.y);
-            ushort v2 = __half_as_ushort(h1.x); ushort v3 = __half_as_ushort(h1.y);
+        auto& fragment0 = REGS0[tile_idx];
 
-            asm volatile(
-                "{\n"
-                "  .reg .pred p;\n"
-                "  setp.ne.b32 p, %8, 0;\n"
-                "  mov.u16 %0, %4;\n"
-                "  mov.u16 %1, %5;\n"
-                "  mov.u16 %2, %6;\n"
-                "  mov.u16 %3, %7;\n"
-                "  @p st.global.v4.u16 [%9], {%0, %1, %2, %3};\n"
-                "}\n"
-                : "=h"(v0), "=h"(v1), "=h"(v2), "=h"(v3)
-                : "h"(v0),  "h"(v1),  "h"(v2),  "h"(v3),
-                  "r"(pred),
-                  "l"(GMEM0 + row * GLOBAL_STRIDE + col)
-                : "memory"
-            );
+        #pragma unroll
+        for (int idx = 0; idx < 8; idx += 2) {
+            const int row_offset  = (idx >> 1) & 0b1;
+            const int global_m    = tile_m + static_cast<int>(lines.x + row_offset * 2);
+            const int global_n    = tile_n + static_cast<int>(lines.y + (idx & 0b1) + ((idx >> 2) & 0b1) * 4);
+
+            if (global_m >= VALID_M) continue;
+
+            float scale = 1.0f;
+            if constexpr (NORMALIZE) {
+                scale = __frcp_rn(fmaxf(ROW_SUM[(tile_idx / num_tiles_n) * 2 + row_offset], 1e-24f));
+            }
+
+            const __half2 h0 = __float22half2_rn(make_float2(fragment0.x[idx] * scale, fragment0.x[idx + 1] * scale));
+            const ushort  u0 = __half_as_ushort(h0.x);
+            const ushort  u1 = __half_as_ushort(h0.y);
+            const int pred   = (global_n + 1 < D) ? 1 : 0;
+
+            __half* dst0 = GMEM0 + (size_t)global_m * STRIDE + global_n;
 
             if constexpr (DUAL_STORE) {
-                uint32_t smem01_addr = __cvta_generic_to_shared(SMEM1 + row * Config::DIM) + col * 4;
-                float4   smem01      = ld_float4(smem01_addr, row);
-                const __half2 h2 = __float22half2_rn(make_float2(smem01.x * norm, smem01.y * norm));
-                const __half2 h3 = __float22half2_rn(make_float2(smem01.z * norm, smem01.w * norm));
+                const Fragment* regs1 = static_cast<const Fragment*>(REGS1);
+                auto& fragment1  = regs1[tile_idx];
+                const __half2 h1 = __float22half2_rn(make_float2(fragment1.x[idx], fragment1.x[idx + 1]));
+                const ushort  u2 = __half_as_ushort(h1.x);
+                const ushort  u3 = __half_as_ushort(h1.y);
 
-                ushort v4 = __half_as_ushort(h2.x); ushort v5 = __half_as_ushort(h2.y);
-                ushort v6 = __half_as_ushort(h3.x); ushort v7 = __half_as_ushort(h3.y);
+                __half* dst1 = GMEM1 + (size_t)global_m * STRIDE + global_n;
 
                 asm volatile(
-                    "{\n"
-                    "  .reg .pred p;\n"
-                    "  setp.ne.b32 p, %8, 0;\n"
-                    "  mov.u16 %0, %4;\n"
-                    "  mov.u16 %1, %5;\n"
-                    "  mov.u16 %2, %6;\n"
-                    "  mov.u16 %3, %7;\n"
-                    "  @p st.global.v4.u16 [%9], {%0, %1, %2, %3};\n"
-                    "}\n"
-                    : "=h"(v4), "=h"(v5), "=h"(v6), "=h"(v7)
-                    : "h"(v4), "h"(v5), "h"(v6), "h"(v7),
-                      "r"(pred),
-                      "l"(GMEM1 + row * GLOBAL_STRIDE + col)
+                    "{\n\t"
+                    ".reg .pred p;\n\t"
+                    "setp.ne.b32 p, %4, 0;\n\t"
+                    "@p st.global.v2.u16 [%2], {%0, %1};\n\t"
+                    "@p st.global.v2.u16 [%3], {%5, %6};\n\t"
+                    "}\n\t"
+                    :
+                    : "h"(u0), "h"(u1), "l"(dst0), "l"(dst1), "r"(pred), "h"(u2), "h"(u3)
                     : "memory"
                 );
+            } else {
+                asm volatile(
+                    "{\n\t"
+                    ".reg .pred p;\n\t"
+                    "setp.ne.b32 p, %3, 0;\n\t"
+                    "@p st.global.v2.u16 [%2], {%0, %1};\n\t"
+                    "}\n\t"
+                    :
+                    : "h"(u0), "h"(u1), "l"(dst0), "r"(pred)
+                    : "memory"
+                );
+
+                if constexpr (WRITE_LSE) {
+                    if (GMEM_LSE != nullptr
+                        && (((LANE_ID >> 3) & 1) == 0)
+                        && tile_n                == 0
+                        && row_offset            == ((LANE_ID >> 1) & 1)
+                        && idx                   == ((LANE_ID >> 1) & 1) * 2)
+                    {
+                        const int   jdx = (tile_idx / num_tiles_n) * 2 + ((LANE_ID >> 1) & 1);
+                        const float sum = fmaxf(ROW_SUM[jdx], 1e-24f);
+                        GMEM_LSE[global_m] = ROW_MAX[jdx] + __logf(sum);
+                    }
+                }
             }
         }
     }

@@ -1,0 +1,345 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Occupancy / Limits Calculator</title>
+<style>
+  body { font: 14px monospace; max-width: 1150px; margin: 20px auto; padding: 10px; color: #222; }
+  h2 { margin: 0 0 12px; }
+  h3 { margin: 18px 0 8px; font-size: 14px; color: #333; }
+  .two-col { display: grid; grid-template-columns: 380px 1fr; gap: 20px; align-items: start; }
+  .col-left .row { margin: 6px 0; display: flex; align-items: center; gap: 8px; }
+  .col-left label { min-width: 165px; }
+  input, select { padding: 3px; font: inherit; }
+  input[type=number] { width: 100px; }
+  button { font: inherit; padding: 2px 10px; cursor: pointer; }
+  table { border-collapse: collapse; margin-top: 6px; width: 100%; }
+  th, td { border: 1px solid #bbb; padding: 4px 8px; }
+  th { background: #f3f3f3; text-align: left; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  td.note { color: #666; font-size: 12px; }
+  .limit { color: #c00; font-weight: bold; }
+  .ok { color: #080; }
+  .warn { color: #d80; }
+  .big { font-size: 16px; }
+  .note-box { color: #666; font-size: 12px; margin-top: 14px; line-height: 1.5; }
+  tr.total td { background: #fafafa; font-weight: bold; }
+</style>
+</head>
+<body>
+
+<h2 align="center">Occupancy / Limits Calculator</h2>
+<br>
+<div class="two-col">
+  <div class="col-left">
+    <h3>Parameters</h3>
+    <div class="row"><label>Kernel:</label>
+      <select id="kern">
+        <option value="fwd">forward</option>
+        <option value="bdq">backward dQ</option>
+        <option value="bdkv">backward dKV</option>
+      </select>
+    </div>
+    <div class="row"><label>D (head dim):</label>
+      <select id="dim">
+        <option>16</option><option>32</option><option selected>64</option>
+        <option>128</option><option>256</option>
+      </select>
+    </div>
+    <div class="row"><label>BLOCK_M:</label><input id="bm" type="number" value="64" min="1"></div>
+    <div class="row"><label>BLOCK_N:</label><input id="bn" type="number" value="64" min="1"></div>
+    <div class="row"><label>WARPS / block:</label><input id="warps" type="number" value="8" min="1" max="32"></div>
+    <div class="row"><label>REG / thread:</label><input id="reg" type="number" value="128" min="1" max="255"></div>
+    <div class="row"><label>SMEM override:</label>
+      <input id="smem" type="number" value="0" min="0">
+      <button id="auto">auto</button>
+    </div>
+  </div>
+
+  <div class="col-right">
+    <h3>SMEM layout (for selected kernel)</h3>
+    <table id="smemTable"></table>
+  </div>
+</div>
+
+<h3>Current configuration</h3>
+<table id="cur"></table>
+
+<h3>Maximums with others fixed</h3>
+<table id="max"></table>
+
+<script>
+const HW = {
+  THREADS_PER_WARP : 32,
+  THREADS_PER_SM   : 2048,
+  MAX_BLOCK_THREADS: 1024,
+  BLOCKS_PER_SM    : 32,
+  WARPS_PER_SM     : 64,
+  SMEM_PER_SM      : 98304,
+  WARP_ALLOC_GROUP : 4,
+  REG_UNIT         : 256,
+  REG_PER_THREAD   : 255,
+  REG_PER_BLOCK    : 65536,
+  REG_BUFFER       : 65536,
+  SMEM_ALIGN       : 128
+};
+
+// Values below are pulled directly from include/forward.h and include/backward.h.
+const PRESETS = {
+  fwd:  { warps: 8,  blocks: { 16:[128,128],  32:[128,128],  64:[128,64],  128:[128,128], 256:[128,32] } },
+  bdq:  { warps: 16, blocks: { 16:[16,256],   32:[32,128],   64:[64,192],  128:[64,160],  256:[32,96]  } },
+  bdkv: { warps: 16, blocks: { 16:[32,224],   32:[32,192],   64:[64,112],  128:[32,192],  256:[32,96]  } }
+};
+
+const $ = id => document.getElementById(id);
+const alignUp    = (x, a) => Math.ceil(x / a) * a;
+const isPow2     = x => x > 0 && (x & (x - 1)) === 0;
+const isTileMul  = x => x > 0 && x % 16 === 0;
+
+// ============================================================
+// SMEM breakdown
+// ============================================================
+function smemBreakdown(kern, BM, BN, D) {
+  const items = [];
+  const push = (name, bytes, expr) => items.push({ name, bytes, expr });
+
+  if (kern === 'fwd') {
+    push('sQ  .q',           BM * D * 2,  `half[${BM}×${D}]`);
+    push('sK/sV  .reuse_kv', BN * D * 2,  `max(half[${BN}×${D}], half[${BN}×${D}])`);
+    push('sP  .p',           BM * BN * 2, `half[${BM}×${BN}]`);
+  } else if (kern === 'bdq') {
+    push('sK/sV  .reuse_kv', BN * D * 2,  `max(half[${BN}×${D}], half[${BN}×${D}])`);
+    push('sdO  .dO',         BM * D * 2,  `half[${BM}×${D}]`);
+    push('sQ  .q',           BM * D * 2,  `half[${BM}×${D}]`);
+    push('sdS  .dS',         BM * BN * 2, `half[${BM}×${BN}]`);
+  } else {
+    push('sK  .k',           BM * D * 2,  `half[${BM}×${D}]`);
+    push('sV  .v',           BM * D * 2,  `half[${BM}×${D}]`);
+    push('sQ/sdO  .reuse_qdO',BN * D * 2, `max(half[${BN}×${D}], half[${BN}×${D}])`);
+    push('sP  .p',           BN * BM * 2, `half[${BN}×${BM}]`);
+    push('sdS  .dS',         BN * BM * 2, `half[${BN}×${BM}]`);
+  }
+
+  const raw     = items.reduce((s, it) => s + it.bytes, 0);
+  const aligned = items.reduce((s, it) => s + alignUp(it.bytes, HW.SMEM_ALIGN), 0);
+  return { items, raw, aligned };
+}
+
+function regAccumulator(kern, BM, BN, D) {
+  let name, floats;
+  if (kern === 'fwd')       { name = 'rO';         floats = BM * D; }
+  else if (kern === 'bdq')  { name = 'rdQ';        floats = BM * D; }
+  else                      { name = 'rdK + rdV';  floats = 2 * BM * D; }
+  return { name, floats, bytes: floats * 4 };
+}
+
+function compute(kern, BM, BN, D, warps, regs, smemOverride) {
+  const threads  = warps * HW.THREADS_PER_WARP;
+  const warpsAl  = Math.ceil(warps / HW.WARP_ALLOC_GROUP) * HW.WARP_ALLOC_GROUP;
+  const regsWarp = Math.ceil(regs * HW.THREADS_PER_WARP / HW.REG_UNIT) * HW.REG_UNIT;
+  const regsBlk  = warpsAl * regsWarp;
+
+  const bd = smemBreakdown(kern, BM, BN, D);
+  const smem = (smemOverride && smemOverride > 0) ? smemOverride : bd.aligned;
+
+  const lim = [
+    ['threads/SM',             Math.floor(HW.THREADS_PER_SM / threads)],
+    ['warps/SM',               Math.floor(HW.WARPS_PER_SM   / warps)],
+    ['blocks/SM (hw max)',     HW.BLOCKS_PER_SM],
+    ['registers (reg buffer)', Math.floor(HW.REG_BUFFER    / regsBlk)],
+    ['registers (reg/block)',  Math.floor(HW.REG_PER_BLOCK / regsBlk)],
+    ['shared memory',          Math.floor(HW.SMEM_PER_SM   / smem)]
+  ];
+  const minB = Math.min(...lim.map(l => l[1]));
+  return { threads, warpsAl, regsWarp, regsBlk, smem, lim, minB, bd };
+}
+
+function maxBM(kern, BN, D, warps, regs) {
+  let best = 0;
+  for (let BM = 1; BM <= 4096; BM++) {
+    const c = compute(kern, BM, BN, D, warps, regs);
+    if (c.smem > HW.SMEM_PER_SM) break;
+    if (c.minB < 1) break;
+    best = BM;
+  }
+  return best;
+}
+function maxBN(kern, BM, D, warps, regs) {
+  let best = 0;
+  for (let BN = 1; BN <= 4096; BN++) {
+    const c = compute(kern, BM, BN, D, warps, regs);
+    if (c.smem > HW.SMEM_PER_SM) break;
+    if (c.minB < 1) break;
+    best = BN;
+  }
+  return best;
+}
+function maxWarps(kern, BM, BN, D, regs) {
+  let best = 0;
+  for (let w = 1; w <= HW.WARPS_PER_SM; w++) {
+    const c = compute(kern, BM, BN, D, w, regs);
+    if (c.threads > HW.MAX_BLOCK_THREADS) break;
+    if (c.smem > HW.SMEM_PER_SM) break;
+    if (c.minB < 1) break;
+    best = w;
+  }
+  return best;
+}
+function maxReg(kern, BM, BN, D, warps) {
+  for (let r = HW.REG_PER_THREAD; r >= 1; r--) {
+    const c = compute(kern, BM, BN, D, warps, r);
+    if (c.minB >= 1) return r;
+  }
+  return 0;
+}
+function bindingAt(kern, BM, BN, D, warps, regs) {
+  const c = compute(kern, BM, BN, D, warps, regs);
+  const min = Math.min(...c.lim.map(l => l[1]));
+  const b = c.lim.find(l => l[1] === min);
+  return b ? b[0] : '—';
+}
+
+function renderSmem(kern, BM, BN, D) {
+  const bd = smemBreakdown(kern, BM, BN, D);
+  let h = `<tr><th>Buffer</th><th>Expression</th><th style="text-align:right">Bytes</th><th style="text-align:right">↑128B</th></tr>`;
+  for (const it of bd.items) {
+    h += `<tr><td>${it.name}</td><td class="note">${it.expr}</td>` +
+         `<td class="num">${it.bytes.toLocaleString()}</td>` +
+         `<td class="num">${alignUp(it.bytes, HW.SMEM_ALIGN).toLocaleString()}</td></tr>`;
+  }
+  h += `<tr class="total"><td>Σ raw</td><td class="note">sum without alignment</td><td class="num">${bd.raw.toLocaleString()}</td><td class="num">—</td></tr>`;
+  h += `<tr class="total"><td>Σ aligned</td><td class="note">each buffer ↑ to ${HW.SMEM_ALIGN}B, then Σ</td><td class="num">—</td><td class="num">${bd.aligned.toLocaleString()}</td></tr>`;
+  const pct = (bd.aligned / HW.SMEM_PER_SM * 100).toFixed(1);
+  const cls = bd.aligned > HW.SMEM_PER_SM ? 'limit' : 'ok';
+  h += `<tr><td>share of SMEM/SM</td><td class="note">of ${(HW.SMEM_PER_SM/1024)} KB</td><td class="num ${cls}">${pct}%</td><td class="num"></td></tr>`;
+  h += `<tr><td>max blocks/SM</td><td class="note">by SMEM</td><td class="num ${cls}">${Math.floor(HW.SMEM_PER_SM / bd.aligned)}</td><td class="num"></td></tr>`;
+  $('smemTable').innerHTML = h;
+}
+
+function render() {
+  const kern  = $('kern').value;
+  const D     = +$('dim').value  || 0;
+  const BM    = +$('bm').value   || 0;
+  const BN    = +$('bn').value   || 0;
+  const warps = +$('warps').value|| 0;
+  const regs  = +$('reg').value  || 0;
+  const smemIn= +$('smem').value || 0;
+
+  renderSmem(kern, BM, BN, D);
+
+  const c  = compute(kern, BM, BN, D, warps, regs, smemIn || null);
+  const ra = regAccumulator(kern, BM, BN, D);
+
+  const errs = [];
+  if (c.threads > HW.MAX_BLOCK_THREADS) errs.push(`threads/block=${c.threads} > ${HW.MAX_BLOCK_THREADS}`);
+  if (regs > HW.REG_PER_THREAD)         errs.push(`regs/thread=${regs} > ${HW.REG_PER_THREAD}`);
+  if (c.smem > HW.SMEM_PER_SM)          errs.push(`smem/block=${c.smem} > ${HW.SMEM_PER_SM} (${HW.SMEM_PER_SM/1024} KB)`);
+  if (BM * BN === 0)                    errs.push('BLOCK_M/N must be > 0');
+  if (!isTileMul(BM))                   errs.push(`BLOCK_M=${BM} is not a multiple of WMMA_M=16`);
+  if (!isTileMul(BN))                   errs.push(`BLOCK_N=${BN} is not a multiple of WMMA_N=16`);
+
+  const raPerThreadF = ra.floats / (warps * HW.THREADS_PER_WARP);
+  const raPerThreadB = raPerThreadF * 4;
+  const regBudgetB   = c.regsBlk * 4;
+  const raPctOfBlk   = regBudgetB > 0 ? (ra.bytes / regBudgetB * 100) : 0;
+  const raPctOfSM    = ra.bytes * c.minB / (HW.REG_BUFFER * 4) * 100;
+  const raCls        = ra.bytes > regBudgetB ? 'limit' : 'ok';
+
+  const bmTile = isTileMul(BM);
+  const bnTile = isTileMul(BN);
+  const bmPow2 = isPow2(BM);
+  const bnPow2 = isPow2(BN);
+
+  let h = `<tr><th>Quantity</th><th>Value</th></tr>`;
+  h += `<tr><td>kernel</td><td>${kern}</td></tr>`;
+  h += `<tr><td>D</td><td>${D}</td></tr>`;
+  h += `<tr><td>BLOCK_M × BLOCK_N</td><td>${BM} × ${BN} = ${BM*BN}</td></tr>`;
+
+  h += `<tr><td>BLOCK_M % 16 (WMMA_M)</td><td class="${bmTile?'ok':'limit'}">`
+     + (bmTile ? '✓ multiple' : `✗ remainder ${BM % 16} — WMMA broken`) + `</td></tr>`;
+  h += `<tr><td>BLOCK_N % 16 (WMMA_N)</td><td class="${bnTile?'ok':'limit'}">`
+     + (bnTile ? '✓ multiple' : `✗ remainder ${BN % 16} — WMMA broken`) + `</td></tr>`;
+  h += `<tr><td>BLOCK_M = 2^k</td><td class="${bmPow2?'ok':'warn'}">`
+     + (bmPow2 ? '✓' : `✗ fixed axis: ${BM} does not divide 512/1024/2048`) + `</td></tr>`;
+  h += `<tr><td>BLOCK_N = 2^k</td><td class="${bnPow2?'ok':'warn'}">`
+     + (bnPow2 ? '✓' : `✗ iter axis: ${BN} does not divide 512/1024/2048`) + `</td></tr>`;
+
+  const iterSeq  = (kern === 'bdkv') ? 'M' : 'N';
+  const fixSeq   = (kern === 'bdkv') ? 'N' : 'M';
+  h += `<tr><td>fast-path iter (${iterSeq}, step ${BN})</td><td class="${bnPow2?'ok':'warn'}">`
+     + (bnPow2 ? `✓ for ${iterSeq} ∈ {512, 1024, 2048, ...}`
+               : `✗ ${iterSeq} % ${BN} ≠ 0 at 512/1024 not IS_EVEN`) + `</td></tr>`;
+  h += `<tr><td>fast-path fix (${fixSeq}, step ${BM})</td><td class="${bmPow2?'ok':'warn'}">`
+     + (bmPow2 ? `✓ for ${fixSeq} ∈ {512, 1024, 2048, ...}`
+               : `✗ ${fixSeq} % ${BM} ≠ 0 at 512/1024 - per-tile VALID check remains`) + `</td></tr>`;
+
+  h += `<tr><td>WARPS / block</td><td>${warps} → aligned ×${HW.WARP_ALLOC_GROUP} = ${c.warpsAl}</td></tr>`;
+  h += `<tr><td>threads / block</td><td>${c.threads}</td></tr>`;
+  h += `<tr><td>regs / thread</td><td>${regs}</td></tr>`;
+  h += `<tr><td>regs / warp (aligned ×${HW.REG_UNIT})</td><td>${c.regsWarp}</td></tr>`;
+  h += `<tr><td>regs / block (actual)</td><td>${c.regsBlk}</td></tr>`;
+  h += `<tr><td>SMEM / block</td><td>${c.smem}${smemIn?' (override)':' (auto)'}</td></tr>`;
+
+  h += `<tr><th>Limit</th><th>blocks / SM</th></tr>`;
+  for (const [n, v] of c.lim) {
+    const isMin = v === c.minB;
+    h += `<tr><td>${n}</td><td class="${isMin?'limit':''}">${isFinite(v)?v:'∞'}</td></tr>`;
+  }
+  const occ = c.minB * warps * HW.THREADS_PER_WARP / HW.THREADS_PER_SM * 100;
+  h += `<tr class="total"><td class="big">RESULT</td><td class="big">${c.minB} block(s)/SM · occupancy ${isFinite(occ)?occ.toFixed(1):0}%</td></tr>`;
+  h += `<tr class="total"><td>${ra.name} (regs)</td><td class="${raCls}">` +
+       `${ra.floats.toLocaleString()} float = ${ra.bytes.toLocaleString()} B ` +
+       `· ${raPerThreadF.toFixed(1)} float/thread (${raPerThreadB.toFixed(1)} B) ` +
+       `· ${raPctOfBlk.toFixed(1)}% of reg/block ` +
+       `· ${raPctOfSM.toFixed(1)}% of reg file/SM</td></tr>`;
+  h += `<tr><td>configuration</td><td class="${errs.length?'limit':'ok'}">` +
+       (errs.length ? 'ERROR: ' + errs.join(' · ') : 'valid') + `</td></tr>`;
+  $('cur').innerHTML = h;
+
+  const mBM = maxBM(kern, BN, D, warps, regs);
+  const mBN = maxBN(kern, BM, D, warps, regs);
+  const mW  = maxWarps(kern, BM, BN, D, regs);
+  const mR  = maxReg(kern, BM, BN, D, warps);
+
+  const whyBM = bindingAt(kern, mBM + 1, BN, D, warps, regs);
+  const whyBN = bindingAt(kern, BM, mBN + 1, D, warps, regs);
+  const whyW  = bindingAt(kern, BM, BN, D, mW + 1, regs);
+
+  const rowM = (name, cur, mx, why) =>
+    `<tr><td>${name}</td><td class="num">${cur}</td><td class="num ${cur>mx?'limit':'ok'}">${mx}</td><td class="note">${why}</td></tr>`;
+
+  let m = `<tr><th>Parameter</th><th>Current</th><th>Maximum (≥1 block/SM)</th><th>Limited by</th></tr>`;
+  m += rowM('BLOCK_M', BM, mBM, whyBM);
+  m += rowM('BLOCK_N', BN, mBN, whyBN);
+  m += rowM('WARPS / block', warps, mW, whyW);
+  m += rowM('REG / thread', regs, mR, 'reg buffer / reg per block');
+  $('max').innerHTML = m;
+}
+
+function applyPreset() {
+  const kern = $('kern').value;
+  const D    = +$('dim').value;
+  const p    = PRESETS[kern];
+  if (!p) return;
+  const [bm, bn] = p.blocks[D] || [0, 0];
+  $('bm').value    = bm;
+  $('bn').value    = bn;
+  $('warps').value = p.warps;
+  $('smem').value  = 0;
+}
+
+$('auto').addEventListener('click', () => {
+  const k = $('kern').value;
+  $('smem').value = smemBreakdown(k, +$('bm').value, +$('bn').value, +$('dim').value).aligned;
+  render();
+});
+$('kern').addEventListener('change', () => { applyPreset(); render(); });
+$('dim').addEventListener('change',  () => { applyPreset(); render(); });
+['bm','bn','warps','reg','smem'].forEach(id =>
+  $(id).addEventListener('input', render));
+
+applyPreset();
+render();
+</script>
+</body>
+</html>

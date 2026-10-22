@@ -12,198 +12,243 @@
 // ======================================================================================
 // WMMA_GEMM_SOFTMAX: Online softmax with O-scaling
 // ======================================================================================
-// FA2 MATH: m_new   = max(m_old, rowmax(S))
-//           P       = exp(S - m_new)    [clamped > -80]
-//           l_new   = exp(m_old - m_new) * l_old + rowsum(P)
-//           O_new   = exp(m_old - m_new) * O_old
-// LAYOUT:   S [float], O [float] row-major, swizzled via ld_float4/st_float4(addr, row)
-//           P [half ]            row-major, swizzled via st_half4/st_half(addr, row)
-//           sS[row,k]            sP[row,2k], sP[row,2k+1]
+// FA2 MATH: m_new  = max(m_old, rowmax(S))
+//           P      = exp2(S·log2e - m_new·log2e)
+//           l_new  = exp2(m_old·log2e - m_new·log2e) * l_old + rowsum(P)
+//           O_new  = exp2(m_old·log2e - m_new·log2e) * O_old
+// LAYOUT:   S [float], O [float] in WMMA accumulator fragments;
+//           P [half ] row-major in SMEM, written via st_half2(addr, half2, row);
+//           m / l / exp_diff thread-local across the 4 lanes of a row.
 // ======================================================================================
-template <typename Config, bool IS_DROPOUT>
+template<typename Config, GemmPhase PHASE, bool IS_EVEN, bool IS_DROPOUT, typename FRAG_S, typename FRAG_O, int TILES_S, int TILES_O, int ROWS>
 __device__ __forceinline__ void WMMA_GEMM_SOFTMAX(
-    float*   __restrict__ SMEM_S,
-    __half*  __restrict__ SMEM_P,
-    float*   __restrict__ SMEM_O,
-    float*   __restrict__ SMEM_MAX,
-    float*   __restrict__ SMEM_SUM,
-    __half*  __restrict__ GMEM_MASK,
+    FRAG_S (&rS)      [TILES_S],
+    FRAG_O (&rO)      [TILES_O],
+    float  (&rRowMax )[ROWS],
+    float  (&rRowSum )[ROWS],
+    float  (&rExpDiff)[ROWS],
+         __half* __restrict__ SMEM_P,
+         __half* __restrict__ GMEM_MASK,
     int      VALID_Q,
     int      VALID_KV,
-    int      THREAD_ID,
-    int      BLOCK_ID,
     int      GLOBAL_ROW_OFFSET,
     int      GLOBAL_COL_OFFSET,
     int      GLOBAL_N,
     float    P_DROPOUT,
     uint64_t DROPOUT_SEED,
     uint64_t DROPOUT_OFFSET,
-    int      STRIDE_GMEM_MASK
+    int      STRIDE_GMEM,
+    int      BLOCK_ID,
+    int      WARP_ID,
+    int      LANE_ID 
 ) {
-    if (VALID_Q == 0 || VALID_KV == 0) return;
-
-    constexpr int BLOCK_N         = Config::DO::BLOCK_N;
-    constexpr int SCORE_STRIDE    = Config::DO::BLOCK_N;
-    constexpr int HEAD_STRIDE     = Config::DIM;
-    constexpr int THREADS_PER_ROW = Config::DO::THREADS_PER_ROW;
-
-    constexpr int MAX_ITERS       = ((BLOCK_N >> 2) + THREADS_PER_ROW - 1) / THREADS_PER_ROW;
-    constexpr int MAX_TAILS       = (4 + THREADS_PER_ROW - 1) / THREADS_PER_ROW;
-
-    const int row    = THREAD_ID / THREADS_PER_ROW;
-    const int thread = THREAD_ID % THREADS_PER_ROW;
-    const int cols   = VALID_KV >> 2;
-    const int tail   = (VALID_KV >> 2) << 2;
-
-    float thread_max = NEG_INF, new_max  = NEG_INF;
-    float thread_sum = 0.0f,    exp_diff = 1.0f;
-
-    float4 sS[MAX_ITERS];
-    float  sS_tail[MAX_TAILS];
-
-    if (row < VALID_Q) {
-        uint32_t sS_base = __cvta_generic_to_shared(SMEM_S + row * SCORE_STRIDE);
-
-        #pragma unroll
-        for (int idx = 0; idx < MAX_ITERS; ++idx) {
-            const int addr = thread + idx * THREADS_PER_ROW;
-            if (addr < cols) {
-                sS[idx] = ld_float4(sS_base + addr * 16, row);
-                thread_max = fmaxf(thread_max, fmaxf(fmaxf(sS[idx].x, sS[idx].y), fmaxf(sS[idx].z, sS[idx].w)));
-            }
-        }
-
-        if (tail < VALID_KV) {
-            #pragma unroll
-            for (int idx = 0; idx < MAX_TAILS; ++idx) {
-                const int addr = tail + thread + idx * THREADS_PER_ROW;
-                if (addr < VALID_KV) {
-                    sS_tail[idx] = ld_float(sS_base + addr * 4, row);
-                    thread_max = fmaxf(thread_max, sS_tail[idx]);
-                }
-            }
-        }
+    if constexpr (!IS_EVEN) {
+        if (VALID_Q == 0 || VALID_KV == 0) return;
+        if (WARP_ID * WMMA_M >= VALID_Q) return;
     }
+
+    using PTraits        = PhaseTraits<PHASE>;
+    constexpr int STRIDE = PTraits::template STRIDE<Config>();
+    const uint2 lines    = LINE_CHORDS(static_cast<unsigned>(LANE_ID));
+
+    // ============================================================
+    // Per-iteration max -> thread-local over all row-tiles
+    // ============================================================
+    float iter_max[ROWS];
+    #pragma unroll
+    for (int row = 0; row < ROWS; ++row) iter_max[row] = NEG_INF;
 
     #pragma unroll
-    for (int offset = THREADS_PER_ROW / 2; offset > 0; offset >>= 1) {
-        thread_max = fmaxf(thread_max, __shfl_xor_sync(0xFFFFFFFFU, thread_max, offset, THREADS_PER_ROW));
-    }
+    for (int tile_idx = 0; tile_idx < TILES_S; ++tile_idx) {
 
-    if (row < VALID_Q) {
-        uint32_t sP_base = __cvta_generic_to_shared(SMEM_P + row * SCORE_STRIDE * 2);
+        if constexpr (!IS_EVEN) {
+            if ((tile_idx * WMMA_N) >= VALID_KV) continue;
+        }
 
-        new_max  =  fmaxf(SMEM_MAX[row],  thread_max);
-        exp_diff = __expf(SMEM_MAX[row] - new_max);
+        const bool is_full      = IS_EVEN || ((tile_idx * WMMA_N) + WMMA_N <= VALID_KV);
+        const int  column_base  = (tile_idx * WMMA_N) + lines.y;
+        const int  column_base4 = column_base + 4;
+        auto&      rS_fragment  = rS[tile_idx];
 
         #pragma unroll
-        for (int idx = 0; idx < MAX_ITERS; ++idx) {
-            const int addr = thread + idx * THREADS_PER_ROW;
-            if (addr < cols) {
-                float e0 = __expf(fmaxf(sS[idx].x - new_max, -80.0f));
-                float e1 = __expf(fmaxf(sS[idx].y - new_max, -80.0f));
-                float e2 = __expf(fmaxf(sS[idx].z - new_max, -80.0f));
-                float e3 = __expf(fmaxf(sS[idx].w - new_max, -80.0f));
-
-                thread_sum += (e0 + e1) + (e2 + e3);
-
-                if constexpr (IS_DROPOUT) {
-                    const float  rp_dropout = (1.0f / (1.0f - P_DROPOUT));
-                    const uint32_t drop_thr = static_cast<uint32_t>((1.0f - P_DROPOUT) * 4294967295.0f);
-                    uint64_t addr_plx = static_cast<uint64_t>(GLOBAL_ROW_OFFSET + row) * GLOBAL_N + (GLOBAL_COL_OFFSET + addr * 4);
-
-                    PhiloxState philox = init_philox(DROPOUT_SEED, DROPOUT_OFFSET + (addr_plx >> 2));
-                    uint4 rng = philox.next();
-
-                    uint32_t r0 = ((addr_plx + 0) & 3) == 0 ? rng.x : ((addr_plx + 0) & 3) == 1 ? rng.y : ((addr_plx + 0) & 3) == 2 ? rng.z : rng.w;
-                    uint32_t r1 = ((addr_plx + 1) & 3) == 0 ? rng.x : ((addr_plx + 1) & 3) == 1 ? rng.y : ((addr_plx + 1) & 3) == 2 ? rng.z : rng.w;
-                    uint32_t r2 = ((addr_plx + 2) & 3) == 0 ? rng.x : ((addr_plx + 2) & 3) == 1 ? rng.y : ((addr_plx + 2) & 3) == 2 ? rng.z : rng.w;
-                    uint32_t r3 = ((addr_plx + 3) & 3) == 0 ? rng.x : ((addr_plx + 3) & 3) == 1 ? rng.y : ((addr_plx + 3) & 3) == 2 ? rng.z : rng.w;
-
-                    uint32_t k0 = (r0 <= drop_thr);
-                    uint32_t k1 = (r1 <= drop_thr);
-                    uint32_t k2 = (r2 <= drop_thr);
-                    uint32_t k3 = (r3 <= drop_thr);
-
-                    e0 = k0 ? (e0 * rp_dropout) : 0.0f;
-                    e1 = k1 ? (e1 * rp_dropout) : 0.0f;
-                    e2 = k2 ? (e2 * rp_dropout) : 0.0f;
-                    e3 = k3 ? (e3 * rp_dropout) : 0.0f;
-
-                    if (GMEM_MASK != nullptr) {
-                        ushort gmem0 = 0x3C00 | (k0 ? 0 : 0x8000);
-                        ushort gmem1 = 0x3C00 | (k1 ? 0 : 0x8000);
-                        ushort gmem2 = 0x3C00 | (k2 ? 0 : 0x8000);
-                        ushort gmem3 = 0x3C00 | (k3 ? 0 : 0x8000);
-                        uint64_t gmem_addr = __cvta_generic_to_global(GMEM_MASK + row * STRIDE_GMEM_MASK + addr * 4);
-                        asm volatile("st.global.v4.u16 [%0], {%1, %2, %3, %4};\n"
-                                     :: "l"(gmem_addr), "h"(gmem0), "h"(gmem1), "h"(gmem2), "h"(gmem3) : "memory");
-                    }
-                }
-                st_half4(sP_base + addr * 8, __float22half2_rn(make_float2(e0, e1)), __float22half2_rn(make_float2(e2, e3)), row);
+        for (int row_pair = 0; row_pair < 2; ++row_pair) {
+            float value_0, value_1, value_4, value_5;
+            if (is_full) {
+                value_0 = rS_fragment.x[row_pair*2];
+                value_1 = rS_fragment.x[row_pair*2+1];
+                value_4 = rS_fragment.x[row_pair*2+4];
+                value_5 = rS_fragment.x[row_pair*2+5];
+            } else {
+                value_0 = (column_base      < VALID_KV) ? rS_fragment.x[row_pair*2]   : NEG_INF;
+                value_1 = (column_base  + 1 < VALID_KV) ? rS_fragment.x[row_pair*2+1] : NEG_INF;
+                value_4 = (column_base4     < VALID_KV) ? rS_fragment.x[row_pair*2+4] : NEG_INF;
+                value_5 = (column_base4 + 1 < VALID_KV) ? rS_fragment.x[row_pair*2+5] : NEG_INF;
             }
-        }
 
-        if (tail < VALID_KV) {
-            #pragma unroll
-            for (int idx = 0; idx < MAX_TAILS; ++idx) {
-                const int addr = tail + thread + idx * THREADS_PER_ROW;
-                if (addr < VALID_KV) {
-                    float e = __expf(fmaxf(sS_tail[idx] - new_max, -80.0f));
-                    thread_sum += e;
-
-                    if constexpr (IS_DROPOUT) {
-                        const float  rp_dropout = (1.0f / (1.0f - P_DROPOUT));
-                        const uint32_t drop_thr = static_cast<uint32_t>((1.0f - P_DROPOUT) * 4294967295.0f);
-                        uint64_t addr_plx_tail  = static_cast<uint64_t>(GLOBAL_ROW_OFFSET + row) * GLOBAL_N + (GLOBAL_COL_OFFSET + addr);
-
-                        PhiloxState philox = init_philox(DROPOUT_SEED, DROPOUT_OFFSET + (addr_plx_tail >> 2));
-                        uint4 rng  = philox.next();
-                        uint32_t r = (addr_plx_tail & 3) == 0 ? rng.x : (addr_plx_tail & 3) == 1 ? rng.y : (addr_plx_tail & 3) == 2 ? rng.z : rng.w;
-
-                        uint32_t kk = (r <= drop_thr);
-                        e = kk ? (e * rp_dropout) : 0.0f;
-
-                        if (GMEM_MASK != nullptr) {
-                            ushort gmem = 0x3C00 | (kk ? 0 : 0x8000);
-                            uint64_t gmem_addr = __cvta_generic_to_global(GMEM_MASK + row * STRIDE_GMEM_MASK + addr);
-                            asm volatile("st.global.u16 [%0], %1;\n" :: "l"(gmem_addr), "h"(gmem) : "memory");
-                        }
-                    }
-                    st_half(sP_base + addr * 2, __float2half_rn(e), row);
-                }
-            }
-        }
-
-        if (VALID_KV < BLOCK_N) {
-            #pragma unroll
-            for (int idx = VALID_KV + thread; idx < BLOCK_N; idx += THREADS_PER_ROW) {
-                st_half(sP_base + idx * 2, __float2half(0.0f), row);
-            }
+            const float lane_max = fmaxf(fmaxf(value_0, value_1), fmaxf(value_4, value_5));
+            iter_max[row_pair] = fmaxf(iter_max[row_pair], lane_max);
         }
     }
+
+    // ============================================================
+    // Warp-reduce per row -> merge into rRowMax
+    // ============================================================
+    float neg_max[ROWS];
+    #pragma unroll
+    for (int row = 0; row < ROWS; ++row) {
+
+        float warp_max = iter_max[row];
+
+        warp_max = fmaxf(warp_max, __shfl_xor_sync(0xFFFFFFFFu, warp_max, 2));
+        warp_max = fmaxf(warp_max, __shfl_xor_sync(0xFFFFFFFFu, warp_max, 8));
+
+        const float row_max_old = rRowMax[row];
+        const float row_max_new = fmaxf(row_max_old, warp_max);
+
+        rRowMax[row] = row_max_new;
+
+        if (row_max_new == NEG_INF) {
+            neg_max[row]  = NEG_INF;
+            rExpDiff[row] = 0.0f;
+        } else {
+            neg_max[row]  = -row_max_new * LOG2E;
+            rExpDiff[row] = exp2f((row_max_old - row_max_new) * LOG2E);
+        }
+    }
+
+    // ============================================================
+    // P = exp2f(S·log2e - nm·log2e), P -> SMEM, thread-local sum
+    // ============================================================
+    const uint32_t sp_base    = __cvta_generic_to_shared(SMEM_P);
+    const float    rp_dropout = IS_DROPOUT ? (1.0f / (1.0f - P_DROPOUT)) : 1.0f;
+    const uint32_t drop_thr   = IS_DROPOUT ? static_cast<uint32_t>((1.0f - P_DROPOUT) * 4294967295.0f) : 0u;
+
+    float iter_sum[ROWS];
+    #pragma unroll
+    for (int row = 0; row < ROWS; ++row) iter_sum[row] = 0.0f;
 
     #pragma unroll
-    for (int offset = THREADS_PER_ROW / 2; offset > 0; offset >>= 1) {
-        thread_sum += __shfl_xor_sync(0xFFFFFFFFU, thread_sum, offset, THREADS_PER_ROW);
-    }
+    for (int tile_idx = 0; tile_idx < TILES_S; ++tile_idx) {
 
-    if (thread == 0) {
-        SMEM_SUM[row] = exp_diff * SMEM_SUM[row] + thread_sum;
-        SMEM_MAX[row] = new_max;
-    }
-
-    if (row < VALID_Q && BLOCK_ID > 0) {
-        uint32_t sO_base = __cvta_generic_to_shared(SMEM_O + row * HEAD_STRIDE);
-        #pragma unroll 4
-        for (int idx = thread; idx < ((HEAD_STRIDE + 3) >> 2); idx += THREADS_PER_ROW) {
-            float4 sO = ld_float4(sO_base + idx * 16, row);
-            sO.x *= exp_diff;
-            sO.y *= exp_diff;
-            sO.z *= exp_diff;
-            sO.w *= exp_diff;
-            st_float4(sO_base + idx * 16, sO, row);
+        if constexpr (!IS_EVEN) {
+            if ((tile_idx * WMMA_N) >= VALID_KV) continue;
         }
+
+        const bool is_full      = IS_EVEN || ((tile_idx * WMMA_N) + WMMA_N <= VALID_KV);
+        const int  column_base  = (tile_idx * WMMA_N) + lines.y;
+        const int  column_base4 = column_base + 4;
+        auto&      rS_fragment  = rS[tile_idx];
+
+        #pragma unroll
+        for (int row_pair = 0; row_pair < 2; ++row_pair) {
+            const int   global_row = (WARP_ID * WMMA_M) + lines.x + row_pair * 2;
+            const float nm_log2e   = neg_max[row_pair];
+
+            float p0 = exp2f(fmaf(rS_fragment.x[row_pair*2],   LOG2E, nm_log2e));
+            float p1 = exp2f(fmaf(rS_fragment.x[row_pair*2+1], LOG2E, nm_log2e));
+            float p4 = exp2f(fmaf(rS_fragment.x[row_pair*2+4], LOG2E, nm_log2e));
+            float p5 = exp2f(fmaf(rS_fragment.x[row_pair*2+5], LOG2E, nm_log2e));
+
+            if (!is_full) {
+                if (column_base      >= VALID_KV) p0 = 0.0f;
+                if (column_base  + 1 >= VALID_KV) p1 = 0.0f;
+                if (column_base4     >= VALID_KV) p4 = 0.0f;
+                if (column_base4 + 1 >= VALID_KV) p5 = 0.0f;
+            }
+
+            iter_sum[row_pair] += (p0 + p1) + (p4 + p5);
+
+            if constexpr (IS_DROPOUT) {
+                const uint64_t dropout_addr = (uint64_t)(GLOBAL_ROW_OFFSET + global_row) * GLOBAL_N + (GLOBAL_COL_OFFSET + column_base);
+                const uint4    rng0         = init_philox(DROPOUT_SEED, DROPOUT_OFFSET + (dropout_addr >> 2)).next();
+
+                const uint32_t rand0 = ((dropout_addr + 0) & 3) == 0 ? rng0.x : ((dropout_addr + 0) & 3) == 1 ? rng0.y : ((dropout_addr + 0) & 3) == 2 ? rng0.z : rng0.w;
+                const uint32_t rand1 = ((dropout_addr + 1) & 3) == 0 ? rng0.x : ((dropout_addr + 1) & 3) == 1 ? rng0.y : ((dropout_addr + 1) & 3) == 2 ? rng0.z : rng0.w;
+
+                const bool keep0 = (rand0 <= drop_thr);
+                const bool keep1 = (rand1 <= drop_thr);
+                p0 = keep0 ? (p0 * rp_dropout) : 0.0f;
+                p1 = keep1 ? (p1 * rp_dropout) : 0.0f;
+
+                if (GMEM_MASK != nullptr) {
+                    const ushort   mask0     = 0x3C00 | (keep0 ? 0 : 0x8000);
+                    const ushort   mask1     = 0x3C00 | (keep1 ? 0 : 0x8000);
+                    const uint64_t gmem_addr = __cvta_generic_to_global(GMEM_MASK + global_row * STRIDE_GMEM + column_base);
+
+                    if (is_full || column_base + 1 < VALID_KV) {
+                        asm volatile("st.global.v2.u16 [%0], {%1, %2};\n" :: "l"(gmem_addr), "h"(mask0), "h"(mask1) : "memory");
+                    } else if (column_base < VALID_KV) {
+                        asm volatile("st.global.u16 [%0], %1;\n" :: "l"(gmem_addr), "h"(mask0) : "memory");
+                    }
+                }
+
+                const uint64_t dropout_addr4 = (uint64_t)(GLOBAL_ROW_OFFSET + global_row) * GLOBAL_N + (GLOBAL_COL_OFFSET + column_base4);
+                const uint4    rng4          = init_philox(DROPOUT_SEED, DROPOUT_OFFSET + (dropout_addr4 >> 2)).next();
+
+                const uint32_t rand4 = ((dropout_addr4 + 0) & 3) == 0 ? rng4.x : ((dropout_addr4 + 0) & 3) == 1 ? rng4.y : ((dropout_addr4 + 0) & 3) == 2 ? rng4.z : rng4.w;
+                const uint32_t rand5 = ((dropout_addr4 + 1) & 3) == 0 ? rng4.x : ((dropout_addr4 + 1) & 3) == 1 ? rng4.y : ((dropout_addr4 + 1) & 3) == 2 ? rng4.z : rng4.w;
+
+                const bool keep4 = (rand4 <= drop_thr);
+                const bool keep5 = (rand5 <= drop_thr);
+                p4 = keep4 ? (p4 * rp_dropout) : 0.0f;
+                p5 = keep5 ? (p5 * rp_dropout) : 0.0f;
+
+                if (GMEM_MASK != nullptr) {
+                    const ushort   mask4     = 0x3C00 | (keep4 ? 0 : 0x8000);
+                    const ushort   mask5     = 0x3C00 | (keep5 ? 0 : 0x8000);
+                    const uint64_t gmem_addr = __cvta_generic_to_global(GMEM_MASK + global_row * STRIDE_GMEM + column_base4);
+
+                    if (is_full || column_base4 + 1 < VALID_KV) {
+                        asm volatile("st.global.v2.u16 [%0], {%1, %2};\n" :: "l"(gmem_addr), "h"(mask4), "h"(mask5) : "memory");
+                    } else if (column_base4 < VALID_KV) {
+                        asm volatile("st.global.u16 [%0], %1;\n" :: "l"(gmem_addr), "h"(mask4) : "memory");
+                    }
+                }
+            }
+
+            const uint32_t sp_row = sp_base + (uint32_t)global_row * (STRIDE * 2);
+
+            st_half2(sp_row + (uint32_t)column_base  * 2, __float22half2_rn(make_float2(p0, p1)), global_row);
+            st_half2(sp_row + (uint32_t)column_base4 * 2, __float22half2_rn(make_float2(p4, p5)), global_row);
+        }
+    }
+
+    // ============================================================
+    // rO rescale -> only when running max grew
+    // ============================================================
+    if (BLOCK_ID > 0) {
+        bool is_full = false;
+
+        #pragma unroll
+        for (int row = 0; row < ROWS; ++row) {
+            is_full |= (rExpDiff[row] != 1.0f);
+        }
+
+        if (is_full) {
+            #pragma unroll
+            for (int idx = 0; idx < TILES_O; ++idx) {
+                auto& rO_fragment = rO[idx];
+                #pragma unroll
+                for (int elem = 0; elem < 8; ++elem) {
+                    const int row_pair = (elem >> 1) & 1;
+                    rO_fragment.x[elem] *= rExpDiff[row_pair];
+                }
+            }
+        }
+    }
+
+    // ============================================================
+    // Single warp-reduce of row sums -> merge into rRowSum
+    // ============================================================
+    #pragma unroll
+    for (int row = 0; row < ROWS; ++row) {
+
+        float warp_sum = iter_sum[row];
+
+        warp_sum += __shfl_xor_sync(0xFFFFFFFFu, warp_sum, 2);
+        warp_sum += __shfl_xor_sync(0xFFFFFFFFu, warp_sum, 8);
+
+        rRowSum[row] = rExpDiff[row] * rRowSum[row] + warp_sum;
     }
 }
 
@@ -215,16 +260,16 @@ __device__ __forceinline__ void WMMA_GEMM_SOFTMAX(
 //           dS     = (P_drop * dOV - P_orig * D) * softmax_scale
 //           if softcap: dS *= (1 - (S/c)^2)   [FMA form]
 //
-// LAYOUT:   S [float], dOV[float] row-major, stride SMEM_LDS_STRIDE (floats)
-//           P [half ], dS [half ] row-major, stride SMEM_LDO_STRIDE (halves)
-//           sS[row,k]             sP[row,2k],sP[row,2k+1]
+// LAYOUT:   S [float], dOV [float] in WMMA accumulator fragments
+//           P [half ], dS [half ] row-major in SMEM via st_half2(addr, half2, row)
+//           pair p (0..3), e = 2p; row += (p & 1) * 2, col += (p >> 1) * 4
 // ======================================================================================
-template<typename Config, GemmPhase TYPE, bool IS_SOFTCAP, bool IS_DROPOUT>
+template<typename Config, GemmPhase PHASE, bool IS_SOFTCAP, bool IS_DROPOUT, typename FRAG_S, typename FRAG_DOV, int TILES>
 __device__ __forceinline__ void WMMA_GEMM_SOFTMAX_GRADIENT(
-    const float* __restrict__ SMEM_S,
-    const float* __restrict__ SMEM_DOV,
-    const float* __restrict__ SMEM_LSE,
-    const float* __restrict__ SMEM_DOT,
+    FRAG_S       (&rS)        [TILES],
+    FRAG_DOV     (&rdOV)      [TILES],
+    const float* __restrict__ GMEM_LSE,
+    const float* __restrict__ GMEM_ROWDOT,
          __half* __restrict__ SMEM_P,
          __half* __restrict__ SMEM_DS,
     int      VALID_Q_ROWS,
@@ -237,113 +282,100 @@ __device__ __forceinline__ void WMMA_GEMM_SOFTMAX_GRADIENT(
     int      GLOBAL_ROW_OFFSET,
     int      GLOBAL_COL_OFFSET,
     int      GLOBAL_N,
-    int      THREAD_ID
+    int      WARP_ID,
+    int      LANE_ID
 ) {
-    using Traits = PhaseTraits<TYPE>;
+    if (VALID_Q_ROWS == 0 || VALID_KV_ROWS == 0) return;
 
-    constexpr int  TILE_X            = Traits::template BLOCK_X<Config>();
-    constexpr int  TILE_Y            = Traits::template BLOCK_Y<Config>();
-    constexpr int  LDS_STRIDE        = Traits::template LDS_STRIDE<Config>();
-    constexpr int  LDO_STRIDE        = Traits::template LDO_STRIDE<Config>();
-    constexpr bool PHASE             = Traits::IS_SDS_SP;
-    constexpr int  THREADS_PER_BLOCK = Config::THREADS_PER_BLOCK;
+    using PTraits              = PhaseTraits<PHASE>;
+    constexpr bool WRITE_P     = PTraits::WRITE_P;
+    constexpr uint32_t STRIDE  = PTraits::template STRIDE<Config>();
+    constexpr int TILE_M       = PTraits::template BLOCK_X<Config>();
+    constexpr int TILE_N       = PTraits::template BLOCK_Y<Config>();
+    constexpr int num_tiles_m  = (TILE_M + WMMA_M - 1) / WMMA_M;
+    constexpr int num_tiles_n  = (TILE_N + WMMA_N - 1) / WMMA_N;
+    constexpr int total_tiles  = num_tiles_m * num_tiles_n;
 
-    const float    softcap_inv = IS_SOFTCAP ? (1.0f / SOFTCAP) : 0.0f;
-    const float    rp_dropout  = IS_DROPOUT ? (1.0f / (1.0f - P_DROPOUT)) : 1.0f;
-    const uint32_t drop_thr    = IS_DROPOUT ? static_cast<uint32_t>((1.0f - P_DROPOUT) * 4294967295.0f) : 0u;
+    const   float softcap_inv  = IS_SOFTCAP ? (1.0f / SOFTCAP) : 0.0f;
+    const   float rp_dropout   = IS_DROPOUT ? (1.0f / (1.0f - P_DROPOUT)) : 1.0f;
+    const uint32_t drop_thr    = IS_DROPOUT ? uint32_t((1.0f - P_DROPOUT) * 4294967295.0f) : 0u;
+    const uint32_t sp_base     = WRITE_P ? __cvta_generic_to_shared(SMEM_P) : 0u;
+    const uint32_t sds_base    = __cvta_generic_to_shared(SMEM_DS);
 
-    float4  prev_ds  = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-    int     prev_row  = -1;
-    int     prev_col  =  0;
-    bool    prev_has  = false;
+    const uint2    lines       = LINE_CHORDS(LANE_ID);
 
-    #pragma unroll 1
-    for (int i = THREAD_ID; i < (TILE_X * TILE_Y >> 2); i += THREADS_PER_BLOCK) {
-        const int idx = i << 2;
-        const int row = idx / TILE_Y;
-        const int col = idx % TILE_Y;
+    #pragma unroll
+    for (int tile_index = 0; tile_index < TILES; ++tile_index) {
 
-        const bool is_valid = (row < VALID_Q_ROWS);
-        const bool in0      = is_valid && (col       < VALID_KV_ROWS);
-        const bool in1      = is_valid && ((col + 1) < VALID_KV_ROWS);
-        const bool in2      = is_valid && ((col + 2) < VALID_KV_ROWS);
-        const bool in3      = is_valid && ((col + 3) < VALID_KV_ROWS);
+        if ((WARP_ID * TILES + tile_index) >= total_tiles) break;
 
-        const float lse = is_valid ? SMEM_LSE[row] : 0.0f;
-        const float dot = is_valid ? SMEM_DOT[row] : 0.0f;
+        const int tile_m = ((WARP_ID * TILES + tile_index) / num_tiles_n) * WMMA_M;
+        const int tile_n = ((WARP_ID * TILES + tile_index) % num_tiles_n) * WMMA_N;
 
-        float4 sS, sdOV;
+        if (tile_m >= VALID_Q_ROWS) continue;
 
-        if (is_valid) {
-            const uint32_t sS_base   = __cvta_generic_to_shared(SMEM_S   + row * LDS_STRIDE);
-            const uint32_t sDOV_base = __cvta_generic_to_shared(SMEM_DOV + row * LDS_STRIDE);
-            sS   = ld_float4(sS_base   + col * 4, row);
-            sdOV = ld_float4(sDOV_base + col * 4, row);
-        } else {
-            sS   = make_float4(NEG_INF, NEG_INF, NEG_INF, NEG_INF);
-            sdOV = make_float4(0.0f,    0.0f,    0.0f,    0.0f);
-        }
+        auto& rS_fragment   = rS[tile_index];
+        auto& rdOV_fragment = rdOV[tile_index];
 
-        if (!in0) { sS.x = NEG_INF; sdOV.x = 0.0f; }
-        if (!in1) { sS.y = NEG_INF; sdOV.y = 0.0f; }
-        if (!in2) { sS.z = NEG_INF; sdOV.z = 0.0f; }
-        if (!in3) { sS.w = NEG_INF; sdOV.w = 0.0f; }
+        #pragma unroll
+        for (int pair_index = 0; pair_index < 4; ++pair_index) {
+            const int element  = pair_index * 2;
+            const int row_pair = pair_index & 1;
+            const int col_quad = pair_index >> 1;
 
-        float p0 = (sS.x == NEG_INF || (sS.x - lse) < -80.0f) ? 0.0f : __expf(sS.x - lse);
-        float p1 = (sS.y == NEG_INF || (sS.y - lse) < -80.0f) ? 0.0f : __expf(sS.y - lse);
-        float p2 = (sS.z == NEG_INF || (sS.z - lse) < -80.0f) ? 0.0f : __expf(sS.z - lse);
-        float p3 = (sS.w == NEG_INF || (sS.w - lse) < -80.0f) ? 0.0f : __expf(sS.w - lse);
+            const int global_row = tile_m + int(lines.x) + row_pair * 2;
+            const int global_col = tile_n + int(lines.y) + col_quad * 4;
 
-        float pd0 = p0, pd1 = p1, pd2 = p2, pd3 = p3;
+            //if (global_row >= VALID_Q_ROWS || global_col >= VALID_KV_ROWS) continue;
 
-        if constexpr (IS_DROPOUT) {
-            const uint64_t addr_plx = static_cast<uint64_t>(GLOBAL_ROW_OFFSET + row) * GLOBAL_N + (GLOBAL_COL_OFFSET + col);
-            const uint4         rng = init_philox(DROPOUT_SEED, DROPOUT_OFFSET + (addr_plx >> 2)).next();
-
-            if (in0) pd0 = (rng.x <= drop_thr) ? (p0 * rp_dropout) : 0.0f;
-            if (in1) pd1 = (rng.y <= drop_thr) ? (p1 * rp_dropout) : 0.0f;
-            if (in2) pd2 = (rng.z <= drop_thr) ? (p2 * rp_dropout) : 0.0f;
-            if (in3) pd3 = (rng.w <= drop_thr) ? (p3 * rp_dropout) : 0.0f;
-        }
-
-        float ds0 = __fmaf_rn(pd0, sdOV.x, -p0 * dot) * SOFTMAX_SCALE;
-        float ds1 = __fmaf_rn(pd1, sdOV.y, -p1 * dot) * SOFTMAX_SCALE;
-        float ds2 = __fmaf_rn(pd2, sdOV.z, -p2 * dot) * SOFTMAX_SCALE;
-        float ds3 = __fmaf_rn(pd3, sdOV.w, -p3 * dot) * SOFTMAX_SCALE;
-
-        if constexpr (IS_SOFTCAP) {
-            if (sS.x > NEG_INF) { const float n = __fmul_rn(sS.x, softcap_inv); ds0 = __fmul_rn(ds0, __fmaf_rn(-n, n, 1.0f)); }
-            if (sS.y > NEG_INF) { const float n = __fmul_rn(sS.y, softcap_inv); ds1 = __fmul_rn(ds1, __fmaf_rn(-n, n, 1.0f)); }
-            if (sS.z > NEG_INF) { const float n = __fmul_rn(sS.z, softcap_inv); ds2 = __fmul_rn(ds2, __fmaf_rn(-n, n, 1.0f)); }
-            if (sS.w > NEG_INF) { const float n = __fmul_rn(sS.w, softcap_inv); ds3 = __fmul_rn(ds3, __fmaf_rn(-n, n, 1.0f)); }
-        }
-
-        if constexpr (!PHASE) {
-            if (prev_has) {
-                const uint32_t sDS_base = __cvta_generic_to_shared(SMEM_DS + prev_row * LDO_STRIDE);
-                const uint32_t addr  = sDS_base + prev_col * 2;
-                st_half4(addr, __float22half2_rn(make_float2(prev_ds.x, prev_ds.y)), __float22half2_rn(make_float2(prev_ds.z, prev_ds.w)), prev_row);
+            if (global_row >= VALID_Q_ROWS || global_col >= VALID_KV_ROWS) {
+                st_half2(sds_base + ((global_row * STRIDE + global_col) * 2u), __float22half2_rn(make_float2(0.0f, 0.0f)), global_row);
+                if constexpr (WRITE_P)
+                    st_half2(sp_base + ((global_row * STRIDE + global_col) * 2u), __float22half2_rn(make_float2(0.0f, 0.0f)), global_row);
+                continue;
             }
-            prev_ds  = make_float4(ds0, ds1, ds2, ds3);
-            prev_row = row;
-            prev_col = col;
-            prev_has = true;
-        } else {
-            const uint32_t sDS_base = __cvta_generic_to_shared(SMEM_DS + row * LDO_STRIDE);
-            const uint32_t sP_base  = __cvta_generic_to_shared(SMEM_P  + row * LDO_STRIDE);
-            const uint32_t addr_ds  = sDS_base + col * 2;
-            const uint32_t addr_p   = sP_base  + col * 2;
 
-            st_half4(addr_ds, __float22half2_rn(make_float2(ds0, ds1)), __float22half2_rn(make_float2(ds2, ds3)), row);
-            st_half4(addr_p,  __float22half2_rn(make_float2(pd0, pd1)), __float22half2_rn(make_float2(pd2, pd3)), row);
-        }
-    }
+            const float lse = GMEM_LSE   [global_row];
+            const float dot = GMEM_ROWDOT[global_row];
 
-    if constexpr (!PHASE) {
-        if (prev_has) {
-            const uint32_t sDS_base = __cvta_generic_to_shared(SMEM_DS + prev_row * LDO_STRIDE);
-            const uint32_t addr  = sDS_base + prev_col * 2;
-            st_half4(addr, __float22half2_rn(make_float2(prev_ds.x, prev_ds.y)), __float22half2_rn(make_float2(prev_ds.z, prev_ds.w)), prev_row);
+            const float s0 = rS_fragment.x[element];
+            const float s1 = rS_fragment.x[element + 1];
+            const float d0 = rdOV_fragment.x[element];
+            const float d1 = rdOV_fragment.x[element + 1];
+
+            float p0 = (s0 == NEG_INF || (s0 - lse) < -80.0f) ? 0.0f : __expf(s0 - lse);
+            float p1 = (s1 == NEG_INF || (s1 - lse) < -80.0f) ? 0.0f : __expf(s1 - lse);
+
+            float pd0 = p0;
+            float pd1 = p1;
+
+            if constexpr (IS_DROPOUT) {
+                const uint32_t dropout_addr = (GLOBAL_ROW_OFFSET + global_row) * GLOBAL_N + (GLOBAL_COL_OFFSET + global_col);
+                const uint4 rng = init_philox(DROPOUT_SEED, DROPOUT_OFFSET + (dropout_addr >> 2)).next();
+                const int c0 = global_col & 3;
+                const int c1 = (global_col + 1) & 3;
+                const uint32_t r0 = (c0 == 0) ? rng.x : (c0 == 1) ? rng.y : (c0 == 2) ? rng.z : rng.w;
+                const uint32_t r1 = (c1 == 0) ? rng.x : (c1 == 1) ? rng.y : (c1 == 2) ? rng.z : rng.w;
+                pd0 = (r0 <= drop_thr) ? (p0 * rp_dropout) : 0.0f;
+                pd1 = (r1 <= drop_thr) ? (p1 * rp_dropout) : 0.0f;
+            }
+
+            float ds0 = __fmaf_rn(pd0, d0, -p0 * dot) * SOFTMAX_SCALE;
+            float ds1 = __fmaf_rn(pd1, d1, -p1 * dot) * SOFTMAX_SCALE;
+
+            if constexpr (IS_SOFTCAP) {
+                if (s0 > NEG_INF) { const float n = __fmul_rn(s0, softcap_inv); ds0 = __fmul_rn(ds0, __fmaf_rn(-n, n, 1.0f)); }
+                if (s1 > NEG_INF) { const float n = __fmul_rn(s1, softcap_inv); ds1 = __fmul_rn(ds1, __fmaf_rn(-n, n, 1.0f)); }
+            }
+
+            const uint32_t offset  = (global_row * STRIDE + global_col) * 2u;
+            const uint32_t ds_addr = sds_base + offset;
+            st_half2(ds_addr, __float22half2_rn(make_float2(ds0, ds1)), global_row);
+
+            if constexpr (WRITE_P) {
+                const uint32_t p_addr = sp_base + offset;
+                st_half2(p_addr, __float22half2_rn(make_float2(pd0, pd1)), global_row);
+            }
         }
     }
 }

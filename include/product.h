@@ -7,93 +7,99 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include "swizzle.h"
+#include "kernel.h"
 
 // ======================================================================================
-// WMMA_GEMM_DOT_PRODUCT: Row-wise sum(O ⊙ dO) with optional LSE staging to SMEM
-//   TYPE (GemmType): PHASE (bit 0) selects THREADS_PER_ROW source (DQ vs DKV)
-//   GLOBAL_STRIDE:   Runtime source row pitch
+// BACKWARD ROWDOT KERNEL
 // ======================================================================================
-template <typename Config, GemmPhase PHASE>
-__device__ __forceinline__ void WMMA_GEMM_DOT_PRODUCT(
-    const __half* __restrict__ GMEM_O,
-    const __half* __restrict__ SMEM_DO,
-    const float*  __restrict__ GMEM_LSE,
-          float*  __restrict__ SMEM_LSE,
-          float*  __restrict__ SMEM_DOT,
-    int GLOBAL_STRIDE,
-    int VALID_ROWS,
-    int OFFSET,
-    int THREAD_ID
+template<int D>
+__global__ void __launch_bounds__(MAX_THREADS_PER_WARP * 8, 1)
+flash_attention_rowdot_kernel(
+    const __half* __restrict__ O,
+    const __half* __restrict__ dO,
+           float* __restrict__ row_dot,
+    const int B,
+    const int H_Q,
+    const int M
 ) {
-    using PTraits = PhaseTraits<PHASE>;
+    constexpr int BLOCK_M         = 32;
+    constexpr int THREADS_PER_ROW = 8;
 
-    constexpr int THREADS_PER_ROW = PTraits::IS_SWAPPED ? Config::DKV::THREADS_PER_ROW : Config::DQ::THREADS_PER_ROW;
+    // ==================================================================================
+    // Grid Mapping: X for M-blocks, Y for batch-head composite (batch * H_Q + head)
+    // ==================================================================================
+    const int block_m  = blockIdx.x;
+    const int bthd_idx = blockIdx.y;
 
-    const int total_iters = (Config::DIM + 7) >> 3;
+    if (bthd_idx >= B * H_Q) return;
+    const int start_m = block_m * BLOCK_M;
 
-    if (total_iters == 0 || VALID_ROWS == 0) return;
+    if (start_m >= M) return;
+    const int valid_m = min(BLOCK_M, M - start_m);
 
-    const int row  = THREAD_ID / THREADS_PER_ROW;
-    const int lane = THREAD_ID % THREADS_PER_ROW;
-    const int work = (total_iters + THREADS_PER_ROW - 1) / THREADS_PER_ROW;
+    // ==================================================================================
+    // Init:   thread/row/lane IDs for the 8-lane reduction group
+    // ==================================================================================
+    const int tid  = threadIdx.x;
+    const int row  = tid / THREADS_PER_ROW;
+    const int lane = tid % THREADS_PER_ROW;
 
-    float thread_dot = 0.0f;
+    if (row >= valid_m) return;
 
-    if (row < VALID_ROWS) {
+    const int batch_idx  = bthd_idx / H_Q;
+    const int head_idx   = bthd_idx % H_Q;
+    const int global_row = start_m + row;
 
-        const uint64_t gmem_base = static_cast<uint64_t>(__cvta_generic_to_global(GMEM_O))  + static_cast<uint64_t>(row) * GLOBAL_STRIDE * 2;
-        const uint32_t smem_base = static_cast<uint32_t>(__cvta_generic_to_shared(SMEM_DO)) + static_cast<uint32_t>(row) * Config::DIM   * 2;
+    // ==================================================================================
+    // Layout:   O/dO:    [B, M, H_Q, D]  (element = ((batch_idx*M + global_row)*H_Q + head_idx)*D + d)
+    //           row_dot: [B, H_Q, M]     (element =  bthd_idx * M + global_row)
+    // ==================================================================================
+    const __half* o_row  = O  + ((size_t)batch_idx * M + global_row) * H_Q * D + (size_t)head_idx * D;
+    const __half* do_row = dO + ((size_t)batch_idx * M + global_row) * H_Q * D + (size_t)head_idx * D;
 
+    constexpr int total_iters = (D + 7) >> 3;
+    constexpr int work        = (total_iters + THREADS_PER_ROW - 1) / THREADS_PER_ROW;
+
+    // ==================================================================================
+    // Compute:  partial = Σ_d O[row, d] · dO[row, d]
+    // Layout:   uint4 (8 half per load) per lane
+    // Template: per-lane work = ceil(total_iters / THREADS_PER_ROW)
+    // ==================================================================================
+    float partial = 0.0f;
+    #pragma unroll
+    for (int idx = 0; idx < work; ++idx) {
+        if ((lane + idx * THREADS_PER_ROW) >= total_iters) break;
+        const int col = (lane + idx * THREADS_PER_ROW) << 3;
+
+        const uint4 ov = *reinterpret_cast<const uint4*>(o_row  + col);
+        const uint4 dv = *reinterpret_cast<const uint4*>(do_row + col);
+        const uint32_t op[4] = {ov.x, ov.y, ov.z, ov.w};
+        const uint32_t dp[4] = {dv.x, dv.y, dv.z, dv.w};
+
+        // 4 × half2 per uint4 -> 8 FMA per lane per chunk
         #pragma unroll
-        for (int j = 0; j < work; ++j) {
-            const int chunk = lane + j * THREADS_PER_ROW;
-            if (chunk >= total_iters) break;
-
-            const int col  = chunk << 3;
-            const int pred = (col < Config::DIM) ? 1 : 0;
-
-            uint32_t o_pack[4], d_pack[4];
-            const uint64_t gmem_addr = gmem_base + static_cast<uint64_t>(col) * 2;
-            const uint32_t smem_addr = swizzle(smem_base + static_cast<uint32_t>(col) * 2, row);
-
-            asm volatile(
-                "{\n\t"
-                "  .reg .pred p;\n\t"
-                "  setp.ne.b32 p, %10, 0;\n\t"
-                "  mov.u32 %0, 0; mov.u32 %1, 0; mov.u32 %2, 0; mov.u32 %3, 0;\n\t"
-                "  mov.u32 %4, 0; mov.u32 %5, 0; mov.u32 %6, 0; mov.u32 %7, 0;\n\t"
-                "  @p ld.global.v4.u32 {%0, %1, %2, %3}, [%8];\n\t"
-                "  @p ld.shared.v4.u32 {%4, %5, %6, %7}, [%9];\n\t"
-                "}\n\t"
-                : "=r"(o_pack[0]), "=r"(o_pack[1]), "=r"(o_pack[2]), "=r"(o_pack[3]),
-                  "=r"(d_pack[0]), "=r"(d_pack[1]), "=r"(d_pack[2]), "=r"(d_pack[3])
-                : "l"(gmem_addr), "r"(smem_addr), "r"(pred)
-                : "memory"
-            );
-
-            #define H2F_XY(pack, xy) (__half22float2(reinterpret_cast<const __half2&>(pack)).xy)
-            thread_dot = __fmaf_rn(H2F_XY(o_pack[0], x), H2F_XY(d_pack[0], x), thread_dot);
-            thread_dot = __fmaf_rn(H2F_XY(o_pack[0], y), H2F_XY(d_pack[0], y), thread_dot);
-            thread_dot = __fmaf_rn(H2F_XY(o_pack[1], x), H2F_XY(d_pack[1], x), thread_dot);
-            thread_dot = __fmaf_rn(H2F_XY(o_pack[1], y), H2F_XY(d_pack[1], y), thread_dot);
-            thread_dot = __fmaf_rn(H2F_XY(o_pack[2], x), H2F_XY(d_pack[2], x), thread_dot);
-            thread_dot = __fmaf_rn(H2F_XY(o_pack[2], y), H2F_XY(d_pack[2], y), thread_dot);
-            thread_dot = __fmaf_rn(H2F_XY(o_pack[3], x), H2F_XY(d_pack[3], x), thread_dot);
-            thread_dot = __fmaf_rn(H2F_XY(o_pack[3], y), H2F_XY(d_pack[3], y), thread_dot);
-            #undef H2F_XY
+        for (int jdx = 0; jdx < 4; ++jdx) {
+            const float2 of = __half22float2(*reinterpret_cast<const __half2*>(&op[jdx]));
+            const float2 df = __half22float2(*reinterpret_cast<const __half2*>(&dp[jdx]));
+            partial = __fmaf_rn(of.x, df.x, partial);
+            partial = __fmaf_rn(of.y, df.y, partial);
         }
     }
 
+    // ==================================================================================
+    // Compute:  warp-reduce partials across the THREADS_PER_ROW = 8 lanes
+    // Layout:   xor-shuffle tree, log2(THREADS_PER_ROW) = 3 rounds, group-scoped
+    // ==================================================================================
     #pragma unroll
     for (int offset = THREADS_PER_ROW / 2; offset > 0; offset >>= 1) {
-        thread_dot += __shfl_xor_sync(0xFFFFFFFFU, thread_dot, offset, THREADS_PER_ROW);
+        partial += __shfl_xor_sync(0xFFFFFFFFu, partial, offset, THREADS_PER_ROW);
     }
 
-    if (lane == 0 && row < VALID_ROWS) {
-        SMEM_DOT[row] = thread_dot;
-    }
-
-    if (THREAD_ID < VALID_ROWS) {
-        SMEM_LSE[THREAD_ID] = GMEM_LSE[OFFSET + THREAD_ID];
+    // ==================================================================================
+    // Store:    row_dot[b, h, m] — single fp32 store by lane 0 of each row-group
+    // Layout:   row_dot[bthd_idx * M + global_row]
+    // ==================================================================================
+    if (lane == 0) {
+        row_dot[(size_t)bthd_idx * M + global_row] = partial;
     }
 }

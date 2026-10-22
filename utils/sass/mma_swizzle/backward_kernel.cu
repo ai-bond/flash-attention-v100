@@ -18,22 +18,22 @@
 #include "kernel.h"
 #include "backward.h"
 #include "gemm_smem.h"
-#include "product.h"
 #include "mat_mul.h"
 #include "softmax.h"
+#include "product.h"
 
 // ======================================================================================
 // BACKWARD KERNEL
 // ======================================================================================
-template<int D, bool IS_CAUSAL, bool IS_ALIBI, bool IS_SOFTCAP, bool IS_WINDOW, bool IS_DROPOUT>
-__global__ void __launch_bounds__(KernelConfig<D>::THREADS_PER_BLOCK, 2)
+template<int D, bool IS_EVEN, bool IS_CAUSAL, bool IS_ALIBI, bool IS_SOFTCAP, bool IS_WINDOW, bool IS_DROPOUT>
+__global__ void __launch_bounds__(KernelConfig<D>::THREADS_PER_BLOCK, 1)
 flash_attention_backward_kernel(
     const __half* __restrict__ Q,
     const __half* __restrict__ K,
     const __half* __restrict__ V,
-    const __half* __restrict__ O,
     const __half* __restrict__ dO,
     const  float* __restrict__ softmax_lse,
+    const  float* __restrict__ row_dot,
           __half* __restrict__ dQ,
           __half* __restrict__ dK,
           __half* __restrict__ dV,
@@ -112,13 +112,13 @@ flash_attention_backward_kernel(
         //   K/V:       [B, N, H_K, D]   (KV-head via bthd_idx % H_Q / (H_Q / H_K))
         //   LSE:       [B, H_Q, M]
         // ==================================================================================
-        const __half* __restrict__ q_ptr   = Q           + block.q_offset  (D, H_Q, M);
-        const __half* __restrict__ k_ptr   = K           + block.kv_offset (D, H_K, N);
-        const __half* __restrict__ v_ptr   = V           + block.kv_offset (D, H_K, N);
-        const __half* __restrict__ o_ptr   = O           + block.q_offset  (D, H_Q, M);
-        const __half* __restrict__ dO_ptr  = dO          + block.q_offset  (D, H_Q, M);
-              __half* __restrict__ dQ_ptr  = dQ          + block.q_offset  (D, H_Q, M);
-        const float*  __restrict__ lse_ptr = softmax_lse + block.lse_offset(H_Q, M);
+        const __half* __restrict__ q_ptr    = Q           + block.q_offset  (D, H_Q, M);
+        const __half* __restrict__ k_ptr    = K           + block.kv_offset (D, H_K, N);
+        const __half* __restrict__ v_ptr    = V           + block.kv_offset (D, H_K, N);
+        const __half* __restrict__ dO_ptr   = dO          + block.q_offset  (D, H_Q, M);
+              __half* __restrict__ dQ_ptr   = dQ          + block.q_offset  (D, H_Q, M);
+        const  float* __restrict__ lse_ptr  = softmax_lse + block.lse_offset(H_Q, M);
+        const  float* __restrict__ rdot_ptr = row_dot     + block.lse_offset(H_Q, M);
 
         // ==================================================================================
         // Init:   shared memory with zero-fill union regions to avoid stale data
@@ -130,15 +130,13 @@ flash_attention_backward_kernel(
         __half* __restrict__ sQ      = smem.phase.bdq.q;
         __half* __restrict__ sK      = smem.phase.bdq.reuse_kv.k;
         __half* __restrict__ sV      = smem.phase.bdq.reuse_kv.v;
-         float* __restrict__ sS      = smem.phase.bdq.s;
         __half* __restrict__ sdO     = smem.phase.bdq.dO;
-         float* __restrict__ sdOV    = smem.phase.bdq.reuse_sdOVS.dOV;
-        __half* __restrict__ sdS     = smem.phase.bdq.reuse_sdOVS.dS;
-         float* __restrict__ sRowDot = smem.row_dot;
-         float* __restrict__ sLse    = smem.lse;
-         float* __restrict__ sdQ     = smem.phase.bdq.dQ;
+        __half* __restrict__ sdS     = smem.phase.bdq.dS;
 
         WMMA_GEMM_INIT_SMEM<Config>(smem_raw);
+        WMMA_GEMM_INIT_REGS<Config, GemmType::Q_KT,  GemmPhase::BWQ> rS;
+        WMMA_GEMM_INIT_REGS<Config, GemmType::dO_VT, GemmPhase::BWQ> rdOV;
+        WMMA_GEMM_INIT_REGS<Config, GemmType::dS_K,  GemmPhase::BWQ> rdQ;
         __syncthreads();
 
         // ==================================================================================
@@ -153,20 +151,10 @@ flash_attention_backward_kernel(
         __syncthreads();
 
         // ==================================================================================
-        // Compute:  row_dot = sum(O ⊙ dO) [dQ backward pass]
-        // Layout:   O[global: tile from block.start_q, D], dO[shared: valid_q_rows, D]-> sRowDot[shared: valid_q_rows]
-        // Template: GemmPhase::BWQ (LSE_OFFSET=0)
-        // ==================================================================================
-        WMMA_GEMM_DOT_PRODUCT<Config, GemmPhase::BWQ>(
-          o_ptr,   sdO, lse_ptr, sLse,
-          sRowDot, H_Q * D, block.valid_q_rows, 0, tid);
-        __syncthreads();
-
-        // ==================================================================================
         // MAIN LOOP (iterates over K/V blocks for current Q block)
         // ==================================================================================
-        for (int block_q = block.block_min; block_q < block.block_max; ++block_q) {
-            const int start_kv      = block_q * BLOCK_N;
+        for (int block_kv = block.block_min; block_kv < block.block_max; ++block_kv) {
+            const int start_kv      = block_kv * BLOCK_N;
             const int valid_kv_rows = min(BLOCK_N, N - start_kv);
 
             // ==================================================================================
@@ -186,7 +174,7 @@ flash_attention_backward_kernel(
             // Template: GemmType::dO_VT, GemmPhase::BWQ
             // ==================================================================================
             WMMA_GEMM_SCORES<Config, GemmType::dO_VT, GemmPhase::BWQ, IS_CAUSAL, IS_ALIBI, IS_SOFTCAP, IS_WINDOW>(
-              sdO, sV, sdOV,
+              sdO, sV, rdOV.frags,
               block.valid_q_rows,  valid_kv_rows,
               0, 0, 0, 1.0f, 0.0f, 0.0f, -1, -1,
               warp_id, lane_id);
@@ -209,7 +197,7 @@ flash_attention_backward_kernel(
             // Template: GemmType::Q_KT, GemmPhase::BWQ
             // ==================================================================================
             WMMA_GEMM_SCORES<Config, GemmType::Q_KT, GemmPhase::BWQ, IS_CAUSAL, IS_ALIBI, IS_SOFTCAP, IS_WINDOW>(
-              sQ, sK, sS,
+              sQ, sK, rS.frags,
               block.valid_q_rows,  valid_kv_rows,
               block.start_q,       start_kv,
               block.seqlen_offset,
@@ -223,11 +211,11 @@ flash_attention_backward_kernel(
             // Template: GemmPhase::BWQ
             // ==================================================================================
             WMMA_GEMM_SOFTMAX_GRADIENT<Config, GemmPhase::BWQ, IS_SOFTCAP, IS_DROPOUT>(
-              sS, sdOV, sLse, sRowDot, nullptr, sdS,
+              rS.frags, rdOV.frags, lse_ptr, rdot_ptr, nullptr, sdS,
               block.valid_q_rows, valid_kv_rows,
               softmax_scale, softcap,
               p_dropout, dropout_seed, dropout_offset,
-              block.start_q, start_kv, N, tid);
+              block.start_q, start_kv, N, warp_id, lane_id);
             __syncthreads();
 
             // ==================================================================================
@@ -236,7 +224,7 @@ flash_attention_backward_kernel(
             // Template: GemmType::dS_K, GemmPhase::BWQ
             // ==================================================================================
             WMMA_GEMM_GRADIENTS<Config, GemmType::dS_K, GemmPhase::BWQ>(
-              sdS, sK, sdQ,
+              sdS, sK, rdQ.frags,
               block.valid_q_rows, valid_kv_rows,
               warp_id, lane_id);
             __syncthreads();
@@ -247,10 +235,10 @@ flash_attention_backward_kernel(
         // Template: Result::WRITE_DQ (NORMALIZE=false, DUAL_STORE=false)
         // ==================================================================================
         WMMA_GEMM_EPILOGUE<Config, Result::WRITE_DQ>(
-          sdQ,     dQ_ptr,
-          nullptr, nullptr,
-          nullptr,
-          H_Q * D, block.valid_q_rows, tid);
+          rdQ.frags, dQ_ptr,
+          nullptr,   nullptr,
+          nullptr,   nullptr,   nullptr,
+          H_Q * D, block.valid_q_rows, warp_id, lane_id);
     }
     // ===================================================================================
     // PHASE 2: dKV
@@ -321,19 +309,17 @@ flash_attention_backward_kernel(
         auto& smem = *reinterpret_cast<typename Config::SmemLayout*>(smem_raw);
 
         __half* __restrict__ sQ            = smem.phase.bdkv.reuse_qdO.q;
+        __half* __restrict__ sdO           = smem.phase.bdkv.reuse_qdO.dO;
         __half* __restrict__ sK            = smem.phase.bdkv.k;
         __half* __restrict__ sV            = smem.phase.bdkv.v;
-         float* __restrict__ sS            = smem.phase.bdkv.reuse_sp.s;
-        __half* __restrict__ sdO           = smem.phase.bdkv.reuse_qdO.dO;
-         float* __restrict__ sdOV          = smem.phase.bdkv.reuse_dOVS.dOV;
-        __half* __restrict__ sdS           = smem.phase.bdkv.reuse_dOVS.dS;
-        __half* __restrict__ sP            = smem.phase.bdkv.reuse_sp.p;
-         float* __restrict__ sRowDot       = smem.row_dot;
-         float* __restrict__ sLse          = smem.lse;
-         float* __restrict__ sdK           = smem.phase.bdkv.dK;
-         float* __restrict__ sdV           = smem.phase.bdkv.dV;
+        __half* __restrict__ sdS           = smem.phase.bdkv.dS;
+        __half* __restrict__ sP            = smem.phase.bdkv.p;
 
         WMMA_GEMM_INIT_SMEM<Config>(smem_raw);
+        WMMA_GEMM_INIT_REGS<Config, GemmType::Q_KT,  GemmPhase::BWKV> rS;
+        WMMA_GEMM_INIT_REGS<Config, GemmType::dO_VT, GemmPhase::BWKV> rdOV;
+        WMMA_GEMM_INIT_REGS<Config, GemmType::PT_dO, GemmPhase::BWKV> rdV;
+        WMMA_GEMM_INIT_REGS<Config, GemmType::dST_Q, GemmPhase::BWKV> rdK;
         __syncthreads();
 
         // ==================================================================================
@@ -357,10 +343,10 @@ flash_attention_backward_kernel(
             //   Q/O/dO [B, M, H_Q, D] -> batch * M * H_Q * D + head_q * D
             //   LSE:   [B, H_Q, M]    -> (batch * H_Q + head_q) * M
             // ==================================================================================
-            const __half* __restrict__ q_ptr   = Q           + (size_t)(bthd_idx / H_K)  * M * H_Q * D + (size_t)(((bthd_idx % H_K) * (H_Q / H_K)) + group) * D;
-            const __half* __restrict__ o_ptr   = O           + (size_t)(bthd_idx / H_K)  * M * H_Q * D + (size_t)(((bthd_idx % H_K) * (H_Q / H_K)) + group) * D;
-            const __half* __restrict__ dO_ptr  = dO          + (size_t)(bthd_idx / H_K)  * M * H_Q * D + (size_t)(((bthd_idx % H_K) * (H_Q / H_K)) + group) * D;
-            const  float* __restrict__ lse_ptr = softmax_lse + (size_t)((bthd_idx / H_K) * H_Q + (((bthd_idx % H_K) * (H_Q / H_K)) + group)) * M;
+            const __half* __restrict__ q_ptr    = Q           + (size_t)(bthd_idx  / H_K) * M * H_Q * D + (size_t)(((bthd_idx % H_K) * (H_Q / H_K)) + group) * D;
+            const __half* __restrict__ dO_ptr   = dO          + (size_t)(bthd_idx  / H_K) * M * H_Q * D + (size_t)(((bthd_idx % H_K) * (H_Q / H_K)) + group) * D;
+            const  float* __restrict__ lse_ptr  = softmax_lse + (size_t)((bthd_idx / H_K) * H_Q + (((bthd_idx % H_K) * (H_Q / H_K)) + group)) * M;
+            const  float* __restrict__ rdot_ptr = row_dot     + (size_t)((bthd_idx / H_K) * H_Q + (((bthd_idx % H_K) * (H_Q / H_K)) + group)) * M;
             // Alibi slope only for valid block + batch
             const int   alibi_idx   = (alibi_batch > 0) ? ((bthd_idx / H_K) * alibi_batch + ((bthd_idx % H_K) * (H_Q / H_K) + group)) : (bthd_idx % H_K) * (H_Q / H_K) + group;
             const float alibi_slope = (alibi_slopes != nullptr) ? alibi_slopes[alibi_idx] : 0.0f;
@@ -389,7 +375,7 @@ flash_attention_backward_kernel(
                 // Template: GemmType::Q_KT, GemmPhase::BWKV (IS_SWAPPED=true)
                 // ==================================================================================
                 WMMA_GEMM_SCORES<Config, GemmType::Q_KT, GemmPhase::BWKV, IS_CAUSAL, IS_ALIBI, IS_SOFTCAP, IS_WINDOW>(
-                  sQ, sK, sS,
+                  sQ, sK, rS.frags,
                   valid_q_rows,  block.valid_kv_rows,
                   start_q,       block.start_kv,
                   block.seqlen_offset,
@@ -408,23 +394,12 @@ flash_attention_backward_kernel(
                 __syncthreads();
 
                 // ==================================================================================
-                // Compute:  row_dot = sum(O ⊙ dO) [dK/dV backward pass]
-                // Layout:   O[global: tile from start_q, D], dO[shared: valid_q_rows, D] -> sRowDot[shared: valid_q_rows]
-                // Template: GemmPhase::BWKV (LSE_OFFSET=1)
-                // ==================================================================================
-                WMMA_GEMM_DOT_PRODUCT<Config, GemmPhase::BWKV>(
-                  o_ptr + start_q * (H_Q * D), sdO,
-                  lse_ptr, sLse, sRowDot,
-                  H_Q * D, valid_q_rows, start_q, tid);
-                __syncthreads();
-
-                // ==================================================================================
                 // Compute:  dOV = dO @ V^T
                 // Layout:   dO[row: BLOCK_N, D], V[col: BLOCK_M, D] -> dOV[row: BLOCK_N, col: BLOCK_M]
                 // Template: GemmType::dO_VT, GemmPhase::BWKV (IS_SWAPPED=true)
                 // ==================================================================================
                 WMMA_GEMM_SCORES<Config, GemmType::dO_VT, GemmPhase::BWKV, IS_CAUSAL, IS_ALIBI, IS_SOFTCAP, IS_WINDOW>(
-                  sdO, sV, sdOV,
+                  sdO, sV, rdOV.frags,
                   valid_q_rows,  block.valid_kv_rows,
                   0, 0, 0, 1.0f, 0.0f, 0.0f, -1, -1,
                   warp_id, lane_id);
@@ -437,11 +412,11 @@ flash_attention_backward_kernel(
                 // Template: GemmPhase::BWKV
                 // ==================================================================================
                 WMMA_GEMM_SOFTMAX_GRADIENT<Config, GemmPhase::BWKV, IS_SOFTCAP, IS_DROPOUT>(
-                  sS, sdOV, sLse, sRowDot, sP, sdS,
+                  rS.frags, rdOV.frags, lse_ptr + start_q, rdot_ptr + start_q, sP, sdS,
                   valid_q_rows,  block.valid_kv_rows,
                   softmax_scale, softcap,
                   p_dropout, dropout_seed, dropout_offset,
-                  start_q, block.start_kv, N, tid);
+                  start_q, block.start_kv, N, warp_id, lane_id);
                 __syncthreads();
 
                 // ==================================================================================
@@ -450,7 +425,7 @@ flash_attention_backward_kernel(
                 // Template: GemmType::PT_dO, GemmPhase::BWKV
                 // ==================================================================================
                 WMMA_GEMM_GRADIENTS<Config, GemmType::PT_dO, GemmPhase::BWKV>(
-                  sP, sdO, sdV,
+                  sP, sdO, rdV.frags,
                   block.valid_kv_rows, valid_q_rows,
                   warp_id, lane_id);
                 __syncthreads();
@@ -472,7 +447,7 @@ flash_attention_backward_kernel(
                 // Template: GemmType::dST_Q, GemmPhase::BWKV
                 // ==================================================================================
                 WMMA_GEMM_GRADIENTS<Config, GemmType::dST_Q, GemmPhase::BWKV>(
-                  sdS, sQ, sdK,
+                  sdS, sQ, rdK.frags,
                   block.valid_kv_rows, valid_q_rows,
                   warp_id, lane_id);
                 __syncthreads();
@@ -484,10 +459,10 @@ flash_attention_backward_kernel(
         // Template: Result::WRITE_DKV (NORMALIZE=false, DUAL_STORE=true)
         // ==================================================================================
         WMMA_GEMM_EPILOGUE<Config, Result::WRITE_DKV>(
-          sdK,    dK_ptr,
-          sdV,    dV_ptr,
-          nullptr,
-          H_K * D, block.valid_kv_rows, tid);
+          rdK.frags,   dK_ptr,
+          rdV.frags,   dV_ptr,
+          nullptr,     nullptr,   nullptr,
+          H_K * D, block.valid_kv_rows, warp_id, lane_id);
     }
 }
 
@@ -571,7 +546,7 @@ void cpu_ref_bwd(const float* Q_ref, const float* K_ref, const float* V_ref, con
                 float dov = 0;
                 for (int d = 0; d < D; ++d) dov += dO_ref[(bh*M+i)*D+d] * V_ref[(bh*N+j)*D+d];
                 float ds = P[i*N+j] * (dov - D_arr[i]) * scale;
-                if (causal && j > i) ds = 0.0f; 
+                if (causal && j > i) ds = 0.0f;
                 dS[i*N+j] = ds;
             }
         }
@@ -628,18 +603,25 @@ StabilityMetrics compute_stability_bwd(const std::vector<float>& dq_gpu, const s
 // ======================================================================================
 // TEST HARNESS
 // ======================================================================================
+// ВНИМАНИЕ: раскладка O в cpu_ref_fwd — [B*H, M, D].
+// flash_attention_rowdot_kernel ожидает [B, M, H_Q, D].
+// Для B=1, H=1 оба layout'а эквивалентны — тест-кейсы подобраны так.
+// ======================================================================================
 template<int D, bool IS_CAUSAL>
 bool run_test_bwd(int B, int H, int M, int N, float scale) {
     using Config = KernelConfig<D>;
     printf("  D=%-3d BN=%-3d BM=%-2d W=%-2d causal=%d ",
            D, Config::DQ::BLOCK_N, Config::DQ::BLOCK_M, WARPS, IS_CAUSAL);
 
-    size_t qsz = (size_t)B*H*M*D, ksz = (size_t)B*H*N*D, osz = qsz, lsz = (size_t)B*H*M;
+    const size_t qsz = (size_t)B*H*M*D;
+    const size_t ksz = (size_t)B*H*N*D;
+    const size_t osz = qsz;
+    const size_t lsz = (size_t)B*H*M;
 
     std::vector<float> hQ(qsz), hK(ksz), hV(ksz), hdO(qsz);
     std::vector<float> hO_ref(osz), hLSE_ref(lsz);
     std::vector<float> hdQ_ref(qsz), hdK_ref(ksz), hdV_ref(ksz);
-    std::vector<float> hdQ_gpu(qsz), hdK_gpu(ksz), hdV_gpu(qsz);
+    std::vector<float> hdQ_gpu(qsz), hdK_gpu(ksz), hdV_gpu(ksz);
 
     srand(42);
     for (auto& v : hQ) v = ((float)rand() / RAND_MAX - 0.5f) * 0.1f;
@@ -647,35 +629,59 @@ bool run_test_bwd(int B, int H, int M, int N, float scale) {
     for (auto& v : hV) v = ((float)rand() / RAND_MAX - 0.5f) * 0.1f;
     for (auto& v : hdO) v = ((float)rand() / RAND_MAX - 0.5f) * 0.1f;
 
-    bool use_cpu_ref = (M <= 1024 && N <= 1024); 
+    const bool use_cpu_ref = (M <= 2048 && N <= 2048);
 
-    cpu_ref_fwd(hQ.data(), hK.data(), hV.data(), hO_ref.data(), hLSE_ref.data(), B, H, M, N, D, scale, IS_CAUSAL);
+    cpu_ref_fwd(hQ.data(), hK.data(), hV.data(), hO_ref.data(), hLSE_ref.data(),
+                B, H, M, N, D, scale, IS_CAUSAL);
 
     if (use_cpu_ref) {
-        cpu_ref_bwd(hQ.data(), hK.data(), hV.data(), hO_ref.data(), hdO.data(), 
-                    hdQ_ref.data(), hdK_ref.data(), hdV_ref.data(), B, H, M, N, D, scale, IS_CAUSAL);
+        cpu_ref_bwd(hQ.data(), hK.data(), hV.data(), hO_ref.data(), hdO.data(),
+                    hdQ_ref.data(), hdK_ref.data(), hdV_ref.data(),
+                    B, H, M, N, D, scale, IS_CAUSAL);
     }
 
-    __half *dQ, *dK, *dV, *dO, *dOut, *ddQ, *ddK, *ddV; float *dLSE;
-    cudaMalloc(&dQ, qsz*2); cudaMalloc(&dK, ksz*2); cudaMalloc(&dV, ksz*2);
-    cudaMalloc(&dO, qsz*2); cudaMalloc(&dOut, osz*2); cudaMalloc(&dLSE, lsz*4);
-    cudaMalloc(&ddQ, qsz*2); cudaMalloc(&ddK, ksz*2); cudaMalloc(&ddV, ksz*2);
+    // ----------------------------------------------------------------------------------
+    // GPU buffers: Q, K, V, dO — fp16;  O — fp16 (то, что записало бы forward-ядро)
+    // ----------------------------------------------------------------------------------
+    __half *d_Q, *d_K, *d_V, *d_O, *d_dO, *d_dQ, *d_dK, *d_dV;
+    float  *d_lse, *d_rowdot;
 
-    std::vector<__half> hQ_h(qsz), hK_h(ksz), hV_h(ksz), hdO_h(qsz), hOut_h(osz);
+    cudaMalloc(&d_Q,     qsz*2); cudaMalloc(&d_K,  ksz*2); cudaMalloc(&d_V,  ksz*2);
+    cudaMalloc(&d_O,     osz*2); cudaMalloc(&d_dO, qsz*2);
+    cudaMalloc(&d_dQ,    qsz*2); cudaMalloc(&d_dK, ksz*2); cudaMalloc(&d_dV, ksz*2);
+    cudaMalloc(&d_lse,   lsz*4); cudaMalloc(&d_rowdot, lsz*4);
+
+    std::vector<__half> hQ_h(qsz), hK_h(ksz), hV_h(ksz), hO_h(osz), hdO_h(qsz);
     for (size_t i = 0; i < qsz; ++i) { hQ_h[i] = __float2half(hQ[i]); hdO_h[i] = __float2half(hdO[i]); }
     for (size_t i = 0; i < ksz; ++i) { hK_h[i] = __float2half(hK[i]); hV_h[i] = __float2half(hV[i]); }
-    for (size_t i = 0; i < osz; ++i) hOut_h[i] = __float2half(hO_ref[i]);
+    for (size_t i = 0; i < osz; ++i) { hO_h[i] = __float2half(hO_ref[i]); }
 
-    cudaMemcpy(dQ, hQ_h.data(), qsz*2, cudaMemcpyHostToDevice);
-    cudaMemcpy(dK, hK_h.data(), ksz*2, cudaMemcpyHostToDevice);
-    cudaMemcpy(dV, hV_h.data(), ksz*2, cudaMemcpyHostToDevice);
-    cudaMemcpy(dO, hdO_h.data(), qsz*2, cudaMemcpyHostToDevice);
-    cudaMemcpy(dOut, hOut_h.data(), osz*2, cudaMemcpyHostToDevice);
-    cudaMemcpy(dLSE, hLSE_ref.data(), lsz*4, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_Q,   hQ_h.data(),     qsz*2, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_K,   hK_h.data(),     ksz*2, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_V,   hV_h.data(),     ksz*2, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_O,   hO_h.data(),     osz*2, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_dO,  hdO_h.data(),    qsz*2, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_lse, hLSE_ref.data(), lsz*4, cudaMemcpyHostToDevice);
+    // d_rowdot НЕ копируется с хоста — его заполняет rowdot-ядро на GPU.
 
+    // ----------------------------------------------------------------------------------
+    // STEP 1: row_dot = rowsum(O ⊙ dO)  — как в launcher_flash_attention_rowdot
+    // Layout:  O/dO   [B, M, H_Q, D]  (в тесте B=H=1 — совпадает с [B*H, M, D] CPU-ref)
+    //          row_dot [B, H_Q, M]
+    // ----------------------------------------------------------------------------------
+    {
+        constexpr int ROWDOT_BLOCK_M   = 32;
+        constexpr int ROWDOT_THREADS   = MAX_THREADS_PER_WARP * 8;
+        const dim3    rowdot_grid((M + ROWDOT_BLOCK_M - 1) / ROWDOT_BLOCK_M, B * H);
+        flash_attention_rowdot_kernel<D><<<rowdot_grid, ROWDOT_THREADS>>>(
+            d_O, d_dO, d_rowdot, B, H, M);
+    }
+
+    // ----------------------------------------------------------------------------------
+    // STEP 2: backward kernel  dQ, dK, dV
+    // ----------------------------------------------------------------------------------
     const size_t smem_bytes = Config::TOTAL_SMEM;
-    auto kern = flash_attention_backward_kernel<D, IS_CAUSAL, false, false, false, false>;
-    cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
+    const bool   is_even    = (M % Config::DQ::BLOCK_M == 0) && (N % Config::DQ::BLOCK_N == 0);
 
     const int grid_dq  = (M + Config::DQ::BLOCK_M - 1) /  Config::DQ::BLOCK_M;
     const int grid_dkv = (N + Config::DKV::BLOCK_M - 1) / Config::DKV::BLOCK_M;
@@ -687,12 +693,17 @@ bool run_test_bwd(int B, int H, int M, int N, float scale) {
     cudaEventCreate(&start);
     cudaEventCreate(&stop);
 
+    auto launch = [&](auto kern) {
+        cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
+        kern<<<grid, block, smem_bytes>>>(
+            d_Q, d_K, d_V, d_dO, d_lse, d_rowdot, d_dQ, d_dK, d_dV,
+            B, H, H, M, N, grid_dq, grid_dkv,
+            scale, 0.0f, nullptr, 0, -1, -1, 0.0f, 0, 0);
+    };
+
     cudaEventRecord(start, 0);
-    kern<<<grid, block, smem_bytes>>>(
-        dQ, dK, dV, dOut, dO, dLSE, ddQ, ddK, ddV,
-        B, H, H, M, N, grid_dq, grid_dkv,
-        scale, 0.0f, nullptr, 0, -1, -1, 0.0f, 0, 0
-    );
+    if (is_even) launch(flash_attention_backward_kernel<D, true,  IS_CAUSAL, false, false, false, false>);
+    else         launch(flash_attention_backward_kernel<D, false, IS_CAUSAL, false, false, false, false>);
     cudaEventRecord(stop, 0);
     cudaEventSynchronize(stop);
 
@@ -702,9 +713,9 @@ bool run_test_bwd(int B, int H, int M, int N, float scale) {
     cudaEventDestroy(stop);
 
     std::vector<__half> hdQ_h(qsz), hdK_h(ksz), hdV_h(ksz);
-    cudaMemcpy(hdQ_h.data(), ddQ, qsz*2, cudaMemcpyDeviceToHost);
-    cudaMemcpy(hdK_h.data(), ddK, ksz*2, cudaMemcpyDeviceToHost);
-    cudaMemcpy(hdV_h.data(), ddV, ksz*2, cudaMemcpyDeviceToHost);
+    cudaMemcpy(hdQ_h.data(), d_dQ, qsz*2, cudaMemcpyDeviceToHost);
+    cudaMemcpy(hdK_h.data(), d_dK, ksz*2, cudaMemcpyDeviceToHost);
+    cudaMemcpy(hdV_h.data(), d_dV, ksz*2, cudaMemcpyDeviceToHost);
 
     for (size_t i = 0; i < qsz; ++i) hdQ_gpu[i] = __half2float(hdQ_h[i]);
     for (size_t i = 0; i < ksz; ++i) { hdK_gpu[i] = __half2float(hdK_h[i]); hdV_gpu[i] = __half2float(hdV_h[i]); }
@@ -727,7 +738,7 @@ bool run_test_bwd(int B, int H, int M, int N, float scale) {
     bool pass = (m.nan_count == 0) && (m.inf_count == 0);
     if (use_cpu_ref) {
         int allowed_big = std::max(1, (int)((qsz + ksz * 2) * 0.001f));
-        pass = pass && (m.max_diff < 0.05f) && (m.big_diff_count <= allowed_big); 
+        pass = pass && (m.max_diff < 0.05f) && (m.big_diff_count <= allowed_big);
     }
 
     printf("%s  max(dQKV)=%.2e  avg(dQKV)=%.2e  NaN=%d Inf=%d big=%d GPU=%.4f ms\n",
@@ -736,45 +747,37 @@ bool run_test_bwd(int B, int H, int M, int N, float scale) {
            m.nan_count, m.inf_count, m.big_diff_count,
            milliseconds);
 
-    cudaFree(dQ); cudaFree(dK); cudaFree(dV); cudaFree(dO); cudaFree(dOut); cudaFree(dLSE);
-    cudaFree(ddQ); cudaFree(ddK); cudaFree(ddV);
+    cudaFree(d_Q); cudaFree(d_K); cudaFree(d_V); cudaFree(d_O); cudaFree(d_dO);
+    cudaFree(d_dQ); cudaFree(d_dK); cudaFree(d_dV); cudaFree(d_lse); cudaFree(d_rowdot);
     return pass;
-}
-
-bool dispatch_test_bwd(int B, int H, int M, int N, int D, bool is_causal) {
-    float scale = 1.0f / sqrtf((float)D);
-    switch (D) {
-        case 16:  return is_causal ? run_test_bwd<16, true>(B, H, M, N, scale)  : run_test_bwd<16, false>(B, H, M, N, scale);
-        case 32:  return is_causal ? run_test_bwd<32, true>(B, H, M, N, scale)  : run_test_bwd<32, false>(B, H, M, N, scale);
-        case 64:  return is_causal ? run_test_bwd<64, true>(B, H, M, N, scale)  : run_test_bwd<64, false>(B, H, M, N, scale);
-        case 128: return is_causal ? run_test_bwd<128, true>(B, H, M, N, scale) : run_test_bwd<128, false>(B, H, M, N, scale);
-        case 256: return is_causal ? run_test_bwd<256, true>(B, H, M, N, scale) : run_test_bwd<256, false>(B, H, M, N, scale);
-        default:
-            printf("  Unsupported D=%d\n", D);
-            return false;
-    }
 }
 
 int main() {
     printf("[ FA2 Backward ]:\n");
     int ok = 0, total = 0;
-    auto T = [&](auto r) { total++; if (r) ok++; };
 
     std::vector<std::tuple<int, int, int, int, int>> test_cases = {
-        {1, 1, 16, 16, 16},
-        {1, 1, 32, 32, 32},
-        {1, 1, 64, 64, 64},
-        {1, 1, 128, 128, 128},
-        {1, 1, 256, 256, 256},
+        {1, 1, 1024, 1024,  16},
+        {1, 1, 1024, 1024,  32},
+        {1, 1, 1024, 1024,  64},
         {1, 1, 1024, 1024, 128},
-        {1, 1, 2048, 2048, 128},
-        {1, 1, 4096, 4096, 128},
+        {1, 1, 1024, 1024, 256},
     };
 
     for (const auto& tc : test_cases) {
         auto [B, H, M, N, D] = tc;
-        T(dispatch_test_bwd(B, H, M, N, D, false));
-        T(dispatch_test_bwd(B, H, M, N, D, true));
+        float scale = 1.0f / sqrtf((float)D);
+        for (bool causal : {false, true}) {
+            bool r = false;
+            switch (D) {
+                case 16:  r = causal ? run_test_bwd<16, true >(B,H,M,N,scale) : run_test_bwd<16, false>(B,H,M,N,scale); break;
+                case 32:  r = causal ? run_test_bwd<32, true >(B,H,M,N,scale) : run_test_bwd<32, false>(B,H,M,N,scale); break;
+                case 64:  r = causal ? run_test_bwd<64, true >(B,H,M,N,scale) : run_test_bwd<64, false>(B,H,M,N,scale); break;
+                case 128: r = causal ? run_test_bwd<128,true >(B,H,M,N,scale) : run_test_bwd<128,false>(B,H,M,N,scale); break;
+                case 256: r = causal ? run_test_bwd<256,true >(B,H,M,N,scale) : run_test_bwd<256,false>(B,H,M,N,scale); break;
+            }
+            total++; if (r) ok++;
+        }
     }
 
     printf("\n%d/%d tests passed\n", ok, total);

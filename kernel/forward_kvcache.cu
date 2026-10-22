@@ -166,15 +166,15 @@ flash_attention_kvcache_kernel(
     __half* __restrict__ sQ      = smem.phase.fdo.q;
     __half* __restrict__ sK      = smem.phase.fdo.reuse_kv.k;
     __half* __restrict__ sV      = smem.phase.fdo.reuse_kv.v;
-    float*  __restrict__ sS      = smem.phase.fdo.reuse_sp.s;
-    __half* __restrict__ sP      = smem.phase.fdo.reuse_sp.p;
-    float*  __restrict__ sRowMax = smem.row_max;
-    float*  __restrict__ sRowSum = smem.row_sum;
-    float*  __restrict__ sO      = smem.phase.fdo.o;
+    __half* __restrict__ sP      = smem.phase.fdo.p;
 
     WMMA_GEMM_INIT_SMEM<Config>(smem_raw);
+    WMMA_GEMM_INIT_REGS<Config, GemmType::Q_KT, GemmPhase::FWD> rS;
+    WMMA_GEMM_INIT_REGS<Config, GemmType::P_V,  GemmPhase::FWD> rO;
+    WMMA_GEMM_INIT_REGS<Config, GemmType::Q_KT, GemmPhase::FWD, true> rRowMax (NEG_INF);
+    WMMA_GEMM_INIT_REGS<Config, GemmType::Q_KT, GemmPhase::FWD, true> rRowSum (0.0f);
+    WMMA_GEMM_INIT_REGS<Config, GemmType::Q_KT, GemmPhase::FWD, true> rExpDiff(1.0f);
     __syncthreads();
-    WMMA_GEMM_INIT_SMEM<Config>(smem.row_max, NEG_INF);
 
     // ==================================================================================
     // Load:     Q tile from global to sQ shared memory (optional RoPE applied in-flight)
@@ -191,8 +191,8 @@ flash_attention_kvcache_kernel(
     // ==================================================================================
     // MAIN LOOP (iterates over K/V blocks for current Q block)
     // ==================================================================================
-    for (int block_q = block.block_min; block_q < block.block_max; ++block_q) {
-        const int start_kv      = block_q * BLOCK_N;
+    for (int block_kv = block.block_min; block_kv < block.block_max; ++block_kv) {
+        const int start_kv      = block_kv * BLOCK_N;
         const int valid_kv_rows = min(BLOCK_N, total_seqlen_k - start_kv);
         if (valid_kv_rows <= 0) break;
 
@@ -237,7 +237,7 @@ flash_attention_kvcache_kernel(
         // Template: GemmType::Q_KT, GemmPhase::FWD
         // ======================================================================================
         WMMA_GEMM_SCORES<Config, GemmType::Q_KT, GemmPhase::FWD, IS_CAUSAL, IS_ALIBI, IS_SOFTCAP, IS_WINDOW>(
-          sQ, sK, sS,
+          sQ, sK, rS.frags,
           block.valid_q_rows,  valid_kv_rows,
           block.start_q,       start_kv,
           block.seqlen_offset,
@@ -245,15 +245,16 @@ flash_attention_kvcache_kernel(
         __syncthreads();
 
         // ======================================================================================
-        // Compute:  Online softmax + O-rescaling
+        // Compute:  Online softmax + O-rescaling (KV-cache inference never uses dropout)
         // Layout:   S[BLOCK_M, BLOCK_N] -> P[BLOCK_M, BLOCK_N], O[BLOCK_M, D] scaled
-        // Template: Config, IS_DROPOUT (KV-cache inference never uses dropout)
+        // Template: GemmPhase::FWD, IS_EVEN, IS_DROPOUT=false
         // ======================================================================================
-        WMMA_GEMM_SOFTMAX<Config, false>(
-          sS, sP, sO,
-          sRowMax, sRowSum, nullptr,
-          block.valid_q_rows, valid_kv_rows, tid, block_q,
-          0, 0, 0, 0, 0, 0, 0);
+        WMMA_GEMM_SOFTMAX<Config, GemmPhase::FWD, IS_EVEN, false>(
+          rS.frags, rO.frags, rRowMax.frags, rRowSum.frags, rExpDiff.frags,
+          sP, nullptr,
+          block.valid_q_rows, valid_kv_rows,
+          cache_seqlen + block.start_q, start_kv, max_seqlen_k,
+          0.0f, 0, 0, max_seqlen_k, block_kv, warp_id, lane_id);
         __syncthreads();
 
         // ======================================================================================
@@ -267,34 +268,26 @@ flash_attention_kvcache_kernel(
           stride_k_s, valid_kv_rows, tid);
         __syncthreads();
 
-        // ==============================================================================
+        // ==================================================================================
         // Compute:  O += P @ V
         // Layout:   P[row: BLOCK_M, BLOCK_N], V[row: BLOCK_N, D] -> sO[row: BLOCK_M, D]
         // Template: GemmType::P_V, GemmPhase::FWD
-        // ==============================================================================
+        // ==================================================================================
         WMMA_GEMM_GRADIENTS<Config, GemmType::P_V, GemmPhase::FWD>(
-          sP, sV, sO,
-          block.valid_q_rows, valid_kv_rows,
-          warp_id, lane_id);
+          sP, sV, rO.frags,
+          block.valid_q_rows, valid_kv_rows, warp_id, lane_id);
         __syncthreads();
     }   // END MAIN LOOP
     // ======================================================================================
-    // Compute:  Store normalized attention output O = softmax(S) @ V
+    // Compute:  Store normalized attention output O = softmax(S) @ V + fused LSE
     // Layout:   sO[row: BLOCK_M, D_STRIDE] -> out_ptr[row: BLOCK_M, D] with stride_o_s
-    // Template: Result::WRITE_O (NORMALIZE=true, DUAL_STORE=false)
+    // Template: Result::WRITE_O (NORMALIZE=true, DUAL_STORE=false, WRITE_LSE=true)
     // ======================================================================================
     WMMA_GEMM_EPILOGUE<Config, Result::WRITE_O>(
-      sO,      out_ptr,
-      nullptr, nullptr,
-      sRowSum, stride_o_s, block.valid_q_rows, tid);
-
-    if (tid < block.valid_q_rows) {
-        const float sum = fmaxf(sRowSum[tid], 1e-24f);
-        const size_t lse_idx = static_cast<size_t>(batch_idx) * H_Q * T_Q +
-                               static_cast<size_t>(head_idx) * T_Q +
-                               static_cast<size_t>(block.start_q + tid);
-        softmax_lse[lse_idx] = (sRowSum[tid] <= 1e-24f) ? NEG_INF : (sRowMax[tid] + logf(sum));
-    }
+      rO.frags,    out_ptr,
+      nullptr,     nullptr,
+      lse_ptr,     rRowSum.frags, rRowMax.frags,
+      stride_o_s, block.valid_q_rows, warp_id, lane_id);
 }
 
 // ======================================================================================
@@ -380,6 +373,7 @@ void launcher_flash_attention_kvcache(
     const int stride_o_s = Out.stride(1);
     const int stride_o_h = Out.stride(2);
 
+    bool is_even    = false;
     bool is_alibi   = (alibi_slopes != nullptr);
     bool is_softcap = (softcap > 0.0f);
     bool is_window  = (window_left >= 0 || window_right >= 0);
@@ -471,7 +465,9 @@ std::vector<at::Tensor> flash_attention_kvcache(
 
     // softcap restrictions
     if (softcap > 0.f) {
-        TORCH_CHECK(window_left < 0 && window_right < 0, "Softcap + window not supported");
+        TORCH_CHECK(window_left < 0, "Softcap + window_left not supported");
+        if (!is_causal)
+            TORCH_CHECK(window_right < 0, "Softcap + window_right not supported");
         TORCH_CHECK(!alibi_slopes.has_value(), "Softcap + ALiBi not supported");
     }
 

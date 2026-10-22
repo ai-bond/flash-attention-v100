@@ -10,28 +10,28 @@
 #define BLOCK_N_DQ_32   128
 
 #define BLOCK_M_DQ_64   64
-#define BLOCK_N_DQ_64   80
+#define BLOCK_N_DQ_64   256
 
-#define BLOCK_M_DQ_128  32
-#define BLOCK_N_DQ_128  112
+#define BLOCK_M_DQ_128  64
+#define BLOCK_N_DQ_128  160
 
 #define BLOCK_M_DQ_256  32
-#define BLOCK_N_DQ_256  32
+#define BLOCK_N_DQ_256  112
 
 #define BLOCK_M_DKV_16  32
-#define BLOCK_N_DKV_16  224
+#define BLOCK_N_DKV_16  256
 
 #define BLOCK_M_DKV_32  32
-#define BLOCK_N_DKV_32  192
+#define BLOCK_N_DKV_32  224
 
-#define BLOCK_M_DKV_64  32
-#define BLOCK_N_DKV_64  128
+#define BLOCK_M_DKV_64  64
+#define BLOCK_N_DKV_64  192
 
-#define BLOCK_M_DKV_128 16
-#define BLOCK_N_DKV_128 128
+#define BLOCK_M_DKV_128 32
+#define BLOCK_N_DKV_128 192
 
-#define BLOCK_M_DKV_256 16
-#define BLOCK_N_DKV_256 64
+#define BLOCK_M_DKV_256 32
+#define BLOCK_N_DKV_256 96
 
 #define WARPS 16
 
@@ -64,35 +64,20 @@ struct KernelConfig {
                 } reuse_kv;
                     alignas(16) __half dO [ DQ::BLOCK_M * D ];
                     alignas(16) __half q  [ DQ::BLOCK_M * D ];
-                    alignas(16) float  s  [ DQ::BLOCK_M * DQ::BLOCK_N ];
-                union {
-                    alignas(16) float  dOV[ DQ::BLOCK_M * DQ::BLOCK_N ];
-                    alignas(16) __half dS [ DQ::BLOCK_M * DQ::BLOCK_N * 2];
-                } reuse_sdOVS;
-                    alignas(16) float  dQ [ DQ::BLOCK_M * D ];
+                    alignas(16) __half dS [ DQ::BLOCK_M * DQ::BLOCK_N];
             } bdq;
 
             struct DKV_Phase {
-                    alignas(16) __half k [ DKV::BLOCK_M * D ];
-                    alignas(16) __half v [ DKV::BLOCK_M * D ];
+                    alignas(16) __half k  [ DKV::BLOCK_M * D ];
+                    alignas(16) __half v  [ DKV::BLOCK_M * D ];
                 union {
-                    alignas(16) __half dO[ DKV::BLOCK_N * D ];
-                    alignas(16) __half q [ DKV::BLOCK_N * D ];
+                    alignas(16) __half dO [ DKV::BLOCK_N * D ];
+                    alignas(16) __half q  [ DKV::BLOCK_N * D ];
                 } reuse_qdO;
-                union {
-                    alignas(16) float  s [ DKV::BLOCK_N * DKV::BLOCK_M ];
-                    alignas(16) __half p [ DKV::BLOCK_N * DKV::BLOCK_M * 2];
-                } reuse_sp;
-                union {
-                    alignas(16) float  dOV[ DKV::BLOCK_N * DKV::BLOCK_M ];
-                    alignas(16) __half dS [ DKV::BLOCK_N * DKV::BLOCK_M * 2];
-                } reuse_dOVS;
-                    alignas(16) float dK[ DKV::BLOCK_M * D ];
-                    alignas(16) float dV[ DKV::BLOCK_M * D ];
+                    alignas(16) __half p  [ DKV::BLOCK_N * DKV::BLOCK_M];
+                    alignas(16) __half dS [ DKV::BLOCK_N * DKV::BLOCK_M];
             } bdkv;
         } phase;
-                    alignas(16) float lse     [ (DQ::BLOCK_M > DKV::BLOCK_N) ? DQ::BLOCK_M : DKV::BLOCK_N ];
-                    alignas(16) float row_dot [ (DQ::BLOCK_M > DKV::BLOCK_N) ? DQ::BLOCK_M : DKV::BLOCK_N ];
     };
 
     static constexpr int TOTAL_SMEM = static_cast<int>(((sizeof(SmemLayout) + 127) & ~size_t(127)));
