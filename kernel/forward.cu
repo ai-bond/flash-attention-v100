@@ -131,10 +131,7 @@ flash_attention_forward_kernel(
     // Layout:   Q: global[row: BLOCK_M, D] with H_Q*D -> shared[row: BLOCK_M, D]
     // Template: GemmPhase::FWD, Stage::SNGL
     // ==================================================================================
-    WMMA_GEMM_LOAD_TILE<Config, GemmPhase::FWD, Stage::SNGL>(
-      q_ptr,   sQ,
-      nullptr, nullptr,
-      H_Q * D, block.valid_q_rows, tid);
+    WMMA_GEMM_LOAD_TILE<Config, GemmPhase::FWD, Stage::SNGL>(q_ptr, sQ, H_Q * D, block.valid_q_rows, tid);
 
     // ==================================================================================
     // MAIN LOOP (iterates over K/V blocks for current Q block)
@@ -148,10 +145,7 @@ flash_attention_forward_kernel(
         // Layout:   K: global[row: BLOCK_N, D] with H_K*D -> shared[row: BLOCK_N, D]
         // Template: GemmPhase::FWD, Stage::SNGL
         // ==================================================================================
-        WMMA_GEMM_LOAD_TILE<Config, GemmPhase::FWD, Stage::SNGL>(
-          k_ptr + start_kv * (H_K * D), sK,
-          nullptr, nullptr,
-          H_K * D, valid_kv_rows, tid);
+        WMMA_GEMM_LOAD_TILE<Config, GemmPhase::FWD, Stage::SNGL>(k_ptr + start_kv * (H_K * D), sK, H_K * D, valid_kv_rows, tid);
         __syncthreads();
 
         // ==================================================================================
@@ -184,10 +178,7 @@ flash_attention_forward_kernel(
         // Layout:   V: global[row: BLOCK_N, D] with H_K*D -> shared[row: BLOCK_N, D]
         // Template: GemmPhase::FWD, Stage::SNGL
         // ==================================================================================
-        WMMA_GEMM_LOAD_TILE<Config, GemmPhase::FWD, Stage::SNGL>(
-          v_ptr + start_kv * (H_K * D), sV,
-          nullptr, nullptr,
-          H_K * D, valid_kv_rows, tid);
+        WMMA_GEMM_LOAD_TILE<Config, GemmPhase::FWD, Stage::SNGL>(v_ptr + start_kv * (H_K * D), sV, H_K * D, valid_kv_rows, tid);
         __syncthreads();
 
         // ==================================================================================

@@ -225,10 +225,7 @@ flash_attention_kvcache_kernel(
         // Layout:   K: global[row: BLOCK_N, D] with stride_k_s -> shared[row: BLOCK_N, D]
         // Template: GemmPhase::FWD, Stage::SNGL
         // ======================================================================================
-        WMMA_GEMM_LOAD_TILE<Config, GemmPhase::FWD, Stage::SNGL>(
-          k_ptr_page, sK,
-          nullptr,    nullptr,
-          stride_k_s, valid_kv_rows, tid);
+        WMMA_GEMM_LOAD_TILE<Config, GemmPhase::FWD, Stage::SNGL>(k_ptr_page, sK, stride_k_s, valid_kv_rows, tid);
         __syncthreads();
 
         // ======================================================================================
@@ -262,10 +259,7 @@ flash_attention_kvcache_kernel(
         // Layout:   V: global[row: BLOCK_N, D] with stride_k_s -> shared[row: BLOCK_N, D]
         // Template: GemmPhase::FWD, Stage::SNGL
         // ======================================================================================
-        WMMA_GEMM_LOAD_TILE<Config, GemmPhase::FWD, Stage::SNGL>(
-          v_ptr_page, sV,
-          nullptr,    nullptr,
-          stride_k_s, valid_kv_rows, tid);
+        WMMA_GEMM_LOAD_TILE<Config, GemmPhase::FWD, Stage::SNGL>(v_ptr_page, sV, stride_k_s, valid_kv_rows, tid);
         __syncthreads();
 
         // ==================================================================================

@@ -31,7 +31,7 @@ flash_attention_backward_varlen_kernel(
     const __half* __restrict__ V,
     const __half* __restrict__ dO,
     const float*  __restrict__ softmax_lse,
-    const  float* __restrict__ row_dot,    
+    const  float* __restrict__ row_dot,
     __half* __restrict__ dQ,
     __half* __restrict__ dK,
     __half* __restrict__ dV,
@@ -146,27 +146,16 @@ flash_attention_backward_varlen_kernel(
 
         auto& smem = *reinterpret_cast<typename Config::SmemLayout*>(smem_raw);
 
-        __half* __restrict__ sQ      = smem.phase.bdq.q;
+        __half* __restrict__ sQ      = smem.phase.bdq.reuse_qdO.q;
+        __half* __restrict__ sdO     = smem.phase.bdq.reuse_qdO.dO;
         __half* __restrict__ sK      = smem.phase.bdq.reuse_kv.k;
         __half* __restrict__ sV      = smem.phase.bdq.reuse_kv.v;
-        __half* __restrict__ sdO     = smem.phase.bdq.dO;
         __half* __restrict__ sdS     = smem.phase.bdq.dS;
 
         WMMA_GEMM_INIT_SMEM<Config>(smem_raw);
         WMMA_GEMM_INIT_REGS<Config, GemmType::Q_KT,  GemmPhase::BWQ> rS;
         WMMA_GEMM_INIT_REGS<Config, GemmType::dO_VT, GemmPhase::BWQ> rdOV;
         WMMA_GEMM_INIT_REGS<Config, GemmType::dS_K,  GemmPhase::BWQ> rdQ;
-        __syncthreads();
-
-        // ======================================================================================
-        // Load:     Q(dO)  tile from global to sQ(sdO) shared memory
-        // Layout:   Q[dO]: global[row: BLOCK_M, D] with H_Q*D -> shared[row: BLOCK_M, D]
-        // Template: GemmPhase::BWQ, Stage::DUAL
-        // ======================================================================================
-        WMMA_GEMM_LOAD_TILE<Config, GemmPhase::BWQ, Stage::DUAL>(
-          q_ptr,   sQ,
-          dO_ptr,  sdO,
-          H_Q * D, block.valid_q_rows, tid);
         __syncthreads();
 
         // ======================================================================================
@@ -177,15 +166,19 @@ flash_attention_backward_varlen_kernel(
             const int valid_kv_rows = min(BLOCK_N, block.seqlen_k - start_kv);
             if (valid_kv_rows <= 0) break;
 
-            // ======================================================================================
-            // Load:     V tile from global to sV(reuse) shared memory
+            // ==================================================================================
+            // Load:     V  tile from global to sV(reuse) shared memory
             // Layout:   V: global[row: BLOCK_N, D] with H_K*D -> shared[row: BLOCK_N, D]
             // Template: GemmPhase::BWQ, Stage::SNGL
-            // ======================================================================================
-            WMMA_GEMM_LOAD_TILE<Config, GemmPhase::BWQ, Stage::SNGL>(
-              v_ptr + start_kv * (H_K * D), sV,
-              nullptr, nullptr,
-              H_K * D, valid_kv_rows, tid);
+            // ==================================================================================
+            WMMA_GEMM_LOAD_TILE<Config, GemmPhase::BWQ, Stage::SNGL>(v_ptr + start_kv * (H_K * D), sV, H_K * D, valid_kv_rows, tid);
+
+            // ==================================================================================
+            // Load:     dO  tile from global to sdO(reuse) shared memory
+            // Layout:   dO: global[row: BLOCK_M, D] with H_Q*D -> shared[row: BLOCK_M, D]
+            // Template: GemmPhase::BWQ, Stage::SNGL
+            // ==================================================================================
+            WMMA_GEMM_LOAD_TILE<Config, GemmPhase::BWQ, Stage::SNGL>(dO_ptr, sdO, H_Q * D, block.valid_q_rows, tid);
             __syncthreads();
 
             // ======================================================================================
@@ -200,15 +193,19 @@ flash_attention_backward_varlen_kernel(
               warp_id, lane_id);
             __syncthreads();
 
-            // ======================================================================================
-            // Load:     K tile from global to sK(reuse) shared memory
+            // ==================================================================================
+            // Load:     K  tile from global to sK(reuse) shared memory
             // Layout:   K: global[row: BLOCK_N, D] with H_K*D -> shared[row: BLOCK_N, D]
             // Template: GemmPhase::BWQ, Stage::SNGL
-            // ======================================================================================
-            WMMA_GEMM_LOAD_TILE<Config, GemmPhase::BWQ, Stage::SNGL>(
-              k_ptr + start_kv * (H_K * D), sK,
-              nullptr, nullptr,
-              H_K * D, valid_kv_rows, tid);
+            // ==================================================================================
+            WMMA_GEMM_LOAD_TILE<Config, GemmPhase::BWQ, Stage::SNGL>(k_ptr + start_kv * (H_K * D), sK, H_K * D, valid_kv_rows, tid);
+
+            // ==================================================================================
+            // Load:     Q  tile from global to sQ(reuse) shared memory
+            // Layout:   Q: global[row: BLOCK_M, D] with H_Q*D -> shared[row: BLOCK_M, D]
+            // Template: GemmPhase::BWQ, Stage::SNGL
+            // ==================================================================================
+            WMMA_GEMM_LOAD_TILE<Config, GemmPhase::BWQ, Stage::SNGL>(q_ptr, sQ, H_Q * D, block.valid_q_rows, tid);
             __syncthreads();
 
             // ======================================================================================
@@ -338,7 +335,7 @@ flash_attention_backward_varlen_kernel(
         const __half* __restrict__ q_ptr   = Q  + static_cast<size_t>(block.q_base) * H_Q * D + static_cast<size_t>(block.head_idx) * D;
         const __half* __restrict__ dO_ptr  = dO + static_cast<size_t>(block.q_base) * H_Q * D + static_cast<size_t>(block.head_idx) * D;
         const  float* __restrict__ lse_ptr = softmax_lse + static_cast<size_t>(block.head_idx) * T_Q + block.q_base;
-        const  float* __restrict__ rdot_ptr= row_dot     + static_cast<size_t>(block.head_idx) * T_Q + block.q_base;        
+        const  float* __restrict__ rdot_ptr= row_dot     + static_cast<size_t>(block.head_idx) * T_Q + block.q_base;
               __half* __restrict__ dK_ptr  = dK + static_cast<size_t>(block.k_base + block.start_kv) * H_Q * D + static_cast<size_t>(block.head_idx) * D;
               __half* __restrict__ dV_ptr  = dV + static_cast<size_t>(block.k_base + block.start_kv) * H_Q * D + static_cast<size_t>(block.head_idx) * D;
 
@@ -351,27 +348,16 @@ flash_attention_backward_varlen_kernel(
 
         __half* __restrict__ sQ      = smem.phase.bdkv.reuse_qdO.q;
         __half* __restrict__ sdO     = smem.phase.bdkv.reuse_qdO.dO;
-        __half* __restrict__ sK      = smem.phase.bdkv.k;
-        __half* __restrict__ sV      = smem.phase.bdkv.v;
-        __half* __restrict__ sdS     = smem.phase.bdkv.dS;
+        __half* __restrict__ sK      = smem.phase.bdkv.reuse_kv.k;
+        __half* __restrict__ sV      = smem.phase.bdkv.reuse_kv.v;
         __half* __restrict__ sP      = smem.phase.bdkv.p;
+        __half* __restrict__ sdS     = smem.phase.bdkv.dS;
 
         WMMA_GEMM_INIT_SMEM<Config>(smem_raw);
         WMMA_GEMM_INIT_REGS<Config, GemmType::Q_KT,  GemmPhase::BWKV> rS;
         WMMA_GEMM_INIT_REGS<Config, GemmType::dO_VT, GemmPhase::BWKV> rdOV;
         WMMA_GEMM_INIT_REGS<Config, GemmType::PT_dO, GemmPhase::BWKV> rdV;
         WMMA_GEMM_INIT_REGS<Config, GemmType::dST_Q, GemmPhase::BWKV> rdK;
-        __syncthreads();
-
-        // ======================================================================================
-        // Load:     K & V tiles from global to sK/sV shared memory
-        // Layout:   K[V]: global[row: BLOCK_M, D] with H_K*D -> shared[row: BLOCK_M, D]
-        // Template: GemmPhase::BWKV, Stage::DUAL
-        // ======================================================================================
-        WMMA_GEMM_LOAD_TILE<Config, GemmPhase::BWKV, Stage::DUAL>(
-          k_ptr + block.start_kv * (H_K * D), sK,
-          v_ptr + block.start_kv * (H_K * D), sV,
-          H_K * D, block.valid_kv_rows, tid);
         __syncthreads();
 
         // ==================================================================================
@@ -382,15 +368,19 @@ flash_attention_backward_varlen_kernel(
             const int valid_q_rows = min(BLOCK_N, block.seqlen_q - start_q);
             if (valid_q_rows <= 0) break;
 
-            // ======================================================================================
-            // Load:     Q tile from global to sQ(reuse) shared memory
+            // ==================================================================================
+            // Load:     Q  tile from global to sQ(reuse) shared memory
             // Layout:   Q: global[row: BLOCK_N, D] with H_Q*D -> shared[row: BLOCK_N, D]
             // Template: GemmPhase::BWKV, Stage::SNGL
-            // ======================================================================================
-            WMMA_GEMM_LOAD_TILE<Config, GemmPhase::BWKV, Stage::SNGL>(
-              q_ptr + start_q * (H_Q * D), sQ,
-              nullptr, nullptr,
-              H_Q * D, valid_q_rows, tid);
+            // ==================================================================================
+            WMMA_GEMM_LOAD_TILE<Config, GemmPhase::BWKV, Stage::SNGL>(q_ptr + start_q * H_Q * D, sQ, H_Q * D, valid_q_rows, tid);
+
+            // ==================================================================================
+            // Load:     K  tile from global to sK(reuse) shared memory
+            // Layout:   K: global[row: BLOCK_M, D] with H_K*D -> shared[row: BLOCK_M, D]
+            // Template: GemmPhase::BWKV, Stage::SNGL
+            // ==================================================================================
+            WMMA_GEMM_LOAD_TILE<Config, GemmPhase::BWKV, Stage::SNGL>(k_ptr + block.start_kv * (H_K * D), sK, H_K * D, block.valid_kv_rows, tid);
             __syncthreads();
 
             // ======================================================================================
@@ -406,15 +396,19 @@ flash_attention_backward_varlen_kernel(
               softmax_scale, softcap, alibi_slope, window_left, window_right, warp_id, lane_id);
             __syncthreads();
 
-            // ======================================================================================
+            // ==================================================================================
             // Load:     dO tile from global to sdO(reuse) shared memory
             // Layout:   dO: global[row: BLOCK_N, D] with H_Q*D -> shared[row: BLOCK_N, D]
             // Template: GemmPhase::BWKV, Stage::SNGL
-            // ======================================================================================
-            WMMA_GEMM_LOAD_TILE<Config, GemmPhase::BWKV, Stage::SNGL>(
-              dO_ptr + start_q * (H_Q * D), sdO,
-              nullptr, nullptr,
-              H_Q * D, valid_q_rows, tid);
+            // ==================================================================================
+            WMMA_GEMM_LOAD_TILE<Config, GemmPhase::BWKV, Stage::SNGL>(dO_ptr + start_q * H_Q * D, sdO, H_Q * D, valid_q_rows, tid);
+
+            // ==================================================================================
+            // Load:     V  tile from global to sV(reuse) shared memory
+            // Layout:   V: global[row: BLOCK_M, D] with H_K*D -> shared[row: BLOCK_M, D]
+            // Template: GemmPhase::BWKV, Stage::SNGL
+            // ==================================================================================
+            WMMA_GEMM_LOAD_TILE<Config, GemmPhase::BWKV, Stage::SNGL>(v_ptr + block.start_kv * (H_K * D), sV, H_K * D, block.valid_kv_rows, tid);
             __syncthreads();
 
             // ======================================================================================
@@ -458,10 +452,7 @@ flash_attention_backward_varlen_kernel(
             // Layout:   Q: global[row: BLOCK_N, D] with H_Q*D -> shared[row: BLOCK_N, D]
             // Template: GemmPhase::BWKV, Stage::SNGL
             // ==================================================================================
-            WMMA_GEMM_LOAD_TILE<Config, GemmPhase::BWKV, Stage::SNGL>(
-              q_ptr + start_q * (H_Q * D), sQ,
-              nullptr, nullptr,
-              H_Q * D, valid_q_rows, tid);
+            WMMA_GEMM_LOAD_TILE<Config, GemmPhase::BWKV, Stage::SNGL>(q_ptr + start_q * H_Q * D, sQ, H_Q * D, valid_q_rows, tid);
             __syncthreads();
 
             // ======================================================================================
@@ -557,7 +548,7 @@ void launcher_flash_attention_backward_varlen(
     const int grid_dkv = (max_seqlen_k + Config::DKV::BLOCK_M - 1) / Config::DKV::BLOCK_M;
 
     const dim3 grid_q   (grid_dq,  1, B * H_Q);
-    const dim3 grid_kv  (grid_dkv, 1, B * H_K);
+    const dim3 grid_kv  (grid_dkv, 1, B * H_Q);
     const dim3 block    (Config::THREADS_PER_BLOCK);
 
     bool is_even_dq     = false;
@@ -614,7 +605,7 @@ void launcher_flash_attention_backward_varlen(
         constexpr bool IS_WINDOW  = decltype(WINDOW)::value;
         constexpr bool IS_DROPOUT = decltype(DROPOUT)::value;
 
-        auto kernel = flash_attention_backward_varlen_kernel<D, /*PHASE=*/0, IS_EVEN, IS_CAUSAL, IS_ALIBI, IS_SOFTCAP, IS_WINDOW, IS_DROPOUT>;
+        auto kernel = flash_attention_backward_varlen_kernel<D, /*PHASE=*/1, IS_EVEN, IS_CAUSAL, IS_ALIBI, IS_SOFTCAP, IS_WINDOW, IS_DROPOUT>;
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
 
         kernel<<<grid_kv, block, smem, stream>>>(

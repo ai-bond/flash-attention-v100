@@ -154,10 +154,7 @@ flash_attention_forward_varlen_kernel(
     // Layout:   Q: global[row: BLOCK_M, D] with H_Q*D -> shared[row: BLOCK_M, D]
     // Template: GemmPhase::FWD, Stage::SNGL
     // ======================================================================================
-    WMMA_GEMM_LOAD_TILE<Config, GemmPhase::FWD, Stage::SNGL>(
-      q_ptr,   sQ,
-      nullptr, nullptr,
-      H_Q * D, block.valid_q_rows, tid);
+    WMMA_GEMM_LOAD_TILE<Config, GemmPhase::FWD, Stage::SNGL>(q_ptr, sQ, H_Q * D, block.valid_q_rows, tid);
     __syncthreads();
 
     // ======================================================================================
@@ -196,10 +193,7 @@ flash_attention_forward_varlen_kernel(
         // Layout:   K: global[row: BLOCK_N, D] with H_K*D -> shared[row: BLOCK_N, D]
         // Template: GemmPhase::FWD, Stage::SNGL
         // ======================================================================================
-        WMMA_GEMM_LOAD_TILE<Config, GemmPhase::FWD, Stage::SNGL>(
-          k_ptr_page, sK,
-          nullptr,    nullptr,
-          H_K * D, valid_kv_rows, tid);
+        WMMA_GEMM_LOAD_TILE<Config, GemmPhase::FWD, Stage::SNGL>(k_ptr_page, sK, H_K * D, valid_kv_rows, tid);
         __syncthreads();
 
         // ==================================================================================
@@ -233,10 +227,7 @@ flash_attention_forward_varlen_kernel(
         // Layout:   V: global[row: BLOCK_N, D] with H_K*D -> shared[row: BLOCK_N, D]
         // Template: GemmPhase::FWD, Stage::SNGL
         // ======================================================================================
-        WMMA_GEMM_LOAD_TILE<Config, GemmPhase::FWD, Stage::SNGL>(
-          v_ptr_page, sV,
-          nullptr,    nullptr,
-          H_K * D, valid_kv_rows, tid);
+        WMMA_GEMM_LOAD_TILE<Config, GemmPhase::FWD, Stage::SNGL>(v_ptr_page, sV, H_K * D, valid_kv_rows, tid);
         __syncthreads();
 
         // ==================================================================================
@@ -247,7 +238,7 @@ flash_attention_forward_varlen_kernel(
         WMMA_GEMM_GRADIENTS<Config, GemmType::P_V, GemmPhase::FWD>(
           sP, sV, rO.frags,
           block.valid_q_rows, valid_kv_rows, warp_id, lane_id);
-        __syncthreads();        
+        __syncthreads();
     }   // END MAIN LOOP
     // ==================================================================================
     // Compute:  Store normalized attention output O = softmax(S) @ V

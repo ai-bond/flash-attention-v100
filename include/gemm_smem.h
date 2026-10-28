@@ -119,15 +119,11 @@ struct WMMA_GEMM_INIT_REGS {
 
 // ======================================================================================
 // TILE LOADER: Global-shared load for unified dense/varlen/kvcache layouts
-//   DUAL_LOAD:     Loads two independent buffers (GMEM0->SMEM0, GMEM1->SMEM1)
-//   GLOBAL_STRIDE: Runtime source row pitch
 // ======================================================================================
 template<typename Config, GemmPhase Phase, Stage Option>
 __device__ __forceinline__ void WMMA_GEMM_LOAD_TILE(
-    const __half* __restrict__ GMEM0,
-          __half* __restrict__ SMEM0,
-    const __half* __restrict__ GMEM1,
-          __half* __restrict__ SMEM1,
+    const __half* __restrict__ GMEM,
+          __half* __restrict__ SMEM,
     int GLOBAL_STRIDE,
     int VALID_ROWS,
     int THREAD_ID
@@ -141,15 +137,8 @@ __device__ __forceinline__ void WMMA_GEMM_LOAD_TILE(
 
     if (total_iters == 0) return;
 
-    uint64_t src_base0 = static_cast<uint64_t>(__cvta_generic_to_global(GMEM0));
-    uint32_t dst_base0 = static_cast<uint32_t>(__cvta_generic_to_shared(SMEM0));
-
-    uint64_t src_base1 = 0;
-    uint32_t dst_base1 = 0;
-    if constexpr (LTraits::DUAL_LOAD) {
-        src_base1 = static_cast<uint64_t>(__cvta_generic_to_global(GMEM1));
-        dst_base1 = static_cast<uint32_t>(__cvta_generic_to_shared(SMEM1));
-    }
+    uint64_t src_base = static_cast<uint64_t>(__cvta_generic_to_global(GMEM));
+    uint32_t dst_base = static_cast<uint32_t>(__cvta_generic_to_shared(SMEM));
 
     #pragma unroll 2
     for (int idx = THREAD_ID; idx < total_iters; idx += THREADS_PER_BLOCK) {
@@ -158,56 +147,28 @@ __device__ __forceinline__ void WMMA_GEMM_LOAD_TILE(
 
         const int src_offset = row * src_stride_uint4 + col;
         const int dst_offset = row * dst_stride_uint4 + col;
+        const int pred       = (col < src_stride_uint4) ? 1 : 0;
 
-        const int pred = (col < src_stride_uint4) ? 1 : 0;
-
-        uint64_t src_addr0 = src_base0 + (static_cast<uint64_t>(src_offset) << 4);
-        uint32_t dst_addr0 = swizzle(dst_base0 + (static_cast<uint32_t>(dst_offset) << 4), row);
+        uint64_t src_addr = src_base + (static_cast<uint64_t>(src_offset) << 4);
+        uint32_t dst_addr = swizzle(dst_base + (static_cast<uint32_t>(dst_offset) << 4), row);
 
         uint32_t r0, r1, r2, r3;
-        if constexpr (LTraits::DUAL_LOAD) {
-            uint64_t src_addr1 = src_base1 + (static_cast<uint64_t>(src_offset) << 4);
-            uint32_t dst_addr1 = swizzle(dst_base1 + (static_cast<uint32_t>(dst_offset) << 4), row);
 
-            asm volatile(
-                "{\n\t"
-                ".reg .pred p;\n\t"
-                "setp.ne.b32 p, %8, 0;\n\t"
-                "mov.u32 %0, 0;\n\t"
-                "mov.u32 %1, 0;\n\t"
-                "mov.u32 %2, 0;\n\t"
-                "mov.u32 %3, 0;\n\t"
-                "@p ld.global.v4.u32 {%0, %1, %2, %3}, [%4];\n\t"
-                "st.shared.v4.u32 [%6], {%0, %1, %2, %3};\n\t"
-                "mov.u32 %0, 0;\n\t"
-                "mov.u32 %1, 0;\n\t"
-                "mov.u32 %2, 0;\n\t"
-                "mov.u32 %3, 0;\n\t"
-                "@p ld.global.v4.u32 {%0, %1, %2, %3}, [%5];\n\t"
-                "st.shared.v4.u32 [%7], {%0, %1, %2, %3};\n\t"
-                "}\n\t"
-                : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
-                : "l"(src_addr0), "l"(src_addr1),
-                  "r"(dst_addr0), "r"(dst_addr1), "r"(pred)
-                : "memory"
-            );
-        } else {
-            asm volatile(
-                "{\n\t"
-                ".reg .pred p;\n\t"
-                "setp.ne.b32 p, %6, 0;\n\t"
-                "mov.u32 %0, 0;\n\t"
-                "mov.u32 %1, 0;\n\t"
-                "mov.u32 %2, 0;\n\t"
-                "mov.u32 %3, 0;\n\t"
-                "@p ld.global.v4.u32 {%0, %1, %2, %3}, [%4];\n\t"
-                "st.shared.v4.u32 [%5], {%0, %1, %2, %3};\n\t"
-                "}\n\t"
-                : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
-                : "l"(src_addr0), "r"(dst_addr0), "r"(pred)
-                : "memory"
-            );
-        }
+        asm volatile(
+            "{\n\t"
+            ".reg .pred p;\n\t"
+            "setp.ne.b32 p, %6, 0;\n\t"
+            "mov.u32 %0, 0;\n\t"
+            "mov.u32 %1, 0;\n\t"
+            "mov.u32 %2, 0;\n\t"
+            "mov.u32 %3, 0;\n\t"
+            "@p ld.global.v4.u32 {%0, %1, %2, %3}, [%4];\n\t"
+            "st.shared.v4.u32 [%5], {%0, %1, %2, %3};\n\t"
+            "}\n\t"
+            : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
+            :  "l"(src_addr), "r"(dst_addr), "r"(pred)
+            : "memory"
+        );
     }
 }
 

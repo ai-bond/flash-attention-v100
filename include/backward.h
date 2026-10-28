@@ -4,34 +4,36 @@
 #pragma once
 
 #define BLOCK_M_DQ_16   16
-#define BLOCK_N_DQ_16   256
+#define BLOCK_N_DQ_16   512
 
 #define BLOCK_M_DQ_32   32
-#define BLOCK_N_DQ_32   128
+#define BLOCK_N_DQ_32   256
 
-#define BLOCK_M_DQ_64   64
-#define BLOCK_N_DQ_64   256
+#define BLOCK_M_DQ_64   32
+#define BLOCK_N_DQ_64   128
 
-#define BLOCK_M_DQ_128  64
-#define BLOCK_N_DQ_128  160
+#define BLOCK_M_DQ_128  32
+#define BLOCK_N_DQ_128  256
 
 #define BLOCK_M_DQ_256  32
-#define BLOCK_N_DQ_256  112
+#define BLOCK_N_DQ_256  128
+
+////////////////////////////////
 
 #define BLOCK_M_DKV_16  32
 #define BLOCK_N_DKV_16  256
 
 #define BLOCK_M_DKV_32  32
-#define BLOCK_N_DKV_32  224
+#define BLOCK_N_DKV_32  128
 
-#define BLOCK_M_DKV_64  64
-#define BLOCK_N_DKV_64  192
+#define BLOCK_M_DKV_64  32
+#define BLOCK_N_DKV_64  128
 
-#define BLOCK_M_DKV_128 32
-#define BLOCK_N_DKV_128 192
+#define BLOCK_M_DKV_128 64
+#define BLOCK_N_DKV_128 128
 
 #define BLOCK_M_DKV_256 32
-#define BLOCK_N_DKV_256 96
+#define BLOCK_N_DKV_256 128
 
 #define WARPS 16
 
@@ -62,14 +64,18 @@ struct KernelConfig {
                     alignas(16) __half k  [ DQ::BLOCK_N * D ];
                     alignas(16) __half v  [ DQ::BLOCK_N * D ];
                 } reuse_kv;
+                union {
                     alignas(16) __half dO [ DQ::BLOCK_M * D ];
                     alignas(16) __half q  [ DQ::BLOCK_M * D ];
+                } reuse_qdO;
                     alignas(16) __half dS [ DQ::BLOCK_M * DQ::BLOCK_N];
             } bdq;
 
             struct DKV_Phase {
+                union {
                     alignas(16) __half k  [ DKV::BLOCK_M * D ];
                     alignas(16) __half v  [ DKV::BLOCK_M * D ];
+                } reuse_kv;
                 union {
                     alignas(16) __half dO [ DKV::BLOCK_N * D ];
                     alignas(16) __half q  [ DKV::BLOCK_N * D ];

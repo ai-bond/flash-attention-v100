@@ -120,14 +120,8 @@ forward_lce_partial(
         // Layout:   Input[Weight]: global[row: valid_m(valid_v), D] -> shared[row: BLOCK_M(BLOCK_N), DIM]
         // Template: GemmPhase::LCDX, Stage::SNGL
         // ==================================================================================
-        WMMA_GEMM_LOAD_TILE<Config, GemmPhase::LCDX, Stage::SNGL>(
-          input_ptr  + k_tile, sInput,
-          nullptr, nullptr,
-          D, valid_m, tid);
-        WMMA_GEMM_LOAD_TILE<Config, GemmPhase::LCDX, Stage::SNGL>(
-          weight_ptr + k_tile, sWeight,
-          nullptr, nullptr,
-          D, valid_v, tid);
+        WMMA_GEMM_LOAD_TILE<Config, GemmPhase::LCDX, Stage::SNGL>(input_ptr  + k_tile, sInput,  D, valid_m, tid);
+        WMMA_GEMM_LOAD_TILE<Config, GemmPhase::LCDX, Stage::SNGL>(weight_ptr + k_tile, sWeight, D, valid_v, tid);
         __syncthreads();
 
         #pragma unroll
@@ -491,14 +485,8 @@ backward_lce_dlogits(
         // Layout:   Input[Weight]: global[row: valid_m(valid_v), D] -> shared[row: BLOCK_M(BLOCK_N), DIM]
         // Template: GemmPhase::LCDX, Stage::SNGL
         // ==================================================================================
-        WMMA_GEMM_LOAD_TILE<Config, GemmPhase::LCDX, Stage::SNGL>(
-          input_ptr  + k_tile, sInput,
-          nullptr, nullptr,
-          D, valid_m, tid);
-        WMMA_GEMM_LOAD_TILE<Config, GemmPhase::LCDX, Stage::SNGL>(
-          weight_ptr + k_tile, sWeight,
-          nullptr, nullptr,
-          D, valid_v, tid);
+        WMMA_GEMM_LOAD_TILE<Config, GemmPhase::LCDX, Stage::SNGL>(input_ptr  + k_tile, sInput,  D, valid_m, tid);
+        WMMA_GEMM_LOAD_TILE<Config, GemmPhase::LCDX, Stage::SNGL>(weight_ptr + k_tile, sWeight, D, valid_v, tid);
         __syncthreads();
 
         // ==================================================================================
@@ -594,8 +582,7 @@ backward_lce_dlogits(
                 const unsigned short h1 = __half_as_ushort(__float2half_rn(p1));
                 const unsigned short h2 = __half_as_ushort(__float2half_rn(p2));
                 const unsigned short h3 = __half_as_ushort(__float2half_rn(p3));
-                asm volatile("st.global.v4.u16 [%0], {%1,%2,%3,%4};\n"
-                    :: "l"(dLogits_ptr + global_v), "h"(h0), "h"(h1), "h"(h2), "h"(h3) : "memory");
+                asm volatile("st.global.v4.u16 [%0], {%1,%2,%3,%4};\n" :: "l"(dLogits_ptr + global_v), "h"(h0), "h"(h1), "h"(h2), "h"(h3) : "memory");
             } else {
                 if (global_v     < V) dLogits_ptr[global_v]     = __float2half_rn(p0);
                 if (global_v + 1 < V) dLogits_ptr[global_v + 1] = __float2half_rn(p1);
@@ -715,20 +702,11 @@ backward_lce_dxw(
         // Template: GemmPhase::LCDX, Stage::SNGL or Stage::TRNSP
         // ==================================================================================
         if constexpr (GTraits::A_IS_COL) {
-            WMMA_GEMM_LOAD_TILE<Config, GemmPhase::LCDX, Stage::SNGL>(
-              SMEM_A + k_offset * A_STRIDE + block_m, sdL,
-              nullptr, nullptr,
-              A_STRIDE, k_valid, tid);
+            WMMA_GEMM_LOAD_TILE<Config, GemmPhase::LCDX, Stage::SNGL> (SMEM_A + k_offset * A_STRIDE + block_m,  sdL, A_STRIDE, k_valid, tid);
         } else {
-            WMMA_GEMM_LOAD_TILE<Config, GemmPhase::LCDX, Stage::SNGL>(
-              SMEM_A + block_m * A_STRIDE + k_offset, sdL,
-              nullptr, nullptr,
-              A_STRIDE, valid_m, tid);
+            WMMA_GEMM_LOAD_TILE<Config, GemmPhase::LCDX, Stage::SNGL> (SMEM_A + block_m  * A_STRIDE + k_offset, sdL, A_STRIDE, valid_m, tid);
         }
-        WMMA_GEMM_LOAD_TILE<Config, GemmPhase::LCDX, Stage::TRNSP>(
-          SMEM_B + k_offset * B_STRIDE + block_n, swI,
-          nullptr, nullptr,
-          B_STRIDE, k_valid, tid);
+            WMMA_GEMM_LOAD_TILE<Config, GemmPhase::LCDX, Stage::TRNSP>(SMEM_B + k_offset * B_STRIDE + block_n,  swI, B_STRIDE, k_valid, tid);
 
         // ==================================================================================
         // Compute:  Swizzled zero-fill for K-tails (prevents NaNs in WMMA)
