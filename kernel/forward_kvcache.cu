@@ -126,9 +126,13 @@ flash_attention_kvcache_kernel(
     const int tid     = threadIdx.x;
     const int warp_id = tid >> 5;
     const int lane_id = tid & 31;
+
     // Alibi slope only for valid block + batch
-    const int   alibi_idx   = (alibi_batch > 0) ? (batch_idx * alibi_batch + head_idx) : head_idx;
-    const float alibi_slope = (alibi_slopes != nullptr) ? alibi_slopes[alibi_idx] : 0.0f;
+    float alibi_slope = 0.0f;
+    if constexpr (IS_ALIBI) {
+        const int alibi_idx = (alibi_batch > 0) ? (block.batch_idx * alibi_batch + block.head_idx) : block.head_idx;
+        alibi_slope = alibi_slopes[alibi_idx];
+    }
 
     // ==================================================================================
     // Update:   KV-cache (Global K_new/V_new -> optional RoPE on K -> Global K_cache/V_cache)
@@ -233,7 +237,7 @@ flash_attention_kvcache_kernel(
         // Layout:   Q[row: BLOCK_M, D], K[col: BLOCK_N, D] -> S[row: BLOCK_M, col: BLOCK_N]
         // Template: GemmType::Q_KT, GemmPhase::FWD
         // ======================================================================================
-        WMMA_GEMM_SCORES<Config, GemmType::Q_KT, GemmPhase::FWD, IS_CAUSAL, IS_ALIBI, IS_SOFTCAP, IS_WINDOW>(
+        WMMA_GEMM_SCORES<Config, GemmType::Q_KT, GemmPhase::FWD, IS_EVEN, IS_CAUSAL, IS_ALIBI, IS_SOFTCAP, IS_WINDOW>(
           sQ, sK, rS.frags,
           block.valid_q_rows,  valid_kv_rows,
           block.start_q,       start_kv,
@@ -267,7 +271,7 @@ flash_attention_kvcache_kernel(
         // Layout:   P[row: BLOCK_M, BLOCK_N], V[row: BLOCK_N, D] -> sO[row: BLOCK_M, D]
         // Template: GemmType::P_V, GemmPhase::FWD
         // ==================================================================================
-        WMMA_GEMM_GRADIENTS<Config, GemmType::P_V, GemmPhase::FWD>(
+        WMMA_GEMM_GRADIENTS<Config, GemmType::P_V, GemmPhase::FWD, IS_EVEN>(
           sP, sV, rO.frags,
           block.valid_q_rows, valid_kv_rows, warp_id, lane_id);
         __syncthreads();

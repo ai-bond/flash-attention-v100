@@ -264,7 +264,7 @@ __device__ __forceinline__ void WMMA_GEMM_SOFTMAX(
 //           P [half ], dS [half ] row-major in SMEM via st_half2(addr, half2, row)
 //           pair p (0..3), e = 2p; row += (p & 1) * 2, col += (p >> 1) * 4
 // ======================================================================================
-template<typename Config, GemmPhase PHASE, bool IS_SOFTCAP, bool IS_DROPOUT, typename FRAG_S, typename FRAG_DOV, int TILES>
+template<typename Config, GemmPhase PHASE,  bool IS_EVEN, bool IS_SOFTCAP, bool IS_DROPOUT, typename FRAG_S, typename FRAG_DOV, int TILES>
 __device__ __forceinline__ void WMMA_GEMM_SOFTMAX_GRADIENT(
     FRAG_S       (&rS)        [TILES],
     FRAG_DOV     (&rdOV)      [TILES],
@@ -285,34 +285,42 @@ __device__ __forceinline__ void WMMA_GEMM_SOFTMAX_GRADIENT(
     int      WARP_ID,
     int      LANE_ID
 ) {
-    if (VALID_Q_ROWS == 0 || VALID_KV_ROWS == 0) return;
 
-    using PTraits              = PhaseTraits<PHASE>;
-    constexpr bool WRITE_P     = PTraits::WRITE_P;
-    constexpr uint32_t STRIDE  = PTraits::template STRIDE<Config>();
-    constexpr int TILE_M       = PTraits::template BLOCK_X<Config>();
-    constexpr int TILE_N       = PTraits::template BLOCK_Y<Config>();
-    constexpr int num_tiles_m  = (TILE_M + WMMA_M - 1) / WMMA_M;
-    constexpr int num_tiles_n  = (TILE_N + WMMA_N - 1) / WMMA_N;
-    constexpr int total_tiles  = num_tiles_m * num_tiles_n;
+    if constexpr (!IS_EVEN) {
+        if (VALID_Q_ROWS == 0 || VALID_KV_ROWS == 0) return;
+    }
 
-    const   float softcap_inv  = IS_SOFTCAP ? (1.0f / SOFTCAP) : 0.0f;
-    const   float rp_dropout   = IS_DROPOUT ? (1.0f / (1.0f - P_DROPOUT)) : 1.0f;
-    const uint32_t drop_thr    = IS_DROPOUT ? uint32_t((1.0f - P_DROPOUT) * 4294967295.0f) : 0u;
-    const uint32_t sp_base     = WRITE_P ? __cvta_generic_to_shared(SMEM_P) : 0u;
-    const uint32_t sds_base    = __cvta_generic_to_shared(SMEM_DS);
+    using PTraits               = PhaseTraits<PHASE>;
+    constexpr bool WRITE_P      = PTraits::WRITE_P;
+    constexpr uint32_t STRIDE   = PTraits::template STRIDE<Config>();
+    constexpr int  TILE_M       = PTraits::template BLOCK_X<Config>();
+    constexpr int  TILE_N       = PTraits::template BLOCK_Y<Config>();
+    constexpr int  num_tiles_m  = (TILE_M + WMMA_M - 1) / WMMA_M;
+    constexpr int  num_tiles_n  = (TILE_N + WMMA_N - 1) / WMMA_N;
+    constexpr int  total_tiles  = num_tiles_m * num_tiles_n;
+    constexpr bool early_exit   = (total_tiles % Config::WARPS_PER_BLOCK == 0);
 
-    const uint2    lines       = LINE_CHORDS(LANE_ID);
+    const   float softcap_inv   = IS_SOFTCAP ? (1.0f / SOFTCAP) : 0.0f;
+    const   float rp_dropout    = IS_DROPOUT ? (1.0f / (1.0f - P_DROPOUT)) : 1.0f;
+    const uint32_t drop_thr     = IS_DROPOUT ? uint32_t((1.0f - P_DROPOUT) * 4294967295.0f) : 0u;
+    const uint32_t sp_base      = WRITE_P ? __cvta_generic_to_shared(SMEM_P) : 0u;
+    const uint32_t sds_base     = __cvta_generic_to_shared(SMEM_DS);
+
+    const uint2    lines        = LINE_CHORDS(LANE_ID);
 
     #pragma unroll
     for (int tile_index = 0; tile_index < TILES; ++tile_index) {
 
-        if ((WARP_ID * TILES + tile_index) >= total_tiles) break;
+        if constexpr (!early_exit) {
+            if ((WARP_ID * TILES + tile_index) >= total_tiles) break;
+        }
 
         const int tile_m = ((WARP_ID * TILES + tile_index) / num_tiles_n) * WMMA_M;
         const int tile_n = ((WARP_ID * TILES + tile_index) % num_tiles_n) * WMMA_N;
 
-        if (tile_m >= VALID_Q_ROWS) continue;
+        if constexpr (!IS_EVEN) {
+            if (tile_m >= VALID_Q_ROWS) continue;
+        }
 
         auto& rS_fragment   = rS[tile_index];
         auto& rdOV_fragment = rdOV[tile_index];
@@ -326,13 +334,13 @@ __device__ __forceinline__ void WMMA_GEMM_SOFTMAX_GRADIENT(
             const int global_row = tile_m + int(lines.x) + row_pair * 2;
             const int global_col = tile_n + int(lines.y) + col_quad * 4;
 
-            //if (global_row >= VALID_Q_ROWS || global_col >= VALID_KV_ROWS) continue;
-
-            if (global_row >= VALID_Q_ROWS || global_col >= VALID_KV_ROWS) {
-                st_half2(sds_base + ((global_row * STRIDE + global_col) * 2u), __float22half2_rn(make_float2(0.0f, 0.0f)), global_row);
-                if constexpr (WRITE_P)
-                    st_half2(sp_base + ((global_row * STRIDE + global_col) * 2u), __float22half2_rn(make_float2(0.0f, 0.0f)), global_row);
-                continue;
+            if constexpr (!IS_EVEN) {
+                if (global_row >= VALID_Q_ROWS || global_col >= VALID_KV_ROWS) {
+                    st_half2(sds_base + ((global_row * STRIDE + global_col) * 2u), __float22half2_rn(make_float2(0.0f, 0.0f)), global_row);
+                    if constexpr (WRITE_P)
+                        st_half2(sp_base + ((global_row * STRIDE + global_col) * 2u), __float22half2_rn(make_float2(0.0f, 0.0f)), global_row);
+                    continue;
+                }
             }
 
             const float lse = GMEM_LSE   [global_row];

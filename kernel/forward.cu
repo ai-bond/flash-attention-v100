@@ -88,9 +88,13 @@ flash_attention_forward_kernel(
     const int tid     = threadIdx.x;
     const int warp_id = tid >> 5;
     const int lane_id = tid & 31;
+
     // Alibi slope only for valid block + batch
-    const int   alibi_idx   = (alibi_batch > 0) ? (block.batch_idx * alibi_batch + block.head_idx) : block.head_idx;
-    const float alibi_slope = (alibi_slopes != nullptr) ? alibi_slopes[alibi_idx] : 0.0f;
+    float alibi_slope = 0.0f;
+    if constexpr (IS_ALIBI) {
+        const int alibi_idx = (alibi_batch > 0) ? (block.batch_idx * alibi_batch + block.head_idx) : block.head_idx;
+        alibi_slope = alibi_slopes[alibi_idx];
+    }
 
     // ==================================================================================
     // Layout:
@@ -137,8 +141,13 @@ flash_attention_forward_kernel(
     // MAIN LOOP (iterates over K/V blocks for current Q block)
     // ==================================================================================
     for (int block_kv = block.block_min; block_kv < block.block_max; ++block_kv) {
-        const int start_kv      = block_kv * BLOCK_N;
-        const int valid_kv_rows = min(BLOCK_N, N - start_kv);
+        const int start_kv = block_kv * BLOCK_N;
+              int valid_kv_rows;
+        if constexpr (!IS_EVEN) {
+            valid_kv_rows = min(BLOCK_N, N - start_kv);
+        } else {
+            valid_kv_rows = BLOCK_N;
+        }
 
         // ==================================================================================
         // Load:     K tile from global to sK(reuse) shared memory
@@ -153,7 +162,7 @@ flash_attention_forward_kernel(
         // Layout:   Q[row: BLOCK_M, D], K[col: BLOCK_N, D] -> S[row: BLOCK_M, col: BLOCK_N]
         // Template: GemmType::Q_KT, GemmPhase::FWD
         // ==================================================================================
-        WMMA_GEMM_SCORES<Config, GemmType::Q_KT, GemmPhase::FWD, IS_CAUSAL, IS_ALIBI, IS_SOFTCAP, IS_WINDOW>(
+        WMMA_GEMM_SCORES<Config, GemmType::Q_KT, GemmPhase::FWD, IS_EVEN, IS_CAUSAL, IS_ALIBI, IS_SOFTCAP, IS_WINDOW>(
           sQ, sK, rS.frags,
           block.valid_q_rows,  valid_kv_rows,
           block.start_q,       start_kv,
@@ -169,9 +178,8 @@ flash_attention_forward_kernel(
         WMMA_GEMM_SOFTMAX<Config, GemmPhase::FWD, IS_EVEN, IS_DROPOUT>(
           rS.frags, rO.frags, rRowMax.frags, rRowSum.frags, rExpDiff.frags,
           sP, dmask_ptr ? dmask_ptr + block.start_q * N + start_kv : nullptr,
-          block.valid_q_rows, valid_kv_rows,
-          block.start_q, start_kv, N, p_dropout, dropout_seed, dropout_offset, N, block_kv, warp_id, lane_id);
-        __syncthreads();
+          block.valid_q_rows, valid_kv_rows, block.start_q, start_kv, N,
+          p_dropout, dropout_seed, dropout_offset, N, block_kv, warp_id, lane_id);
 
         // ==================================================================================
         // Load:     V tile from global to sV(reuse) shared memory
@@ -186,7 +194,7 @@ flash_attention_forward_kernel(
         // Layout:   P[row: BLOCK_M, BLOCK_N], V[row: BLOCK_N, D] -> sO[row: BLOCK_M, D]
         // Template: GemmType::P_V, GemmPhase::FWD
         // ==================================================================================
-        WMMA_GEMM_GRADIENTS<Config, GemmType::P_V, GemmPhase::FWD>(
+        WMMA_GEMM_GRADIENTS<Config, GemmType::P_V, GemmPhase::FWD, IS_EVEN>(
           sP, sV, rO.frags,
           block.valid_q_rows, valid_kv_rows, warp_id, lane_id);
         __syncthreads();

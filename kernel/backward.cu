@@ -100,9 +100,13 @@ flash_attention_backward_kernel(
         const int tid     = threadIdx.x;
         const int warp_id = tid >> 5;
         const int lane_id = tid & 31;
+
         // Alibi slope only for valid block + batch
-        const int   alibi_idx   = (alibi_batch > 0) ? (block.batch_idx * alibi_batch + block.head_idx) : block.head_idx;
-        const float alibi_slope = (alibi_slopes != nullptr) ? alibi_slopes[alibi_idx] : 0.0f;
+        float alibi_slope = 0.0f;
+        if constexpr (IS_ALIBI) {
+            const int alibi_idx = (alibi_batch > 0) ? (block.batch_idx * alibi_batch + block.head_idx) : block.head_idx;
+            alibi_slope = alibi_slopes[alibi_idx];
+        }
 
         // ==================================================================================
         // Layout:
@@ -141,8 +145,13 @@ flash_attention_backward_kernel(
         // MAIN LOOP (iterates over K/V blocks for current Q block)
         // ==================================================================================
         for (int block_kv = block.block_min; block_kv < block.block_max; ++block_kv) {
-            const int start_kv      = block_kv * BLOCK_N;
-            const int valid_kv_rows = min(BLOCK_N, N - start_kv);
+            const int start_kv = block_kv * BLOCK_N;
+                  int valid_kv_rows;
+            if constexpr (!IS_EVEN) {
+                valid_kv_rows = min(BLOCK_N, N - start_kv);
+            } else {
+                valid_kv_rows = BLOCK_N;
+            }
 
             // ==================================================================================
             // Load:     V  tile from global to sV(reuse) shared memory
@@ -164,7 +173,7 @@ flash_attention_backward_kernel(
             // Layout:   dO[row: BLOCK_M, D], V[col: BLOCK_N, D] -> dOV[row: BLOCK_M, col: BLOCK_N]
             // Template: GemmType::dO_VT, GemmPhase::BWQ
             // ==================================================================================
-            WMMA_GEMM_SCORES<Config, GemmType::dO_VT, GemmPhase::BWQ, IS_CAUSAL, IS_ALIBI, IS_SOFTCAP, IS_WINDOW>(
+            WMMA_GEMM_SCORES<Config, GemmType::dO_VT, GemmPhase::BWQ, IS_EVEN, IS_CAUSAL, IS_ALIBI, IS_SOFTCAP, IS_WINDOW>(
               sdO, sV, rdOV.frags,
               block.valid_q_rows,  valid_kv_rows,
               0, 0, 0, 1.0f, 0.0f, 0.0f, -1, -1,
@@ -191,7 +200,7 @@ flash_attention_backward_kernel(
             // Layout:   Q[row: BLOCK_M, D], K[col: BLOCK_N, D] -> S[row: BLOCK_M, col: BLOCK_N]
             // Template: GemmType::Q_KT, GemmPhase::BWQ
             // ==================================================================================
-            WMMA_GEMM_SCORES<Config, GemmType::Q_KT, GemmPhase::BWQ, IS_CAUSAL, IS_ALIBI, IS_SOFTCAP, IS_WINDOW>(
+            WMMA_GEMM_SCORES<Config, GemmType::Q_KT, GemmPhase::BWQ, IS_EVEN, IS_CAUSAL, IS_ALIBI, IS_SOFTCAP, IS_WINDOW>(
               sQ, sK, rS.frags,
               block.valid_q_rows,  valid_kv_rows,
               block.start_q,       start_kv,
@@ -205,7 +214,7 @@ flash_attention_backward_kernel(
             //           LSE[row: BLOCK_M], row_dot[row: BLOCK_M] -> dS[row: BLOCK_M, BLOCK_N]
             // Template: GemmPhase::BWQ
             // ==================================================================================
-            WMMA_GEMM_SOFTMAX_GRADIENT<Config, GemmPhase::BWQ, IS_SOFTCAP, IS_DROPOUT>(
+            WMMA_GEMM_SOFTMAX_GRADIENT<Config, GemmPhase::BWQ, IS_EVEN, IS_SOFTCAP, IS_DROPOUT>(
               rS.frags, rdOV.frags, lse_ptr, rdot_ptr, nullptr, sdS,
               block.valid_q_rows, valid_kv_rows,
               softmax_scale, softcap,
@@ -218,7 +227,7 @@ flash_attention_backward_kernel(
             // Layout:   dS[row: BLOCK_M, BLOCK_N], K[row: BLOCK_N, D] -> dQ[row: BLOCK_M, D]
             // Template: GemmType::dS_K, GemmPhase::BWQ
             // ==================================================================================
-            WMMA_GEMM_GRADIENTS<Config, GemmType::dS_K, GemmPhase::BWQ>(
+            WMMA_GEMM_GRADIENTS<Config, GemmType::dS_K, GemmPhase::BWQ, IS_EVEN>(
               sdS, sK, rdQ.frags,
               block.valid_q_rows, valid_kv_rows,
               warp_id, lane_id);
@@ -331,16 +340,26 @@ flash_attention_backward_kernel(
             const __half* __restrict__ dO_ptr   = dO          + (size_t)(bthd_idx  / H_K) * M * H_Q * D + (size_t)(((bthd_idx % H_K) * (H_Q / H_K)) + group) * D;
             const  float* __restrict__ lse_ptr  = softmax_lse + (size_t)((bthd_idx / H_K) * H_Q + (((bthd_idx % H_K) * (H_Q / H_K)) + group)) * M;
             const  float* __restrict__ rdot_ptr = row_dot     + (size_t)((bthd_idx / H_K) * H_Q + (((bthd_idx % H_K) * (H_Q / H_K)) + group)) * M;
+
             // Alibi slope only for valid block + batch
-            const int   alibi_idx   = (alibi_batch > 0) ? ((bthd_idx / H_K) * alibi_batch + ((bthd_idx % H_K) * (H_Q / H_K) + group)) : (bthd_idx % H_K) * (H_Q / H_K) + group;
-            const float alibi_slope = (alibi_slopes != nullptr) ? alibi_slopes[alibi_idx] : 0.0f;
+            float alibi_slope = 0.0f;
+            if constexpr (IS_ALIBI) {
+                alibi_slope = (alibi_batch > 0)
+                      ? alibi_slopes[(bthd_idx / H_K) * alibi_batch + ((bthd_idx % H_K) * (H_Q / H_K) + group)]
+                      : alibi_slopes[(bthd_idx % H_K) * (H_Q / H_K) + group];
+            }
 
             // ==================================================================================
             // Q-TILES LOOP (Iterate over Q-tiles for the current Q-head)
             // ==================================================================================
             for (int block_q = block.block_min; block_q < block.block_max; ++block_q) {
-                const int start_q      = block_q * BLOCK_N;
-                const int valid_q_rows = min(BLOCK_N, M - start_q);
+                const int start_q = block_q * BLOCK_N;
+                      int valid_q_rows;
+                if constexpr (!IS_EVEN) {
+                    valid_q_rows = min(BLOCK_N, M - start_q);
+                } else {
+                    valid_q_rows = BLOCK_N;
+                }
 
                 // ==================================================================================
                 // Load:     Q  tile from global to sQ(reuse) shared memory
@@ -362,7 +381,7 @@ flash_attention_backward_kernel(
                 // Layout:   Q[row: BLOCK_N, D], K[col: BLOCK_M, D] -> S[row: BLOCK_N, col: BLOCK_M]
                 // Template: GemmType::Q_KT, GemmPhase::BWKV (IS_SWAPPED=true)
                 // ==================================================================================
-                WMMA_GEMM_SCORES<Config, GemmType::Q_KT, GemmPhase::BWKV, IS_CAUSAL, IS_ALIBI, IS_SOFTCAP, IS_WINDOW>(
+                WMMA_GEMM_SCORES<Config, GemmType::Q_KT, GemmPhase::BWKV, IS_EVEN, IS_CAUSAL, IS_ALIBI, IS_SOFTCAP, IS_WINDOW>(
                   sQ, sK, rS.frags,
                   valid_q_rows,  block.valid_kv_rows,
                   start_q,       block.start_kv,
@@ -390,7 +409,7 @@ flash_attention_backward_kernel(
                 // Layout:   dO[row: BLOCK_N, D], V[col: BLOCK_M, D] -> dOV[row: BLOCK_N, col: BLOCK_M]
                 // Template: GemmType::dO_VT, GemmPhase::BWKV (IS_SWAPPED=true)
                 // ==================================================================================
-                WMMA_GEMM_SCORES<Config, GemmType::dO_VT, GemmPhase::BWKV, IS_CAUSAL, IS_ALIBI, IS_SOFTCAP, IS_WINDOW>(
+                WMMA_GEMM_SCORES<Config, GemmType::dO_VT, GemmPhase::BWKV, IS_EVEN, IS_CAUSAL, IS_ALIBI, IS_SOFTCAP, IS_WINDOW>(
                   sdO, sV, rdOV.frags,
                   valid_q_rows,  block.valid_kv_rows,
                   0, 0, 0, 1.0f, 0.0f, 0.0f, -1, -1,
@@ -403,7 +422,7 @@ flash_attention_backward_kernel(
                 //           LSE[row: BLOCK_N], row_dot[row: BLOCK_N] -> P[row: BLOCK_N, BLOCK_M], dS[row: BLOCK_N, BLOCK_M]
                 // Template: GemmPhase::BWKV
                 // ==================================================================================
-                WMMA_GEMM_SOFTMAX_GRADIENT<Config, GemmPhase::BWKV, IS_SOFTCAP, IS_DROPOUT>(
+                WMMA_GEMM_SOFTMAX_GRADIENT<Config, GemmPhase::BWKV, IS_EVEN, IS_SOFTCAP, IS_DROPOUT>(
                   rS.frags, rdOV.frags, lse_ptr + start_q, rdot_ptr + start_q, sP, sdS,
                   valid_q_rows,  block.valid_kv_rows,
                   softmax_scale, softcap,
@@ -416,7 +435,7 @@ flash_attention_backward_kernel(
                 // Layout:   P^T[col: BLOCK_M, BLOCK_N], dO[row: BLOCK_N, D] -> dV[row: BLOCK_M, D]
                 // Template: GemmType::PT_dO, GemmPhase::BWKV
                 // ==================================================================================
-                WMMA_GEMM_GRADIENTS<Config, GemmType::PT_dO, GemmPhase::BWKV>(
+                WMMA_GEMM_GRADIENTS<Config, GemmType::PT_dO, GemmPhase::BWKV, IS_EVEN>(
                   sP, sdO, rdV.frags,
                   block.valid_kv_rows, valid_q_rows,
                   warp_id, lane_id);
@@ -435,7 +454,7 @@ flash_attention_backward_kernel(
                 // Layout:   dS^T[col: BLOCK_M, BLOCK_N], Q[row: BLOCK_N, D] -> dK[row: BLOCK_M, D]
                 // Template: GemmType::dST_Q, GemmPhase::BWKV
                 // ==================================================================================
-                WMMA_GEMM_GRADIENTS<Config, GemmType::dST_Q, GemmPhase::BWKV>(
+                WMMA_GEMM_GRADIENTS<Config, GemmType::dST_Q, GemmPhase::BWKV, IS_EVEN>(
                   sdS, sQ, rdK.frags,
                   block.valid_kv_rows, valid_q_rows,
                   warp_id, lane_id);
