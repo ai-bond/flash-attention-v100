@@ -40,10 +40,10 @@ done
 
 if [ $USE_VOLTA -eq 1 ]; then
     SUFFIX="_volta"
-    DEFINE_FLAG="-DUSE_VOLTA_MMA"
+    DEFINE_FLAG="-DUSE_VOLTA_MMA --expt-relaxed-constexpr"
 elif [ $USE_NATIVE -eq 1 ]; then
     SUFFIX="_native"
-    DEFINE_FLAG="-DMMA_NATIVE"
+    DEFINE_FLAG="-DMMA_NATIVE --expt-relaxed-constexpr"
 else
     SUFFIX=""
     DEFINE_FLAG=""

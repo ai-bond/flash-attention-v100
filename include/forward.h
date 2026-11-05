@@ -3,22 +3,22 @@
 // ======================================================================================
 #pragma once
 
-#define BLOCK_M_16  16
-#define BLOCK_N_16  512
+#define BLOCK_M_16  128
+#define BLOCK_N_16  128
 
-#define BLOCK_M_32  32
-#define BLOCK_N_32  256
+#define BLOCK_M_32  128
+#define BLOCK_N_32  128
 
-#define BLOCK_M_64  64
-#define BLOCK_N_64  128
+#define BLOCK_M_64  128
+#define BLOCK_N_64  32
 
-#define BLOCK_M_128 32
-#define BLOCK_N_128 176
+#define BLOCK_M_128 128
+#define BLOCK_N_128 64
 
-#define BLOCK_M_256 32
+#define BLOCK_M_256 128
 #define BLOCK_N_256 64
 
-#define WARPS 16
+#define WARPS 8
 
 // ======================================================================================
 // CONFIGURATIONS
@@ -43,15 +43,8 @@ struct KernelConfig {
                     alignas(16) __half k      [DO::BLOCK_N * D];
                     alignas(16) __half v      [DO::BLOCK_N * D];
                 } reuse_kv;
-                union {
-                    alignas(16) float  s      [DO::BLOCK_M * DO::BLOCK_N];
-                    alignas(16) __half p      [DO::BLOCK_M * DO::BLOCK_N * 2];
-                } reuse_sp;
-                    alignas(16) float  o      [DO::BLOCK_M * D];
             } fdo;
         } phase;
-                    alignas(16) float  row_max[DO::BLOCK_M];
-                    alignas(16) float  row_sum[DO::BLOCK_M];
     };
 
     static constexpr int TOTAL_SMEM = static_cast<int>(((sizeof(SmemLayout) + 127) & ~size_t(127)));

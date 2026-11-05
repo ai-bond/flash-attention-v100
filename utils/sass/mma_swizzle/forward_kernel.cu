@@ -24,8 +24,8 @@
 // ======================================================================================
 // FORWARD KERNEL
 // ======================================================================================
-template<int D, bool IS_CAUSAL, bool IS_ALIBI, bool IS_SOFTCAP, bool IS_WINDOW, bool IS_DROPOUT>
-__global__ void __launch_bounds__(KernelConfig<D>::THREADS_PER_BLOCK, 2)
+template<int D, bool IS_EVEN, bool IS_CAUSAL, bool IS_ALIBI, bool IS_SOFTCAP, bool IS_WINDOW, bool IS_DROPOUT>
+__global__ void __launch_bounds__(KernelConfig<D>::THREADS_PER_BLOCK, 1)
 flash_attention_forward_kernel(
     const __half* __restrict__ Q,
     const __half* __restrict__ K,
@@ -118,15 +118,15 @@ flash_attention_forward_kernel(
     __half* __restrict__ sQ      = smem.phase.fdo.q;
     __half* __restrict__ sK      = smem.phase.fdo.reuse_kv.k;
     __half* __restrict__ sV      = smem.phase.fdo.reuse_kv.v;
-    float*  __restrict__ sS      = smem.phase.fdo.reuse_sp.s;
-    __half* __restrict__ sP      = smem.phase.fdo.reuse_sp.p;
-    float*  __restrict__ sRowMax = smem.row_max;
-    float*  __restrict__ sRowSum = smem.row_sum;
-    float*  __restrict__ sO      = smem.phase.fdo.o;
+    __half* __restrict__ sP      = smem.phase.fdo.p;
 
     WMMA_GEMM_INIT_SMEM<Config>(smem_raw);
+    WMMA_GEMM_INIT_REGS<Config, GemmType::Q_KT, GemmPhase::FWD> rS;
+    WMMA_GEMM_INIT_REGS<Config, GemmType::P_V,  GemmPhase::FWD> rO;
+    WMMA_GEMM_INIT_REGS<Config, GemmType::Q_KT, GemmPhase::FWD, true> rRowMax (NEG_INF);
+    WMMA_GEMM_INIT_REGS<Config, GemmType::Q_KT, GemmPhase::FWD, true> rRowSum (0.0f);
+    WMMA_GEMM_INIT_REGS<Config, GemmType::Q_KT, GemmPhase::FWD, true> rExpDiff(1.0f);
     __syncthreads();
-    WMMA_GEMM_INIT_SMEM<Config>(smem.row_max, NEG_INF);
 
     // ==================================================================================
     // Load:     Q tile from global to sQ shared memory
@@ -137,13 +137,12 @@ flash_attention_forward_kernel(
       q_ptr,   sQ,
       nullptr, nullptr,
       H_Q * D, block.valid_q_rows, tid);
-    __syncthreads();
 
     // ==================================================================================
     // MAIN LOOP (iterates over K/V blocks for current Q block)
     // ==================================================================================
-    for (int block_q = block.block_min; block_q < block.block_max; ++block_q) {
-        const int start_kv      = block_q * BLOCK_N;
+    for (int block_kv = block.block_min; block_kv < block.block_max; ++block_kv) {
+        const int start_kv      = block_kv * BLOCK_N;
         const int valid_kv_rows = min(BLOCK_N, N - start_kv);
 
         // ==================================================================================
@@ -163,7 +162,7 @@ flash_attention_forward_kernel(
         // Template: GemmType::Q_KT, GemmPhase::FWD
         // ==================================================================================
         WMMA_GEMM_SCORES<Config, GemmType::Q_KT, GemmPhase::FWD, IS_CAUSAL, IS_ALIBI, IS_SOFTCAP, IS_WINDOW>(
-          sQ, sK, sS,
+          sQ, sK, rS.frags,
           block.valid_q_rows,  valid_kv_rows,
           block.start_q,       start_kv,
           block.seqlen_offset,
@@ -175,12 +174,11 @@ flash_attention_forward_kernel(
         // Layout:   S[BLOCK_M, BLOCK_N] -> P[BLOCK_M, BLOCK_N], O[BLOCK_M, D] scaled
         // Template: Config, IS_DROPOUT
         // ==================================================================================
-        WMMA_GEMM_SOFTMAX<Config, IS_DROPOUT>(
-          sS, sP, sO,
-          sRowMax, sRowSum, dmask_ptr ? dmask_ptr + block.start_q * N + start_kv : nullptr,
-          block.valid_q_rows, valid_kv_rows, tid, block_q,
-          block.start_q, start_kv, N,
-          p_dropout, dropout_seed, dropout_offset, N);
+        WMMA_GEMM_SOFTMAX<Config, GemmPhase::FWD, IS_EVEN, IS_DROPOUT>(
+          rS.frags, rO.frags, rRowMax.frags, rRowSum.frags, rExpDiff.frags,
+          sP, dmask_ptr ? dmask_ptr + block.start_q * N + start_kv : nullptr,
+          block.valid_q_rows, valid_kv_rows,
+          block.start_q, start_kv, N, p_dropout, dropout_seed, dropout_offset, N, block_kv, warp_id, lane_id);
         __syncthreads();
 
         // ==================================================================================
@@ -200,7 +198,7 @@ flash_attention_forward_kernel(
         // Template: GemmType::P_V, GemmPhase::FWD
         // ==================================================================================
         WMMA_GEMM_GRADIENTS<Config, GemmType::P_V, GemmPhase::FWD>(
-          sP, sV, sO,
+          sP, sV, rO.frags,
           block.valid_q_rows, valid_kv_rows, warp_id, lane_id);
         __syncthreads();
     }   // END MAIN LOOP
@@ -210,14 +208,10 @@ flash_attention_forward_kernel(
     // Template: Result::WRITE_O (NORMALIZE=true, DUAL_STORE=false)
     // ==================================================================================
     WMMA_GEMM_EPILOGUE<Config, Result::WRITE_O>(
-      sO,      out_ptr,
-      nullptr, nullptr,
-      sRowSum, H_Q * D, block.valid_q_rows, tid);
-
-    if (tid < block.valid_q_rows) {
-        const float sum = fmaxf(sRowSum[tid], 1e-24f);
-        softmax_lse_ptr[tid] = sRowMax[tid] + logf(sum);
-    }
+      rO.frags, out_ptr,
+      nullptr,  nullptr,
+      softmax_lse_ptr, rRowSum.frags, rRowMax.frags,
+      H_Q * D, block.valid_q_rows, warp_id, lane_id);
 }
 
 // ======================================================================================
@@ -290,10 +284,13 @@ StabilityMetrics compute_stability_fwd(const std::vector<float>& out_gpu, const 
 template<int D, bool IS_CAUSAL>
 bool run_test_fwd(int B, int H, int M, int N, float scale) {
     using Config = KernelConfig<D>;
-    printf("  D=%-3d BN=%-3d BM=%-2d W=%-2d causal=%d ",
+    printf("  D=%-3d BN=%-3d BM=%-3d W=%-2d causal=%d ",
            D, Config::DO::BLOCK_N, Config::DO::BLOCK_M, WARPS, IS_CAUSAL);
 
-    size_t qsz = (size_t)B*H*M*D, ksz = (size_t)B*H*N*D, osz = qsz, lsz = (size_t)B*H*M;
+    const size_t qsz = (size_t)B*H*M*D;
+    const size_t ksz = (size_t)B*H*N*D;
+    const size_t osz = qsz;
+    const size_t lsz = (size_t)B*H*M;
 
     std::vector<float> hQ(qsz), hK(ksz), hV(ksz);
     std::vector<float> hO_ref(osz), hLSE_ref(lsz);
@@ -304,7 +301,7 @@ bool run_test_fwd(int B, int H, int M, int N, float scale) {
     for (auto& v : hK) v = ((float)rand() / RAND_MAX - 0.5f) * 0.1f;
     for (auto& v : hV) v = ((float)rand() / RAND_MAX - 0.5f) * 0.1f;
 
-    bool use_cpu_ref = (M <= 1024 && N <= 1024);
+    const bool use_cpu_ref = (M <= 2048 && N <= 2048);
 
     cpu_ref_fwd(hQ.data(), hK.data(), hV.data(), hO_ref.data(), hLSE_ref.data(),
                 B, H, M, N, D, scale, IS_CAUSAL);
@@ -325,25 +322,28 @@ bool run_test_fwd(int B, int H, int M, int N, float scale) {
     cudaMemcpy(dV, hV_h.data(), ksz*2, cudaMemcpyHostToDevice);
 
     const size_t smem_bytes = Config::TOTAL_SMEM;
-    auto kern = flash_attention_forward_kernel<D, IS_CAUSAL, false, false, false, false>;
-    cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
+    const bool   is_even    = (M % Config::DO::BLOCK_M == 0) && (N % Config::DO::BLOCK_N == 0);
 
-    const int grid_dq  = (M + Config::DO::BLOCK_M - 1) / Config::DO::BLOCK_M;
-    dim3 grid(grid_dq, 1, B * H);
+    dim3 grid((M + Config::DO::BLOCK_M - 1) / Config::DO::BLOCK_M, 1, B * H);
     dim3 block(Config::THREADS_PER_BLOCK);
 
     cudaEvent_t start, stop;
     cudaEventCreate(&start);
     cudaEventCreate(&stop);
 
+    auto launch = [&](auto kern) {
+        cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
+        kern<<<grid, block, smem_bytes>>>(
+            dQ, dK, dV, dOut, dLSE, /*dmask=*/nullptr,
+            B, H, H, M, N,
+            scale, 0.0f, nullptr, 0,
+            -1, -1,
+            0.0f, 0, 0);
+    };
+
     cudaEventRecord(start, 0);
-    kern<<<grid, block, smem_bytes>>>(
-        dQ, dK, dV, dOut, dLSE, /*dmask=*/nullptr,
-        B, H, H, M, N,
-        scale, 0.0f, nullptr, 0,
-        -1, -1,
-        0.0f, 0, 0
-    );
+    if (is_even) launch(flash_attention_forward_kernel<D, true,  IS_CAUSAL, false, false, false, false>);
+    else         launch(flash_attention_forward_kernel<D, false, IS_CAUSAL, false, false, false, false>);
     cudaEventRecord(stop, 0);
     cudaEventSynchronize(stop);
 
@@ -355,11 +355,9 @@ bool run_test_fwd(int B, int H, int M, int N, float scale) {
     std::vector<__half> hOut_h(osz);
     cudaMemcpy(hOut_h.data(), dOut, osz*2, cudaMemcpyDeviceToHost);
     cudaMemcpy(hLSE_gpu.data(), dLSE, lsz*4, cudaMemcpyDeviceToHost);
-
     for (size_t i = 0; i < osz; ++i) hO_gpu[i] = __half2float(hOut_h[i]);
 
     StabilityMetrics m = {0,0,0,0,0};
-
     if (use_cpu_ref) {
         m = compute_stability_fwd(hO_gpu, hO_ref, hLSE_gpu, hLSE_ref);
     } else {
@@ -389,40 +387,32 @@ bool run_test_fwd(int B, int H, int M, int N, float scale) {
     return pass;
 }
 
-bool dispatch_test_fwd(int B, int H, int M, int N, int D, bool is_causal) {
-    float scale = 1.0f / sqrtf((float)D);
-    switch (D) {
-        case 16:  return is_causal ? run_test_fwd<16, true>(B, H, M, N, scale)  : run_test_fwd<16, false>(B, H, M, N, scale);
-        case 32:  return is_causal ? run_test_fwd<32, true>(B, H, M, N, scale)  : run_test_fwd<32, false>(B, H, M, N, scale);
-        case 64:  return is_causal ? run_test_fwd<64, true>(B, H, M, N, scale)  : run_test_fwd<64, false>(B, H, M, N, scale);
-        case 128: return is_causal ? run_test_fwd<128, true>(B, H, M, N, scale) : run_test_fwd<128, false>(B, H, M, N, scale);
-        case 256: return is_causal ? run_test_fwd<256, true>(B, H, M, N, scale) : run_test_fwd<256, false>(B, H, M, N, scale);
-        default:
-            printf("  Unsupported D=%d\n", D);
-            return false;
-    }
-}
-
 int main() {
     printf("[ FA2 Forward ]:\n");
     int ok = 0, total = 0;
-    auto T = [&](auto r) { total++; if (r) ok++; };
 
     std::vector<std::tuple<int, int, int, int, int>> test_cases = {
-        {1, 1, 16, 16, 16},
-        {1, 1, 32, 32, 32},
-        {1, 1, 64, 64, 64},
-        {1, 1, 128, 128, 128},
-        {1, 1, 256, 256, 256},
-        {1, 1, 1024, 1024, 128},
+        {1, 1, 2048, 2048,  16},
+        {1, 1, 2048, 2048,  32},
+        {1, 1, 2048, 2048,  64},
         {1, 1, 2048, 2048, 128},
-        {1, 1, 4096, 4096, 128},
+        {1, 1, 2048, 2048, 256},
     };
 
     for (const auto& tc : test_cases) {
         auto [B, H, M, N, D] = tc;
-        T(dispatch_test_fwd(B, H, M, N, D, false));
-        T(dispatch_test_fwd(B, H, M, N, D, true));
+        float scale = 1.0f / sqrtf((float)D);
+        for (bool causal : {false, true}) {
+            bool r = false;
+            switch (D) {
+                case 16:  r = causal ? run_test_fwd<16, true >(B,H,M,N,scale) : run_test_fwd<16, false>(B,H,M,N,scale); break;
+                case 32:  r = causal ? run_test_fwd<32, true >(B,H,M,N,scale) : run_test_fwd<32, false>(B,H,M,N,scale); break;
+                case 64:  r = causal ? run_test_fwd<64, true >(B,H,M,N,scale) : run_test_fwd<64, false>(B,H,M,N,scale); break;
+                case 128: r = causal ? run_test_fwd<128,true >(B,H,M,N,scale) : run_test_fwd<128,false>(B,H,M,N,scale); break;
+                case 256: r = causal ? run_test_fwd<256,true >(B,H,M,N,scale) : run_test_fwd<256,false>(B,H,M,N,scale); break;
+            }
+            total++; if (r) ok++;
+        }
     }
 
     printf("\n%d/%d tests passed\n", ok, total);

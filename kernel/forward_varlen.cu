@@ -22,7 +22,7 @@
 // ======================================================================================
 // FORWARD VARLEN KERNEL
 // ======================================================================================
-template<int D, bool IS_CAUSAL, bool IS_ALIBI, bool IS_SOFTCAP, bool IS_WINDOW, bool IS_DROPOUT, bool IS_PAGED>
+template<int D, bool IS_EVEN, bool IS_CAUSAL, bool IS_ALIBI, bool IS_SOFTCAP, bool IS_WINDOW, bool IS_DROPOUT, bool IS_PAGED>
 __global__ void __launch_bounds__(KernelConfig<D>::THREADS_PER_BLOCK, 1)
 flash_attention_forward_varlen_kernel(
     const __half* __restrict__ Q,
@@ -114,9 +114,13 @@ flash_attention_forward_varlen_kernel(
     const int tid       = threadIdx.x;
     const int warp_id   = tid >> 5;
     const int lane_id   = tid & 31;
+
     // Alibi slope only for valid block + batch
-    const int   alibi_idx   = (alibi_batch > 0) ? (block.batch_idx * alibi_batch + block.head_idx) : block.head_idx;
-    const float alibi_slope = (alibi_slopes != nullptr) ? alibi_slopes[alibi_idx] : 0.0f;
+    float alibi_slope = 0.0f;
+    if constexpr (IS_ALIBI) {
+        const int alibi_idx = (alibi_batch > 0) ? (block.batch_idx * alibi_batch + block.head_idx) : block.head_idx;
+        alibi_slope = alibi_slopes[alibi_idx];
+    }
 
     // ======================================================================================
     // Layout:
@@ -139,32 +143,29 @@ flash_attention_forward_varlen_kernel(
     __half* __restrict__ sQ      = smem.phase.fdo.q;
     __half* __restrict__ sK      = smem.phase.fdo.reuse_kv.k;
     __half* __restrict__ sV      = smem.phase.fdo.reuse_kv.v;
-    float*  __restrict__ sS      = smem.phase.fdo.reuse_sp.s;
-    __half* __restrict__ sP      = smem.phase.fdo.reuse_sp.p;
-    float*  __restrict__ sRowMax = smem.row_max;
-    float*  __restrict__ sRowSum = smem.row_sum;
-    float*  __restrict__ sO      = smem.phase.fdo.o;
 
-    WMMA_GEMM_INIT_SMEM<Config>(smem_raw);
+    WMMA_GEMM_INIT_SMEM  <Config>(smem_raw);
+    WMMA_GEMM_INIT_ACCUM <Config, GemmType::Q_KT, GemmPhase::FWD> rS;
+    WMMA_GEMM_INIT_ACCUM <Config, GemmType::P_V,  GemmPhase::FWD> rO;
+    WMMA_GEMM_INIT_MATRIX<Config, GemmType::Q_KT, GemmPhase::FWD> rP(rS);
+    WMMA_GEMM_INIT_BUFFER<Config, GemmType::Q_KT, GemmPhase::FWD> rRowMax (NEG_INF);
+    WMMA_GEMM_INIT_BUFFER<Config, GemmType::Q_KT, GemmPhase::FWD> rRowSum (0.0f);
+    WMMA_GEMM_INIT_BUFFER<Config, GemmType::Q_KT, GemmPhase::FWD> rExpDiff(1.0f);
     __syncthreads();
-    WMMA_GEMM_INIT_SMEM<Config>(smem.row_max, NEG_INF);
 
     // ======================================================================================
     // Load:     Q tile from global to sQ shared memory
     // Layout:   Q: global[row: BLOCK_M, D] with H_Q*D -> shared[row: BLOCK_M, D]
     // Template: GemmPhase::FWD, Stage::SNGL
     // ======================================================================================
-    WMMA_GEMM_LOAD_TILE<Config, GemmPhase::FWD, Stage::SNGL>(
-      q_ptr,   sQ,
-      nullptr, nullptr,
-      H_Q * D, block.valid_q_rows, tid);
+    WMMA_GEMM_LOAD_TILE<Config, GemmPhase::FWD, Stage::SNGL>(q_ptr, sQ, H_Q * D, block.valid_q_rows, tid);
     __syncthreads();
 
     // ======================================================================================
     // MAIN LOOP (iterates over K/V blocks for current Q block)
     // ======================================================================================
-    for (int block_q = block.block_min; block_q < block.block_max; ++block_q) {
-        const int start_kv      = block_q * BLOCK_N;
+    for (int block_kv = block.block_min; block_kv < block.block_max; ++block_kv) {
+        const int start_kv      = block_kv * BLOCK_N;
         const int valid_kv_rows = min(BLOCK_N, block.seqlen_k - start_kv);
         if (valid_kv_rows <= 0) break;
 
@@ -196,19 +197,16 @@ flash_attention_forward_varlen_kernel(
         // Layout:   K: global[row: BLOCK_N, D] with H_K*D -> shared[row: BLOCK_N, D]
         // Template: GemmPhase::FWD, Stage::SNGL
         // ======================================================================================
-        WMMA_GEMM_LOAD_TILE<Config, GemmPhase::FWD, Stage::SNGL>(
-          k_ptr_page, sK,
-          nullptr,    nullptr,
-          H_K * D, valid_kv_rows, tid);
+        WMMA_GEMM_LOAD_TILE<Config, GemmPhase::FWD, Stage::SNGL>(k_ptr_page, sK, H_K * D, valid_kv_rows, tid);
         __syncthreads();
 
-        // ======================================================================================
+        // ==================================================================================
         // Compute:  S = Q @ K^T
         // Layout:   Q[row: BLOCK_M, D], K[col: BLOCK_N, D] -> S[row: BLOCK_M, col: BLOCK_N]
         // Template: GemmType::Q_KT, GemmPhase::FWD
-        // ======================================================================================
-        WMMA_GEMM_SCORES<Config, GemmType::Q_KT, GemmPhase::FWD, IS_CAUSAL, IS_ALIBI, IS_SOFTCAP, IS_WINDOW>(
-          sQ, sK, sS,
+        // ==================================================================================
+        WMMA_GEMM_SCORES<Config, GemmType::Q_KT, GemmPhase::FWD, IS_EVEN, IS_CAUSAL, IS_ALIBI, IS_SOFTCAP, IS_WINDOW>(
+          sQ, sK, rS.frags,
           block.valid_q_rows,  valid_kv_rows,
           block.start_q,       start_kv,
           block.seqlen_offset,
@@ -220,50 +218,43 @@ flash_attention_forward_varlen_kernel(
         // Layout:   S[BLOCK_M, BLOCK_N] -> P[BLOCK_M, BLOCK_N], O[BLOCK_M, D] scaled
         // Template: Config, IS_DROPOUT
         // ======================================================================================
-        WMMA_GEMM_SOFTMAX<Config, IS_DROPOUT>(
-          sS, sP, sO,
-          sRowMax, sRowSum, dmask_ptr ? dmask_ptr + start_kv : nullptr,
-          block.valid_q_rows, valid_kv_rows, tid, block_q,
+        WMMA_GEMM_SOFTMAX<Config, GemmPhase::FWD, IS_EVEN, IS_DROPOUT>(
+          rS.frags, rO.frags, rP.frags,
+          rRowMax.frags, rRowSum.frags, rExpDiff.frags,
+          dmask_ptr ? dmask_ptr + start_kv : nullptr,
+          block.valid_q_rows, valid_kv_rows,
           block.q_base + block.start_q, start_kv, max_seqlen_k,
-          p_dropout, dropout_seed, dropout_offset, H_Q * max_seqlen_k);
-        __syncthreads();
+          p_dropout, dropout_seed, dropout_offset, H_Q * max_seqlen_k,
+          block_kv, warp_id, lane_id);
 
         // ======================================================================================
         // Load:     V tile from global to sV(reuse) shared memory
         // Layout:   V: global[row: BLOCK_N, D] with H_K*D -> shared[row: BLOCK_N, D]
         // Template: GemmPhase::FWD, Stage::SNGL
         // ======================================================================================
-        WMMA_GEMM_LOAD_TILE<Config, GemmPhase::FWD, Stage::SNGL>(
-          v_ptr_page, sV,
-          nullptr,    nullptr,
-          H_K * D, valid_kv_rows, tid);
+        WMMA_GEMM_LOAD_TILE<Config, GemmPhase::FWD, Stage::SNGL>(v_ptr_page, sV, H_K * D, valid_kv_rows, tid);
         __syncthreads();
 
-        // ==============================================================================
+        // ==================================================================================
         // Compute:  O += P @ V
         // Layout:   P[row: BLOCK_M, BLOCK_N], V[row: BLOCK_N, D] -> sO[row: BLOCK_M, D]
         // Template: GemmType::P_V, GemmPhase::FWD
-        // ==============================================================================
-        WMMA_GEMM_GRADIENTS<Config, GemmType::P_V, GemmPhase::FWD>(
-          sP, sV, sO,
-          block.valid_q_rows, valid_kv_rows,
-          warp_id, lane_id);
+        // ==================================================================================
+        WMMA_GEMM_GRADIENTS<Config, GemmType::P_V, GemmPhase::FWD, IS_EVEN>(
+          rP.frags, sV, rO.frags,
+          block.valid_q_rows, valid_kv_rows, warp_id, lane_id);
         __syncthreads();
     }   // END MAIN LOOP
-    // ======================================================================================
+    // ==================================================================================
     // Compute:  Store normalized attention output O = softmax(S) @ V
     // Layout:   sO[row: BLOCK_M, D_STRIDE] -> out_ptr[row: BLOCK_M, D] with H_Q*D
     // Template: Result::WRITE_O (NORMALIZE=true, DUAL_STORE=false)
-    // ======================================================================================
+    // ==================================================================================
     WMMA_GEMM_EPILOGUE<Config, Result::WRITE_O>(
-      sO,      out_ptr,
-      nullptr, nullptr,
-      sRowSum, H_Q * D, block.valid_q_rows, tid);
-
-    if (tid < block.valid_q_rows) {
-        const float sum = fmaxf(sRowSum[tid], 1e-24f);
-        softmax_lse_ptr[tid] = sRowMax[tid] + logf(sum);
-    }
+      rO.frags, out_ptr,
+      nullptr,  nullptr,
+      softmax_lse_ptr, rRowSum.frags, rRowMax.frags,
+      H_Q * D, block.valid_q_rows, warp_id, lane_id);
 }
 
 // ======================================================================================
@@ -313,6 +304,7 @@ void launcher_flash_attention_forward_varlen(
     const dim3 grid((max_seqlen_q + Config::DO::BLOCK_M - 1) / Config::DO::BLOCK_M, 1, B * H_Q);
     const dim3 block(Config::THREADS_PER_BLOCK);
 
+    bool is_even        = false;
     bool is_alibi       = (alibi_slopes != nullptr);
     bool is_softcap     = (softcap > 0.0f);
     bool is_window      = (window_left >= 0 || window_right >= 0);
@@ -333,8 +325,9 @@ void launcher_flash_attention_forward_varlen(
     const int*    leftpad_k_ptr    = leftpad_k.defined() ? leftpad_k.data_ptr<int>() : nullptr;
     const int*    block_table_ptr  = paged_KV ? block_table.data_ptr<int>() : nullptr;
 
-    dispatch_attention_features(is_causal, is_alibi, is_softcap, is_window, is_dropout, is_paged, is_rope, is_interleaved,
-    [&](auto CAUSAL, auto ALIBI, auto SOFTCAP, auto WINDOW, auto DROPOUT, auto PAGED, auto /*ROPE*/, auto /*INTERLEAVED*/) {
+    dispatch_attention_features(is_even, is_causal, is_alibi, is_softcap, is_window, is_dropout, is_paged, is_rope, is_interleaved,
+    [&](auto EVEN, auto CAUSAL, auto ALIBI, auto SOFTCAP, auto WINDOW, auto DROPOUT, auto PAGED, auto /*ROPE*/, auto /*INTERLEAVED*/) {
+        constexpr bool IS_EVEN    = decltype(EVEN)::value;    
         constexpr bool IS_CAUSAL  = decltype(CAUSAL)::value;
         constexpr bool IS_ALIBI   = decltype(ALIBI)::value;
         constexpr bool IS_SOFTCAP = decltype(SOFTCAP)::value;
@@ -342,7 +335,7 @@ void launcher_flash_attention_forward_varlen(
         constexpr bool IS_DROPOUT = decltype(DROPOUT)::value;
         constexpr bool IS_PAGED   = decltype(PAGED)::value;
 
-        auto kernel = flash_attention_forward_varlen_kernel<D, IS_CAUSAL, IS_ALIBI, IS_SOFTCAP, IS_WINDOW, IS_DROPOUT, IS_PAGED>;
+        auto kernel = flash_attention_forward_varlen_kernel<D, IS_EVEN, IS_CAUSAL, IS_ALIBI, IS_SOFTCAP, IS_WINDOW, IS_DROPOUT, IS_PAGED>;
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
 
         kernel<<<grid, block, smem, stream>>>(

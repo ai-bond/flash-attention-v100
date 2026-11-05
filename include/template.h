@@ -262,6 +262,7 @@ __host__ inline void dispatch_flags(LaunchFn& launch, bool next, Rest... rest) {
 // ======================================================================================
 template <typename LaunchFn>
 __host__ inline void dispatch_attention_features(
+    bool is_even,
     bool is_causal,
     bool is_alibi,
     bool is_softcap,
@@ -272,6 +273,7 @@ __host__ inline void dispatch_attention_features(
     bool is_interleaved,
     LaunchFn&& launch)
 {
+    const bool chk_even        = is_even;
     const bool chk_causal      = is_causal;
     const bool chk_alibi       = is_alibi;
     const bool chk_window      = is_window;
@@ -283,6 +285,6 @@ __host__ inline void dispatch_attention_features(
 
     dispatch_flags<LaunchFn>(
         launch,
-        chk_causal, chk_alibi, chk_softcap, chk_window, chk_dropout, chk_paged, chk_rope, chk_interleaved
+        chk_even, chk_causal, chk_alibi, chk_softcap, chk_window, chk_dropout, chk_paged, chk_rope, chk_interleaved
     );
 }
