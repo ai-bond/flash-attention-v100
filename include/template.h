@@ -288,10 +288,3 @@ __host__ inline void dispatch_attention_features(
         chk_even, chk_causal, chk_alibi, chk_softcap, chk_window, chk_dropout, chk_paged, chk_rope, chk_interleaved
     );
 }
-
-// ======================================================================================
-// LINE_CHORDS: fragment element for the current lane
-// ======================================================================================
-__device__ __forceinline__ constexpr uint2 LINE_CHORDS(unsigned lane) noexcept {
-    return uint2{(lane & 0x1u) | ((lane & 0x4u) << 1) | ((lane & 0x10u) >> 2), lane & 0xAu};
-}

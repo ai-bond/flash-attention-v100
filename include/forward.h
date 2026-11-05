@@ -10,13 +10,13 @@
 #define BLOCK_N_32  128
 
 #define BLOCK_M_64  128
-#define BLOCK_N_64  64
+#define BLOCK_N_64  32
 
 #define BLOCK_M_128 128
-#define BLOCK_N_128 128
+#define BLOCK_N_128 64
 
 #define BLOCK_M_256 128
-#define BLOCK_N_256 32
+#define BLOCK_N_256 64
 
 #define WARPS 8
 
@@ -43,7 +43,6 @@ struct KernelConfig {
                     alignas(16) __half k      [DO::BLOCK_N * D];
                     alignas(16) __half v      [DO::BLOCK_N * D];
                 } reuse_kv;
-                    alignas(16) __half p      [DO::BLOCK_M * DO::BLOCK_N];
             } fdo;
         } phase;
     };

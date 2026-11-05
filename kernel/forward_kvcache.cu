@@ -170,14 +170,14 @@ flash_attention_kvcache_kernel(
     __half* __restrict__ sQ      = smem.phase.fdo.q;
     __half* __restrict__ sK      = smem.phase.fdo.reuse_kv.k;
     __half* __restrict__ sV      = smem.phase.fdo.reuse_kv.v;
-    __half* __restrict__ sP      = smem.phase.fdo.p;
 
-    WMMA_GEMM_INIT_SMEM<Config>(smem_raw);
-    WMMA_GEMM_INIT_REGS<Config, GemmType::Q_KT, GemmPhase::FWD> rS;
-    WMMA_GEMM_INIT_REGS<Config, GemmType::P_V,  GemmPhase::FWD> rO;
-    WMMA_GEMM_INIT_REGS<Config, GemmType::Q_KT, GemmPhase::FWD, true> rRowMax (NEG_INF);
-    WMMA_GEMM_INIT_REGS<Config, GemmType::Q_KT, GemmPhase::FWD, true> rRowSum (0.0f);
-    WMMA_GEMM_INIT_REGS<Config, GemmType::Q_KT, GemmPhase::FWD, true> rExpDiff(1.0f);
+    WMMA_GEMM_INIT_SMEM  <Config>(smem_raw);
+    WMMA_GEMM_INIT_ACCUM <Config, GemmType::Q_KT, GemmPhase::FWD> rS;
+    WMMA_GEMM_INIT_ACCUM <Config, GemmType::P_V,  GemmPhase::FWD> rO;
+    WMMA_GEMM_INIT_MATRIX<Config, GemmType::Q_KT, GemmPhase::FWD> rP(rS);
+    WMMA_GEMM_INIT_BUFFER<Config, GemmType::Q_KT, GemmPhase::FWD> rRowMax (NEG_INF);
+    WMMA_GEMM_INIT_BUFFER<Config, GemmType::Q_KT, GemmPhase::FWD> rRowSum (0.0f);
+    WMMA_GEMM_INIT_BUFFER<Config, GemmType::Q_KT, GemmPhase::FWD> rExpDiff(1.0f);
     __syncthreads();
 
     // ==================================================================================
@@ -251,12 +251,11 @@ flash_attention_kvcache_kernel(
         // Template: GemmPhase::FWD, IS_EVEN, IS_DROPOUT=false
         // ======================================================================================
         WMMA_GEMM_SOFTMAX<Config, GemmPhase::FWD, IS_EVEN, false>(
-          rS.frags, rO.frags, rRowMax.frags, rRowSum.frags, rExpDiff.frags,
-          sP, nullptr,
+          rS.frags, rO.frags, rP.frags,
+          rRowMax.frags, rRowSum.frags, rExpDiff.frags, nullptr,
           block.valid_q_rows, valid_kv_rows,
           cache_seqlen + block.start_q, start_kv, max_seqlen_k,
           0.0f, 0, 0, max_seqlen_k, block_kv, warp_id, lane_id);
-        __syncthreads();
 
         // ======================================================================================
         // Load:     V tile from global to sV(reuse) shared memory
@@ -272,7 +271,7 @@ flash_attention_kvcache_kernel(
         // Template: GemmType::P_V, GemmPhase::FWD
         // ==================================================================================
         WMMA_GEMM_GRADIENTS<Config, GemmType::P_V, GemmPhase::FWD, IS_EVEN>(
-          sP, sV, rO.frags,
+          rP.frags, sV, rO.frags,
           block.valid_q_rows, valid_kv_rows, warp_id, lane_id);
         __syncthreads();
     }   // END MAIN LOOP

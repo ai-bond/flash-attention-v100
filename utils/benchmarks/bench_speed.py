@@ -343,6 +343,6 @@ if __name__ == "__main__":
         ver  = f"flash_attn_v100 v{getattr(mod, '__version__', '?')}"
 
     if args.env is None:
-        parser.error("script must run as -> python benchmark_flash.py --env native_api or v100_api")
+        parser.error("script must run as -> python bench_speed.py --env native_api or v100_api")
 
     run(env_name=args.env, attn_fn=func, version=ver, output_dir=Path(args.output))
