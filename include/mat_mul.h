@@ -28,6 +28,21 @@ template <typename Use, typename Layout = void>
 __device__ constexpr std::array<uint2, 32> BASELANE = []() constexpr {
     std::array<uint2, 32> r{};
     for (unsigned lid = 0; lid < 32; ++lid) {
+#if defined(MMA_884)
+        // m8n8k4 (8x8x4)
+        if constexpr (std::is_same_v<Use, accumulator>) {
+            r[lid] = uint2{(lid & 1u) + ((lid >> 4) & 1u) * 4u, lid & 2u};
+        } else if constexpr (std::is_same_v<Use, matrix_a> && std::is_same_v<Layout, row_major>) {
+            r[lid] = uint2{(lid & 3u) | ((lid >> 4) & 1u) * 4u, 0u};
+        } else if constexpr (std::is_same_v<Use, matrix_a> && std::is_same_v<Layout, col_major>) {
+            r[lid] = uint2{((lid >> 4) & 1u) * 4u, lid & 3u};
+        } else if constexpr (std::is_same_v<Use, matrix_b> && std::is_same_v<Layout, row_major>) {
+            r[lid] = uint2{lid & 3u, ((lid >> 4) & 1u) * 4u};
+        } else if constexpr (std::is_same_v<Use, matrix_b> && std::is_same_v<Layout, col_major>) {
+            r[lid] = uint2{0u, (lid & 3u) + ((lid >> 4) & 1u) * 4u};
+        }
+#else
+        // m16n16k16
         if constexpr (std::is_same_v<Use, accumulator>) {
             r[lid] = uint2{((lid >> 2) & 1u) * 8u + ((lid >> 4) & 1u) * 4u + (lid & 1u), lid & 10u};
         } else if constexpr (std::is_same_v<Use, matrix_a> && std::is_same_v<Layout, row_major>) {
@@ -39,6 +54,7 @@ __device__ constexpr std::array<uint2, 32> BASELANE = []() constexpr {
         } else if constexpr (std::is_same_v<Use, matrix_b> && std::is_same_v<Layout, col_major>) {
             r[lid] = uint2{0u, (lid & 3u) | (lid & 8u) | ((lid >> 2) & 4u)};
         }
+#endif
     }
     return r;
 }();
@@ -47,22 +63,36 @@ __device__ constexpr std::array<uint2, 32> BASELANE = []() constexpr {
 // OFFSETS <Use, Layout>[reg_idx] : per-register offset
 // ======================================================================================
 template <typename Use, typename Layout = void>
-__device__ constexpr std::array<uint2, 8> OFFSETS = []() constexpr {
-    std::array<uint2, 8> r{};
+__device__ constexpr auto OFFSETS = []() constexpr {
     if constexpr (std::is_same_v<Use, accumulator>) {
-        r = {{ {0,0}, {0,1}, {2,0}, {2,1}, {0,4}, {0,5}, {2,4}, {2,5} }};
-    } else if constexpr (std::is_same_v<Use, matrix_a> && std::is_same_v<Layout, row_major>) {
-        r = {{ {0,0}, {0,2}, {0,4}, {0,6}, {0,8}, {0,10}, {0,12}, {0,14} }};
+        return std::array<uint2, 8>{{ {0,0}, {0,1}, {2,0}, {2,1}, {0,4}, {0,5}, {2,4}, {2,5} }};
+    }
+#if defined(MMA_884)
+    // m8n8k4
+    else if constexpr (std::is_same_v<Use, matrix_a> && std::is_same_v<Layout, row_major>) {
+        return std::array<uint2, 2>{{ {0,0}, {0,2} }};
     } else if constexpr (std::is_same_v<Use, matrix_a> && std::is_same_v<Layout, col_major>) {
-        r = {{ {0,0}, {2,0}, {4,0}, {6,0}, {8,0}, {10,0}, {12,0}, {14,0} }};
-    } else if constexpr (std::is_same_v<Use, matrix_b> && std::is_same_v<Layout, col_major>) {
-        r = {{ {0,0}, {2,0}, {4,0}, {6,0}, {8,0}, {10,0}, {12,0}, {14,0} }};
+        return std::array<uint2, 2>{{ {0,0}, {2,0} }};
     } else if constexpr (std::is_same_v<Use, matrix_b> && std::is_same_v<Layout, row_major>) {
-        r = {{ {0,0}, {0,2}, {8,0}, {8,2}, {0,4}, {0,6}, {8,4}, {8,6} }};
-    } else {
+        return std::array<uint2, 2>{{ {0,0}, {0,2} }};
+    } else if constexpr (std::is_same_v<Use, matrix_b> && std::is_same_v<Layout, col_major>) {
+        return std::array<uint2, 2>{{ {0,0}, {2,0} }};
+    }
+#else
+    // m16n16k16
+    else if constexpr (std::is_same_v<Use, matrix_a> && std::is_same_v<Layout, row_major>) {
+        return std::array<uint2, 8>{{ {0,0}, {0,2}, {0,4}, {0,6}, {0,8}, {0,10}, {0,12}, {0,14} }};
+    } else if constexpr (std::is_same_v<Use, matrix_a> && std::is_same_v<Layout, col_major>) {
+        return std::array<uint2, 8>{{ {0,0}, {2,0}, {4,0}, {6,0}, {8,0}, {10,0}, {12,0}, {14,0} }};
+    } else if constexpr (std::is_same_v<Use, matrix_b> && std::is_same_v<Layout, row_major>) {
+        return std::array<uint2, 8>{{ {0,0}, {0,2}, {8,0}, {8,2}, {0,4}, {0,6}, {8,4}, {8,6} }};
+    } else if constexpr (std::is_same_v<Use, matrix_b> && std::is_same_v<Layout, col_major>) {
+        return std::array<uint2, 8>{{ {0,0}, {2,0}, {4,0}, {6,0}, {8,0}, {10,0}, {12,0}, {14,0} }};
+    }
+#endif
+    else {
         static_assert(sizeof(Use) == 0, "OFFSETS: unsupported Use/Layout");
     }
-    return r;
 }();
 
 // ======================================================================================
