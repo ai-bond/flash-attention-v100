@@ -1,8 +1,8 @@
 # FlashAttention for unsupported Tesla v100
 
-This repository implementation of [FlashAttention-2](https://github.com/ai-bond/flash-attention-v100/blob/main/utils/docs/attention.md) under unsupported in TriDao repo [Nvidia Tesla V100](https://github.com/ai-bond/flash-attention-v100/blob/main/utils/docs/volta.md)
+This repository implementation of [FlashAttention-2](https://github.com/ai-bond/flash-attention-v100/blob/main/utils/docs/attention.md) for [Nvidia Tesla V100](https://github.com/ai-bond/flash-attention-v100/blob/main/utils/docs/volta.md)
 
-> It attempt to build flash attention from scratch without "Vibe Code" for self education.
+> It product ready build of Flash Attention 2 created from scratch without Cutlass and "Vibe Code"
 
 If this code saved you time, treat me to a coffee ☕: 
 - 🪙 BTC:          `bc1q5dydywjqmlewmenkyymzrmy482f9jdh7mr42aw`
