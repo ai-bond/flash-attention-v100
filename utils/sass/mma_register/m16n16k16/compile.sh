@@ -18,7 +18,7 @@ fi
 
 # Resolve include/ relative to this script, so cwd doesn't matter
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-INC="-I${SCRIPT_DIR}/../../../include"
+INC="-I${SCRIPT_DIR}/../../../../include"
 
 USE_VOLTA=0
 USE_NATIVE=0
